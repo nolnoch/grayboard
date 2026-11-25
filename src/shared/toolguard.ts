@@ -27,6 +27,17 @@ export function checkArgs(tools: Tool[], name: string, args: Record<string, unkn
 }
 
 /**
+ * What a session is told once grayboard's binary was replaced under it. omp's
+ * local adapter runs grayboard itself (`BUS_HARNESS=omp`) and keeps omp's own
+ * grayboard entry disabled, so `/mcp` reconnect there would start a second
+ * grayboard beside it; restarting omp restarts the adapter's.
+ */
+export function updateNoticeText(env: Record<string, string | undefined> = process.env): string {
+  const fix = env.BUS_HARNESS === "omp" ? "restart omp" : "reconnect it (/mcp → grayboard → reconnect)";
+  return `Note: grayboard was updated after this session started, so these tools may be out of date. Ask the user to ${fix}.`;
+}
+
+/**
  * For an installed binary: a function that returns a notice once the binary on
  * disk has been replaced since this process started (a reinstall), else null.
  * Checked on each tool call; there's no watcher. From source, always null.
@@ -44,15 +55,22 @@ export function updateNotice(): () => string | null {
   const start = id();
   return () => {
     const now = id();
-    return start && now && now !== start
-      ? "Note: grayboard was updated after this session started, so these tools may be out of date. Ask the user to reconnect it (/mcp → grayboard → reconnect)."
-      : null;
+    return start && now && now !== start ? updateNoticeText() : null;
   };
 }
 
 /** The warning a tools-only Claude Code session gets, naming why its channels are off. */
 export function channelsOffNotice(reason: string): string {
   return `Warning: this Claude Code session is tools-only: grayboard can't push messages or board posts to it, because ${reason}, and peers see it as offline. Tell the user; what's pending arrives once a session with channels on holds this name. Until then, check dm_inbox and board_read yourself.`;
+}
+
+/**
+ * The warning a bare `grayboard mcp` gets on a machine signed in to a server
+ * (#491): it runs the local bus, so the team isn't here. `server` is null when
+ * the sign-in doesn't name one (a truncated, signed-out credentials file).
+ */
+export function signedInLocalNotice(server: string | null): string {
+  return `Warning: this machine is signed in to ${server ?? "a grayboard server"}, but this grayboard MCP entry runs the local bus: that server's peers, names and messages aren't here, and an empty peer list isn't the team's. Tell the user: \`grayboard setup\` moves this machine's harnesses to the server (for opencode it prints the command to run); \`grayboard setup --local\` if this machine should be local; \`--mode local\` on this entry keeps the local bus on purpose.`;
 }
 
 /**

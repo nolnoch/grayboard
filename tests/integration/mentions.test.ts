@@ -7,7 +7,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { ReadResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
-import type { AppSession } from "../support/app_session.ts";
 import { board } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -19,7 +18,7 @@ let bob: string;
 
 beforeEach(async () => {
   // Inbox polling spends hosted requests.
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   alice = await srv.login(A);
   bob = await srv.login(B);
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
@@ -29,20 +28,15 @@ afterEach(() => srv.stop());
 
 const mentioned = (body: string) => board((i) => i.kind === "push" && i.reason === "mention" && i.post.body === body);
 
-// An application session: a hosted session holds one person-scope name, so
-// it can't hold the team alias eng/deploy (#451).
-async function connect(token: string, identity: string): Promise<AppSession> {
-  const s = srv.appSession(token, identity);
-  await s.connect();
-  return s;
-}
+// Application sessions (srv.connected): a hosted session holds one
+// person-scope name, so it can't hold the team alias eng/deploy (#451).
 
 // hosted twin: #451 (deploy, a team alias)
-test("@scope/name is exact; a bare name is the author's own scope's first, else the board's one match", async () => {
+test("@scope/name is exact; a bare name is only ever the author's own scope's (F-08)", async () => {
   const abe = await srv.hosted(A, "be");
   const aqa = await srv.hosted(A, "qa");
   const bqa = await srv.hosted(B, "qa");
-  const deploy = await connect(bob, "eng/deploy");
+  const deploy = await srv.connected(bob, "eng/deploy");
   await abe.call("board_create", { name: "e2e", purpose: "fixtures" });
 
   // Exact: another person's alias, and a team's.
@@ -63,26 +57,28 @@ test("@scope/name is exact; a bare name is the author's own scope's first, else 
   await aqa.next(mentioned(body));
   await bqa.none(mentioned(body));
 
-  // Bare with no own match: the one alias of that name on the roster.
+  // Bare with no own match: refused naming the one on the roster, which isn't woken.
   body = "@deploy roster";
-  expect((await abe.call<BoardPostResult>("board_post", { board: "e2e", body })).notified).toEqual(["eng/deploy"]);
-  await deploy.next(mentioned(body));
+  await expect(abe.call("board_post", { board: "e2e", body })).rejects.toMatchObject({
+    message: "@deploy isn't in your scope; name it in full: eng/deploy",
+  });
+  await deploy.none(mentioned(body));
 });
 
 // hosted twin: #451 (deploy, a team alias)
-test("an ambiguous bare name refuses the post with its candidates; an @id: reaches the session", async () => {
+test("a bare name only other scopes have refuses the post with its candidates; an @id: reaches the session", async () => {
   const aqa = await srv.hosted(A, "qa");
   const bqa = await srv.hosted(B, "qa");
-  const deploy = await connect(bob, "eng/deploy");
+  const deploy = await srv.connected(bob, "eng/deploy");
   // A session with no name holds no lease and receives nothing (#229), so the
   // session an @id: names is one bound to a name of its own.
-  const bound = await connect(alice, "sim");
+  const bound = await srv.connected(alice, "sim");
   await deploy.call("board_create", { name: "e2e", purpose: "fixtures" });
 
   // eng has no qa of its own, and two people's are on the roster.
   await expect(deploy.call("board_post", { board: "e2e", body: "@qa which" })).rejects.toMatchObject({
     code: "bad_request",
-    message: `@qa matches ${A}/qa, ${B}/qa; name one`,
+    message: `@qa isn't in your scope; name it in full: ${A}/qa, ${B}/qa`,
   });
   expect((await deploy.call<ReadResult>("board_read", { board: "e2e" })).posts).toEqual([]);
   await aqa.none(board());

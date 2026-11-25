@@ -1,6 +1,6 @@
 import { errorDiagnostic } from "./diagnostics.ts";
 
-type Operation = "oauth.sweep" | "oauth.exchange" | "oauth.request" | "oauth.replay" | "delivery.changed" | "delivery.closed" | "resources.changed" | "resources.closed" | "resources.finish" | "resources.authorize" | "hosted.sweep" | "hosted.heartbeat" | "mcp.hint" | "mcp.binding" | "mcp.stream" | "mcp.resource" | "mcp.subscriber";
+type Operation = "oauth.sweep" | "oauth.exchange" | "oauth.upstream" | "oauth.request" | "oauth.replay" | "delivery.changed" | "delivery.closed" | "resources.changed" | "resources.closed" | "resources.finish" | "resources.authorize" | "hosted.sweep" | "hosted.reconcile" | "hosted.heartbeat" | "hosted.refusal_row" | "hosted.settle" | "mcp.hint" | "mcp.binding" | "mcp.stream" | "mcp.resource" | "mcp.subscriber" | "attachments.upload" | "attachments.download" | "attachments.release";
 
 // Deliberately accepts no request-derived strings; an error contributes only its class and an allowlisted code.
 export function hostedFailure(operation: Operation | "mcp.legacy" | "rate_limit.end", error?: unknown, level: "error" | "warning" = "error") {

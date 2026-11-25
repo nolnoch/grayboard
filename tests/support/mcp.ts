@@ -1,5 +1,6 @@
 // A `grayboard mcp` child driven by an MCP client, as a harness drives it.
 import { spawn, type ChildProcess } from "node:child_process";
+import { connect, type Socket } from "node:net";
 import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ReadBuffer, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
@@ -8,6 +9,7 @@ import type { ClientCapabilities, JSONRPCMessage, JSONRPCRequest } from "@modelc
 import { localEnv } from "./env.ts";
 import { RESTARTED } from "./harness.ts";
 import { CLI } from "./paths.ts";
+import { existsSync } from "node:fs";
 import { until } from "./until.ts";
 
 const HARNESS = resolve(import.meta.dir, "harness.ts");
@@ -25,8 +27,10 @@ export type Session = {
   protocol: () => string | undefined;
   // Restart grayboard under the same harness, as `/mcp` reconnect does
   // ("reconnect") or a crash does ("crash"), and handshake with the new
-  // process. The returned session replaces this one.
-  restart: (how: "reconnect" | "crash") => Promise<Session>;
+  // process. The returned session replaces this one. `pid`: signal that
+  // process instead, a stand-in between the harness and grayboard that
+  // restarts its own child the same way, keeping its pid.
+  restart: (how: "reconnect" | "crash", pid?: number) => Promise<Session>;
 };
 
 const open = new Set<Client>();
@@ -55,7 +59,10 @@ export async function mcpSession(
   return handshake(t, o.client ?? {});
 }
 
-async function handshake(t: HarnessTransport, shape: ClientShape): Promise<Session> {
+// What handshake needs of a transport: the harness's, or a sibling's socket.
+type SessionTransport = Transport & { stderr: () => string; pid: number; protocol?: string; restart(signal: "SIGUSR1" | "SIGUSR2", pid?: number): Promise<void> };
+
+async function handshake(t: SessionTransport, shape: ClientShape): Promise<Session> {
   const pushes: Push[] = [];
   const c = new Client({ name: "test", version: "0" }, { capabilities: shape.capabilities ?? {} });
   shape.setup?.(c);
@@ -81,9 +88,9 @@ async function handshake(t: HarnessTransport, shape: ClientShape): Promise<Sessi
   return {
     c, pushes, stderr: t.stderr, harnessPid: t.pid, protocol: () => t.protocol,
     call: (name, args) => call(c, name, args).catch((e) => Promise.reject(withStderr(e, t.stderr))),
-    restart: async (how) => {
+    restart: async (how, pid) => {
       open.delete(c);
-      await t.restart(how === "crash" ? "SIGUSR2" : "SIGUSR1");
+      await t.restart(how === "crash" ? "SIGUSR2" : "SIGUSR1", pid);
       return handshake(t, shape);
     },
   };
@@ -93,7 +100,7 @@ async function handshake(t: HarnessTransport, shape: ClientShape): Promise<Sessi
 // under it: each new Client connects to the same transport, and start() only
 // spawns the first time. Closing ends the harness's stdin, as the SDK's
 // stdio transport does, then signals it if it outlives that.
-class HarnessTransport implements Transport {
+class HarnessTransport implements SessionTransport {
   onclose?: () => void;
   onerror?: (error: Error) => void;
   onmessage?: (message: JSONRPCMessage) => void;
@@ -139,10 +146,11 @@ class HarnessTransport implements Transport {
     return new Promise((ok) => (stdin.write(serializeMessage(message)) ? ok() : stdin.once("drain", ok)));
   }
 
-  async restart(signal: "SIGUSR1" | "SIGUSR2"): Promise<void> {
+  async restart(signal: "SIGUSR1" | "SIGUSR2", pid?: number): Promise<void> {
     const before = this.err.split(RESTARTED).length;
     this.buf.clear();
-    this.p!.kill(signal);
+    if (pid === undefined) this.p!.kill(signal);
+    else process.kill(pid, signal);
     await until(() => this.err.split(RESTARTED).length > before, 10_000, "the harness to restart grayboard");
   }
 
@@ -158,6 +166,76 @@ class HarnessTransport implements Transport {
       p.kill(signal);
       await within(2000);
     }
+  }
+}
+
+/**
+ * A sibling grayboard (#1381): the same command as a session's, under the
+ * same harness pid, with `env` over the harness's env (null unsets), started
+ * through the HARNESS_SIBLINGS socket `sock` that session's harness was
+ * started with (`extra`). Its stderr goes to the harness's, the first
+ * session's, so its own `stderr()` is empty and `harnessPid` is unknown (0);
+ * it can't restart.
+ */
+export async function siblingSession(sock: string, env: Record<string, string | null>, client: ClientShape = {}): Promise<Session> {
+  await until(() => existsSync(sock), 10_000, "the harness's sibling socket");
+  return handshake(new SiblingTransport(sock, env), client);
+}
+
+class SiblingTransport implements SessionTransport {
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: (message: JSONRPCMessage) => void;
+  private s: Socket | null = null;
+  private readonly buf = new ReadBuffer();
+  protocol?: string;
+  readonly stderr = () => "";
+  readonly pid = 0;
+
+  constructor(private readonly path: string, private readonly env: Record<string, string | null>) {}
+
+  setProtocolVersion(version: string): void {
+    this.protocol = version;
+  }
+
+  start(): Promise<void> {
+    if (this.s) return Promise.resolve();
+    return new Promise((ok, fail) => {
+      const s = connect(this.path);
+      this.s = s;
+      s.once("connect", () => {
+        s.write(JSON.stringify(this.env) + "\n");
+        ok();
+      });
+      s.once("error", (e) => {
+        fail(e);
+        this.onerror?.(e);
+      });
+      s.on("close", () => this.onclose?.());
+      s.on("data", (chunk: Buffer) => {
+        this.buf.append(chunk);
+        for (let m = this.buf.readMessage(); m; m = this.buf.readMessage()) this.onmessage?.(m);
+      });
+    });
+  }
+
+  send(message: JSONRPCMessage): Promise<void> {
+    const s = this.s;
+    if (!s || s.writableEnded) return Promise.reject(new Error("not connected"));
+    return new Promise((ok) => (s.write(serializeMessage(message)) ? ok() : s.once("drain", ok)));
+  }
+
+  restart(): Promise<void> {
+    return Promise.reject(new Error("a sibling session can't restart"));
+  }
+
+  async close(): Promise<void> {
+    const s = this.s;
+    if (!s || s.destroyed) return;
+    const closed = new Promise((ok) => s.once("close", ok));
+    s.end();
+    await Promise.race([closed, Bun.sleep(2000)]);
+    s.destroy();
   }
 }
 
@@ -185,6 +263,22 @@ export async function call(c: Client, name: string, args: Record<string, unknown
   } catch {
     return body; // e.g. board_subscribe's "ok: ..."
   }
+}
+
+// A tool call's error text; a call that succeeds throws, naming what it returned.
+export async function refusal(s: { c: Client }, name: string, args: Record<string, unknown> = {}): Promise<string> {
+  const r = await s.c.callTool({ name, arguments: args });
+  const text = (r.content as { text: string }[])[0]!.text;
+  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
+  return text;
+}
+
+// The same, with the refusal's structuredContent code (#959).
+export async function refusalCoded(s: { c: Client }, name: string, args: Record<string, unknown> = {}): Promise<{ text: string; code: unknown }> {
+  const r = await s.c.callTool({ name, arguments: args });
+  const text = (r.content as { text: string }[])[0]!.text;
+  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
+  return { text, code: (r.structuredContent as { code?: unknown } | undefined)?.code };
 }
 
 // Ends one session mid-test. The SDK's close waits for the child to exit.

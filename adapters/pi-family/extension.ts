@@ -18,15 +18,20 @@ import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams, render, wakes } from "../hosted-core/src/channel.ts";
 import { end, register } from "../hosted-core/src/children.ts";
-import { failureText, HostedClient, message, type Disposable, type Level } from "../hosted-core/src/client.ts";
+import { endFailedText, failureText, HostedClient, message, type Disposable, type Level } from "../hosted-core/src/client.ts";
 import { readHostedConfig } from "../hosted-core/src/config.ts";
 import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
-import { Login } from "../hosted-core/src/login.ts";
+import { Login, type SignIn } from "../hosted-core/src/login.ts";
+import * as signIns from "../hosted-core/src/offer.ts";
+import type { Flow, Last, Origin, Outcome, SignInState } from "../hosted-core/src/offer.ts";
+import type { SessionFacts } from "../hosted-core/src/port.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
-import { failure, hostTools, outputOf, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
-import { RootDelivery } from "../hosted-core/src/root.ts";
+import { CallAborted, failure, hostTools, signOutCause, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
+import { outputOf } from "../hosted-core/src/results.ts";
+import { NotStarted, RootDelivery } from "../hosted-core/src/root.ts";
+import { NEW_RUN, StaticLogin, staticMode } from "../hosted-core/src/static.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
-import { describeLocation } from "../../src/shared/identity.ts";
+import { configuredIdentity, describeLocation, sessionIdentity } from "../../src/shared/identity.ts";
 
 export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
@@ -35,6 +40,12 @@ export type SessionInfo = { id: string; file?: string; parentFile?: string; reas
 // when the runner gave no parent session, so it can't be attributed) through
 // the intermediate subagent sessions `via`, outermost first (audit only).
 export type Marker = { child: false } | { child: true; root?: string; via?: string[] };
+// An admission (rendered and handed to the harness) or a receipt (the server
+// committed it). `root` names the session that admitted it, since /fork
+// copies entries into the fork; `itemId` joins an admission to its receipt.
+export type DeliveryEntry =
+  | { event: "admitted"; root: string; itemId: string; stableID: string; wake: boolean; at: string }
+  | { event: "receipted"; root: string; itemIds: string[]; at: string };
 
 export interface Harness {
   readonly name: string;     // "pi" | "omp", in messages
@@ -43,10 +54,21 @@ export interface Harness {
   readonly agentDir: string; // state lives under <agentDir>/grayboard/
   marker(): Marker;
   // (Re)registers the tool list; `call` runs one under the current session.
-  register(tools: NativeTool[], call: (tool: string, args: Record<string, unknown>) => Promise<CallToolResult>): void;
+  // `signal`: the harness's abort of one call; an aborted call throws.
+  register(tools: NativeTool[], call: (tool: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<CallToolResult>): void;
   // A rendered `<channel>`; `wake` starts a turn (idle) or steers in (mid-run).
   deliver(content: string, wake: boolean): void;
   notify(message: string, level: Level): void;
+  // Appends a `grayboard-delivery` entry to the session file (pi.appendEntry):
+  // the delivery record of the session an item changed. Never message bodies.
+  record(data: DeliveryEntry): void;
+  // `sessionID`'s current model and effort (#364), read per request: the
+  // harness answers only while that session is its current one, since its
+  // model is the current session's.
+  facts?(sessionID: string): SessionFacts | undefined;
+  // The process outlives a browser round trip (tui or rpc mode): a signed-out
+  // tool call may start a sign-in whose loopback callback it then answers.
+  interactive(): boolean;
 }
 
 export const LOGIN_ACTION = "run /grayboard login";
@@ -54,6 +76,16 @@ export const RESUME_HINT = "run /grayboard resume";
 // A tool call that failed: the call itself is what to retry.
 const RETRY_HINT = "call the tool again";
 const SOURCE = "grayboard";
+// How long a model call waits for the instructions before going out without
+// them, and how long after a timeout or failure it skips the fetch: a server
+// that accepts connections and stalls would otherwise hold every prompt for
+// the connect timeout (#438-25).
+export const INSTRUCTIONS_WAIT_MS = 2_000;
+export const INSTRUCTIONS_BACKOFF_MS = 30_000;
+// How long a shutdown waits for a non-root session's running calls before its
+// end (#1160): under omp's 2 s cap on shutdown handlers, so the end still goes.
+export const SHUTDOWN_CALLS_WAIT_MS = 1_000;
+const LATE = Symbol("late");
 
 // A tool's arguments and MCP result as both entries' tools take and return
 // them: text and image blocks, and an error said in text when the server
@@ -79,15 +111,23 @@ export const COMMAND = {
 // /fork carries, the live session files (file → root id), and per root
 // session the stable ids of items it admitted, which a /reload keeps (the
 // lease stays) while the Controller's own admission set doesn't outlive it.
-type Shared = { carried?: string[]; live: Map<string, string>; admitted: Map<string, Set<string>> };
+// `signins` is the process's sign-in record (hosted-core offer.ts); an older
+// bundle's `signIn` field is ignored.
+type Shared = { carried?: string[]; live: Map<string, string>; admitted: Map<string, Set<string>>; signins: SignInState; voice?: Voice; interactive?: boolean };
+// A runtime's notice line and delivery restart. The slot's `voice` is the
+// latest root runtime started in this process (pi's one session, omp's main
+// session): a flow outlives the runtime that started it (a /new, /fork,
+// /resume or /reload ends that one), so it speaks through the current one.
+type Voice = { log(message: string, level?: Level): void; restart(): Promise<void> };
 const ADMITTED_LIMIT = 256;
 function shared(harness: string): Shared {
   const key = Symbol.for(`io.github.nolnoch.grayboard/${harness}-sessions`);
   // globalThis carries no symbol index; this slot is ours (Symbol.for, namespaced).
   const g = globalThis as unknown as Record<symbol, Shared | undefined>;
-  const slot = g[key] ??= { live: new Map(), admitted: new Map() };
+  const slot = g[key] ??= { live: new Map(), admitted: new Map(), signins: {} };
   // A /reload after `grayboard update` may find the slot an older bundle made.
   slot.admitted ??= new Map();
+  slot.signins ??= {};
   return slot;
 }
 
@@ -103,6 +143,25 @@ export interface Grayboard {
   idle(): Promise<void>;                       // a subagent's run ended: its child slot goes back until its next call
 }
 
+/**
+ * A harness's facts read one at a time (#547): a reader that throws leaves its
+ * key out, so the server keeps that fact's stored value, and the other fact
+ * still goes. Each failure is said once per session and fact through `warn`.
+ */
+export function factReader(warn: (message: string) => void) {
+  const said = new Set<string>();
+  return (sessionID: string, read: Record<keyof SessionFacts & string, () => string | null>): SessionFacts => {
+    const facts: SessionFacts = {};
+    for (const [fact, get] of Object.entries(read) as [keyof SessionFacts, () => string | null][]) {
+      try { facts[fact] = get(); } catch (error) {
+        const key = `${sessionID}\0${fact}`;
+        if (!said.has(key)) { said.add(key); warn(`grayboard: couldn't read session ${sessionID}'s ${fact}; the server keeps its last one: ${message(error)}`); }
+      }
+    }
+    return facts;
+  };
+}
+
 export function createGrayboard(h: Harness): Grayboard {
   const stateDir = join(h.agentDir, "grayboard");
   const config = readHostedConfig(stateDir);
@@ -110,6 +169,11 @@ export function createGrayboard(h: Harness): Grayboard {
   // Said until this session's shutdown finishes, so its own records (a
   // release that failed) land inside the harness's shutdown handler.
   const log = (message: string, level: Level = "info") => { if (!done) h.notify(`grayboard: ${message}`, level); };
+  // Same gate. A record that fails never fails the admission or receipt it records.
+  const record = (data: DeliveryEntry) => {
+    if (done) return;
+    try { h.record(data); } catch (error) { log(`couldn't record a delivery ${data.event} in the session file: ${message(error)}`, "warning"); }
+  };
   // The bind's `where` (peer_list, a name refusal's holder text): this
   // process's checkout, as server mode's `grayboard mcp` sent it.
   const place = describeLocation(process.cwd()) ?? h.name;
@@ -128,15 +192,35 @@ export function createGrayboard(h: Harness): Grayboard {
   let registered = false;             // that register succeeded
   let attempted = false;              // a register went out (a timed-out one may have committed)
   let used = false;                   // a call went out under this (non-root) session's id
-  const inflight = new Set<Promise<CallToolResult>>(); // calls running now, which an idle end lands after
+  const inflight = new Set<Promise<unknown>>(); // calls and instructions fetches running now, which an end lands after
+  // An explicit BUS_IDENTITY: each new root binds it at its first start (#443),
+  // which also says one the naming rule refuses (the host has no UI at load).
+  const configured = configuredIdentity(process.env, process.cwd());
+  // The name local mode would suggest here (#522); none when the directory gives no name.
+  const suggestion = (() => { try { return sessionIdentity(process.env, process.cwd()); } catch { return undefined; } })();
 
-  const login = "url" in config ? new Login({
+  // A launcher-set run token (#1243): the environment decides, never a stored grant.
+  const mode = "url" in config ? staticMode(process.env, process.cwd()) : undefined;
+  const loginAction = mode ? NEW_RUN : LOGIN_ACTION;
+  const login: SignIn | undefined = !("url" in config) ? undefined
+    : mode ? new StaticLogin({ resource: config.url, clientId: h.clientId, version: h.version, harness: h.name, mode })
+    : new Login({
     resource: config.url, clientId: h.clientId, stateDir, harness: h.name, loginAction: LOGIN_ACTION,
+    // Every login goes through signIn(), so the flow is the process's. An
+    // offer's flow opens no browser: a model's call never opens a window.
+    // The URL goes only to this line, which the user sees and the model
+    // doesn't: a URL in the model's context lets an injected instruction
+    // complete the flow with another account (#500).
+    // A session waiting on another process's flow gets that flow's URL too.
     present: url => {
-      log(`sign in at ${url}`);
-      openBrowser(url, error => log(`couldn't open a browser (${error.message}); open the URL above`, "warning"));
+      const flow = signIns.present(state.signins, url);
+      say(`sign in at ${url}`);
+      if (!flow || flow.browser) browse(url);
     },
-    notify: message => log(message),
+    notify: message => {
+      say(message);
+      signIns.notify(state.signins, message);
+    },
     // A queued revoke or a refresh whose outcome is unknown leaves a grant live
     // on the server or this session signed out: said at once, not only in
     // /grayboard status, which a restart forgets.
@@ -146,38 +230,106 @@ export function createGrayboard(h: Harness): Grayboard {
       if (logoutWarnings) logoutWarnings.push(record.message);
       else log(record.message, "warning");
     },
-  }) : undefined;
+  });
 
   const client = login ? new HostedClient({
     harness: h.name, clientId: h.clientId, version: h.version, login, source: SOURCE,
-    loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, log,
+    loginAction, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, get launcher() { return role.kind === "root" && process.env.BUS_LAUNCHER === "1"; }, log,
+    // Only this process's own session: the harness's model is that session's.
+    ...(h.facts ? { facts: (id: string) => session?.id === id ? h.facts!(id) : undefined } : {}),
+    ...(suggestion ? { suggested: (id: string) => session?.id === id ? suggestion : undefined } : {}),
   }) : undefined;
+
+  // ---- sign-in ----
+
+  const voice: Voice = {
+    log,
+    // The watch's restart and this one are one epoch-guarded path.
+    restart: async () => {
+      if (closed) return;
+      if (root) await root.credentialChanged();
+      else if (proxy) await client!.connect(proxy);
+    },
+  };
+  // The current root runtime's line, else this one's (which says nothing once it has shut down).
+  const speaker = () => state.voice ?? voice;
+  const say = (message: string, level: Level = "info") => speaker().log(message, level);
+  const browse = (url: string) => openBrowser(url, error => say(`couldn't open a browser (${error.message}); open the URL above`, "warning"));
+  // A flow's outcome, as its runtime's line or the next root's says it.
+  const outcomeLine = (v: Voice, last: Last) => {
+    if (last.outcome === "signed in") v.log("signed in");
+    else v.log(`sign-in ${last.outcome}; ${LOGIN_ACTION} to try again`, "error");
+  };
+  // Says a flow's outcome through the current root runtime, else this one
+  // while it runs. With neither (omp between a session's finish and the
+  // next one's begin), the outcome stays unsaid in the slot and the next root
+  // says it at its start, whose delivery then starts signed in. Success
+  // restarts this runtime's delivery and the current root's, at once; any
+  // other runtime's credential watch restarts its own.
+  const speakerNow = () => state.voice ?? (done ? undefined : voice);
+  // A restart that fails is said; the credential watch tries again.
+  const restartAll = async (current: Voice | undefined) => {
+    await Promise.all([...new Set([voice, ...(current ? [current] : [])])].map(v => v.restart().catch(error => v.log(`couldn't restart after the sign-in: ${message(error)}`, "warning"))));
+  };
+  const ended = async (_flow: Flow, outcome: Outcome) => {
+    const last = state.signins.last!;
+    // Cancelled only by a quit, which has nothing left to say it to.
+    if (outcome === "cancelled") { last.said = true; return; }
+    const current = speakerNow();
+    if (current) { outcomeLine(current, last); last.said = true; }
+    if (outcome !== "signed in") return;
+    await restartAll(current);
+  };
+  // The process's pending flow, else a new one under this runtime's Login.
+  // An offer's returns at once if another process's grant has landed, and
+  // restarts delivery under it then (#596); /grayboard login always runs a
+  // flow.
+  const begin = (origin: Origin, browser: boolean): Flow | undefined =>
+    mode ? undefined : state.signins.flow ?? (!(login instanceof Login) || closed ? undefined : signIns.start(state.signins, login, { origin, browser, ifSignedOut: !browser, ended, current: () => restartAll(speakerNow()) }));
+  // Whether this process outlives a browser round trip. A root's own mode;
+  // any other runtime takes its process's root's, since omp starts in-process
+  // task subagents without a mode (so they read "print"). A pi subagent is its
+  // own process with no root: its own mode (print) decides.
+  const interactive = () => role.kind === "root" ? h.interactive() : state.interactive ?? h.interactive();
+  // A signed-out call's notice (hosted-core offer.ts): the link goes only to
+  // the notice line, which the user sees and the model doesn't. Never where
+  // the process exits before the browser could answer (print or json mode).
+  const notes = {
+    started: `sign-in started: ask the user to open the link ${h.name} shows (/grayboard login shows it again), then call a grayboard tool again`,
+    starting: `sign-in is starting; ${h.name} shows its link once it has one: ask the user to open it, then call a grayboard tool again`,
+  };
+  // A static run offers nothing: its token is the launcher's to replace.
+  const offer = async () => mode ? undefined : signIns.offer(state.signins, login!, { interactive: interactive(), begin: () => begin("offer", false), notes });
 
   // ---- tools ----
 
-  const call = (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
-    const running = dispatch(tool, args);
+  const call = (tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> => {
+    const running = dispatch(tool, args, signal);
     inflight.add(running);
     const settled = () => { inflight.delete(running); };
     running.then(settled, settled);
     return running;
   };
-  const dispatch = async (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+  const dispatch = async (tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> => {
+    // Aborted before it started: no sign-in offer, no registration, nothing sent.
+    if (signal?.aborted) throw new CallAborted();
     if ("error" in config) return failure(config.error);
-    if (root) return root.call(tool, args);
+    if (root) return root.call(tool, args, offer, { signal });
     if (!proxy || !session) return failure(`the ${h.name} session hasn't started yet`);
     used = true;
-    const p = proxy;
-    return client!.call({ call: (name, a, id) => attributed(p, name, a, id) }, tool, args, session.id);
+    const p = proxy, id = session.id;
+    const note = await offer();
+    const result = await client!.call({ call: (name, a, sid, s) => attributed(p, name, a, sid, s) }, tool, args, id, signal);
+    return note ? { ...result, content: [{ type: "text", text: `grayboard: ${note}` }, ...result.content] } : result;
   };
   // The server refuses an unattributed child's call before running it, so
   // one retry after registering again never repeats a write. The client's
   // error wrapper sits outside it: a converted failure never probes.
-  const attributed = async (p: ToolProxy, tool: string, args: Record<string, unknown>, id: string): Promise<CallToolResult> => {
-    let result = await p.call(tool, args, id);
-    if (role.kind === "child" && registered && result.isError && await unattributed(p, id)) {
+  const attributed = async (p: ToolProxy, tool: string, args: Record<string, unknown>, id: string, signal?: AbortSignal): Promise<CallToolResult> => {
+    let result = await p.call(tool, args, id, signal);
+    if (role.kind === "child" && registered && !closed && result.isError && await unattributed(p, id, signal)) {
       registered = false; registration = undefined;
-      result = await p.call(tool, args, id);
+      result = await p.call(tool, args, id, signal);
     }
     return result;
   };
@@ -191,8 +343,8 @@ export function createGrayboard(h: Harness): Grayboard {
   // retried by the next. Concurrent calls share one register. The server ends
   // the registration with the root's ownership (a lapsed lease the root then
   // rebinds), so a refused call checks whether it still holds.
-  const unattributed = async (p: ToolProxy, id: string) => {
-    const who = outputOf(await p.call("whoami", {}, id));
+  const unattributed = async (p: ToolProxy, id: string, signal?: AbortSignal) => {
+    const who = outputOf(await p.call("whoami", {}, id, signal));
     return !!who && typeof who === "object" && "unbound" in who && who.unbound === true && !("child" in who && who.child === true);
   };
   // A child's root and the subagents between, as the harness says at each
@@ -213,12 +365,19 @@ export function createGrayboard(h: Harness): Grayboard {
       error => { if (registration === pending) registration = undefined; throw error; });
     return registration = pending;
   };
+  // A call that waited on the register goes out only if the session is still
+  // open: once shutdown began, its end (sent when the register settles) and
+  // this call would race, and a call the server saw after the end would start
+  // the ID again as an unregistered root (#1160).
   const childHooks = (fixed: { root: string; via: string[] }, child: string): CallHooks => ({
-    beforeCall: () => enlist(fixed, child),
+    beforeCall: async () => {
+      await enlist(fixed, child);
+      if (closed) throw new Error(`the ${h.name} session closed`);
+    },
     afterCall: async () => {},
   });
   const endFailed = (id: string) => (error: unknown) =>
-    log(`couldn't end session ${id} on the server: ${message(error)}`, "warning");
+    log(endFailedText(id, error), "warning");
   // omp keeps a finished subagent live (revivable) for its idle TTL, so a
   // child released only at shutdown would hold a slot long after its run: a
   // fan-out of 128 within that TTL would fill the root's cap. An idle child
@@ -265,11 +424,18 @@ export function createGrayboard(h: Harness): Grayboard {
       return;
     }
     state.live.set(s.file ?? `id:${s.id}`, s.id);
+    state.voice = voice;
+    state.interactive = h.interactive();
+    // A flow that ended while no root runtime was set: said once, here, and
+    // the delivery below starts with its grant.
+    const last = state.signins.last;
+    if (last && !last.said) { last.said = true; outcomeLine(voice, last); }
     const carried = s.reason === "new" || s.reason === "fork" ? state.carried : undefined;
     state.carried = undefined;
     const id = s.id;
+    if (configured && "error" in configured) log(`BUS_IDENTITY is ignored: ${configured.error}`, "warning");
     root = new RootDelivery(client!, {
-      sessionID: id, stateDir, place: () => place, push: true, ...(carried ? { carried } : {}),
+      sessionID: id, stateDir, place: () => place, push: true, ...(carried ? { carried } : {}), ...(configured && "name" in configured ? { configured: configured.name } : {}),
       // Idempotent per stableID across this root's runtimes: a /reload keeps
       // the lease, so the reloaded Controller re-reads an item admitted before
       // the reload whose receipt hadn't landed, and must not deliver it twice.
@@ -278,10 +444,13 @@ export function createGrayboard(h: Harness): Grayboard {
         if (!admitted) state.admitted.set(id, admitted = new Set());
         if (admitted.has(stableID)) return;
         const params = channelParams(item, identity);
-        h.deliver(render(params, SOURCE), wakes(item.actionable, params.meta));
+        const wake = wakes(item.actionable, params.meta);
+        h.deliver(render(params, SOURCE), wake);
         admitted.add(stableID);
         if (admitted.size > ADMITTED_LIMIT) admitted.delete(admitted.values().next().value!);
+        record({ event: "admitted", root: id, itemId: item.id, stableID, wake, at: new Date().toISOString() });
       },
+      receipted: ids => record({ event: "receipted", root: id, itemIds: [...ids], at: new Date().toISOString() }),
       onTools: tools => h.register(tools, call),
     });
     await root.start();
@@ -290,6 +459,11 @@ export function createGrayboard(h: Harness): Grayboard {
   const shutdown = async (reason: ShutdownReason) => {
     if (closed) return;
     closed = true;
+    // A pending sign-in's loopback listener must not hold the exiting process open.
+    // Only the current root's quit is the process's: omp quits each in-process
+    // subagent runtime when it parks, and that must not end the user's sign-in.
+    if (reason === "quit" && state.voice === voice) state.signins.flow?.abort.abort();
+    if (state.voice === voice) state.voice = undefined;
     const id = session?.id;
     if (session) state.live.delete(session.file ?? `id:${session.id}`);
     if (root) {
@@ -301,6 +475,12 @@ export function createGrayboard(h: Harness): Grayboard {
       // An idle end still landing finishes first: omp caps shutdown handlers
       // at 2 s (omp 18.14.0 extensibility/extensions/runner.ts:151-160).
       await releasing;
+      // Calls already sent land before the end, as an idle end's do: one the
+      // server saw after it would start the ID again as a root (#1160). Bounded,
+      // so a stalled call can't hold the end past omp's handler cap.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<void>(resolve => { timer = setTimeout(resolve, SHUTDOWN_CALLS_WAIT_MS); });
+      await Promise.race([Promise.allSettled([...inflight]), late]).finally(() => clearTimeout(timer));
       if (id && reason !== "reload") {
         // A register still in flight, or one that failed after the server
         // committed it (a timeout), may have registered this child: it ends
@@ -322,14 +502,47 @@ export function createGrayboard(h: Harness): Grayboard {
   // System-prompt section: the server's instructions for this session. A
   // child registers first: the text an unregistered session gets tells it to
   // bind, which the server refuses a child.
+  // Bounded by INSTRUCTIONS_WAIT_MS; a timeout or failure is said once until a
+  // fetch succeeds, and starts INSTRUCTIONS_BACKOFF_MS without fetching, which
+  // a timed-out fetch that then lands ends (its text is cached). A sign-out
+  // (the sign-in path says it; the first call after a login fetches), a root
+  // still starting, and a shutdown are neither said nor backed off.
+  let quietUntil = 0;
+  let failing = false;
   const instructions = async (): Promise<string | undefined> => {
-    if (!session) return undefined;
-    try {
+    if (!session || Date.now() < quietUntil) return undefined;
+    const s = session;
+    const fetching = (async () => {
       if (root) return await root.instructions();
       if (!proxy) return undefined;
-      if (role.kind === "child") await enlist(role, session.id);
-      return await proxy.instructions(session.id);
-    } catch { return undefined; }
+      if (role.kind === "child") await enlist(role, s.id);
+      // Not after a shutdown began: its end and this fetch's connect would race (#1160).
+      if (closed) return undefined;
+      return await proxy.instructions(s.id);
+    })();
+    fetching.catch(() => {}); // a fetch that outlives the deadline settles unobserved
+    // A fetch is a request under this session's id too: shutdown lets it land before the end (#1160).
+    inflight.add(fetching);
+    const landed = () => { inflight.delete(fetching); };
+    fetching.then(landed, landed);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<typeof LATE>(resolve => { timer = setTimeout(() => resolve(LATE), INSTRUCTIONS_WAIT_MS); });
+    let why: string;
+    try {
+      const text = await Promise.race([fetching, late]);
+      if (text !== LATE) { failing = false; return text; }
+      why = `took longer than ${INSTRUCTIONS_WAIT_MS} ms`;
+    } catch (error) {
+      if (closed || signOutCause(error) || error instanceof NotStarted) return undefined;
+      why = `failed: ${message(error)}`;
+    } finally { clearTimeout(timer); }
+    if (closed) return undefined;
+    const until = quietUntil = Date.now() + INSTRUCTIONS_BACKOFF_MS;
+    // Late but answered: the backoff it started ends.
+    fetching.then(() => { if (quietUntil === until) { quietUntil = 0; failing = false; } }, () => {});
+    if (!failing) log(`fetching the instructions ${why}, so they aren't refreshed; trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s or once a fetch answers`, "warning");
+    failing = true;
+    return undefined;
   };
 
   // ---- /grayboard ----
@@ -337,7 +550,7 @@ export function createGrayboard(h: Harness): Grayboard {
   // While signed out, a root the sign-out paused restarts on its own after a
   // login; resume can't help, so its line names the login instead.
   const describe = (status: Status, signedIn: boolean) => {
-    const shown = (state: string, message: string) => !signedIn && state === "paused" && message.startsWith(DRIFTED) ? `signed out; ${LOGIN_ACTION}` : message;
+    const shown = (state: string, message: string) => !signedIn && state === "paused" && message.startsWith(DRIFTED) ? `signed out; ${loginAction}` : message;
     return [
       `${status.state}: ${shown(status.state, status.message)}`,
       ...status.roots.map(r => `  ${r.sessionID ?? "-"}${r.held?.length ? ` (${r.held.join(", ")})` : ""}: ${r.state}, ${shown(r.state, r.message)}${r.failure ? ` [last failure: ${r.failure.operation} ${r.failure.code}]` : ""}`),
@@ -346,17 +559,29 @@ export function createGrayboard(h: Harness): Grayboard {
 
   const status = async (): Promise<string> => {
     if ("error" in config) return config.error;
-    const grant = await login!.read().catch(() => undefined);
-    const signedIn = !!grant && !grant.loginRequired && !!grant.access;
+    let signedIn: boolean, signIn: string;
+    if (login instanceof StaticLogin) {
+      // Never the token or its fingerprint.
+      const s = login.static;
+      signedIn = !s.refused && !login.ended;
+      signIn = s.refused ? `refused: ${s.refused}`
+        : login.ended ? `run token ended; ${NEW_RUN}`
+        : `static run token for ${s.principal ? `service ${s.principal}` : "a service"} (issuer ${s.issuer})`;
+    } else {
+      const grant = await (login as Login).read().catch(() => undefined);
+      signedIn = !!grant && !grant.loginRequired && !!grant.access;
+      signIn = signedIn ? "signed in" : `signed out (${grant?.loginRequired?.reason ?? "never signed in"}); ${LOGIN_ACTION}`;
+    }
     const lines = [
       `server: ${login!.resource}`,
-      `sign-in: ${signedIn ? "signed in" : `signed out (${grant?.loginRequired?.reason ?? "never signed in"}); ${LOGIN_ACTION}`}`,
+      `sign-in: ${signIn}`,
       `session: ${session?.id ?? "not started"} (${role.kind === "child" ? `subagent of ${placement(role).root}` : role.kind === "loose" ? "unattributed subagent" : "root"})`,
     ];
     const delivery = root?.status();
     if (delivery?.held) lines.push(`delivery: ${delivery.held}`);
     if (delivery?.error) lines.push(`delivery: ${delivery.error}`);
     if (delivery?.controller) lines.push(describe(delivery.controller, signedIn));
+    if (state.signins.last) lines.push(signIns.describeLast(state.signins.last));
     if (loginNote) lines.push(`last sign-in event: ${loginNote}`);
     return lines.join("\n");
   };
@@ -365,14 +590,37 @@ export function createGrayboard(h: Harness): Grayboard {
     const verb = args.trim().split(/\s+/)[0] || "status";
     if ("error" in config) { log(config.error, "warning"); return; }
     try {
+      if (mode && (verb === "login" || verb === "logout")) {
+        // Nothing here signs in or out: the launcher holds the run token and revokes it.
+        log(verb === "login" ? `this run uses a launcher-set run token (static mode): there's no sign-in here; ${mode && "refused" in mode ? mode.refused : `if it stops working, ${NEW_RUN}`}`
+          : "this run uses a launcher-set run token: nothing to sign out here; the launcher revokes it", "warning");
+        return;
+      }
       if (verb === "login") {
+        // One flow per process: a pending one (an offer's) is joined, shown
+        // again and opened in the browser, not replaced.
+        const pending = state.signins.flow;
+        const flow = begin("command", true);
+        if (!flow) return;
+        if (flow === pending) {
+          flow.browser = true;
+          if (flow.url) { log(`sign in at ${flow.url}`); browse(flow.url); }
+          // Waiting behind another process's flow: say so again, not silence.
+          else if (flow.elsewhere) log(`${flow.elsewhere}; finish it there`);
+        }
+        await flow.done;
+        // A joined offer's flow that found the store already signed in says
+        // nothing itself (#592).
+        if (flow.outcome === "current") { if (!closed) log("already signed in"); return; }
+        // The flow said its outcome and restarted this runtime already. A
+        // runtime that shut down meanwhile (a /new) says nothing: an outcome
+        // still unsaid stays for the next root's start.
+        const last = state.signins.last;
+        if (!last || last.said || closed) return;
+        last.said = true;
         // Its own failure line: resume can't mend a sign-in that didn't happen.
-        try { await login!.login(); }
-        catch (error) { log(`sign-in failed: ${message(error)}; ${LOGIN_ACTION} to try again`, "error"); return; }
-        log("signed in");
-        // The watch's restart and this one are one epoch-guarded path.
-        if (root) await root.credentialChanged();
-        else if (proxy) await client!.connect(proxy);
+        outcomeLine(voice, last);
+        if (last.outcome === "signed in") await voice.restart();
       } else if (verb === "logout") {
         // Before the store changes: this session's own watch sees the new
         // epoch too, and the line below already says it.

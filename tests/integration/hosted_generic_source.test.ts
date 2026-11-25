@@ -20,6 +20,8 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { reprDigest } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { withMeta } from "../helpers/hosted.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
+import { stubProvider } from "../support/stub_provider.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -37,11 +39,11 @@ const clients: Client[] = [];
 // Every refusal and bind text the server returned, for the no-plugin/OpenCode wording check.
 const served: string[] = [];
 function start(oauthClients: OAuthClient[]) {
-  app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
+  app = startServer({ store: { kind: "sqlite" as const, path: join(dir, "db.sqlite") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
-    hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients,
+    hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, hostedSubscriberLimit: { burst: 10_000, perSec: 10_000 }, oauthClients, oauthCimdClients: [OPENCODE_CLIENT, CIMD_CLIENT],
   }, { hostname: "127.0.0.1", background: false, oauth: {
-    exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice" }),
+    providers: [stubProvider(async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }))],
     cimd: {
       resolve: async () => [{ address: "93.184.216.34", family: 4 }],
       read: async url => JSON.stringify({ client_id: url.href, client_name: url.href === OPENCODE_CLIENT ? "OpenCode" : "Metadata client", redirect_uris: [redirectUrl], token_endpoint_auth_method: "none" }),
@@ -64,23 +66,10 @@ afterEach(async () => {
 });
 
 const mapped = (url: string) => { const u = new URL(url); return base + u.pathname + u.search; };
-class Browser {
-  cookies = new Map<string, string>();
-  async request(url: string, init: RequestInit = {}) {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(mapped(url), { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) {
-      const [key, value] = cookie.split(";")[0]!.split("=");
-      this.cookies.set(key!, value!);
-    }
-    return res;
-  }
-}
 // The full authorization code flow with PKCE S256 a native client runs; only the upstream
-// identity provider is stubbed (`exchangeGoogle`).
+// identity provider is stubbed (`stubProvider`).
 async function grant(clientId: string): Promise<string> {
-  const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url"), browser = new Browser();
+  const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url"), browser = new Browser({ rewrite: mapped });
   const begin = await browser.request(`${issuer}/oauth/authorize?` + new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: redirectUrl, scope: SCOPES, resource, state,
     code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }));
   expect(begin.status).toBe(303);
@@ -88,8 +77,7 @@ async function grant(clientId: string): Promise<string> {
   const callback = await browser.request(`${issuer}/oauth/google/callback?` + new URLSearchParams({ code: "upstream-code", state: google.searchParams.get("state")!, iss: "https://accounts.google.com" }));
   expect(callback.status).toBe(303);
   const page = await (await browser.request(callback.headers.get("Location")!)).text();
-  const request = /name="request" value="([^"]+)"/.exec(page)![1]!, csrf = /name="csrf" value="([^"]+)"/.exec(page)![1]!;
-  const approved = await browser.request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: "https://grayboard.example.com" }, body: new URLSearchParams({ request, csrf, decision: "approve" }) });
+  const approved = await submitConsent(browser, `${issuer}/oauth/consent`, consentForm(page), "approve", "https://grayboard.example.com");
   expect(approved.status).toBe(303);
   const returned = new URL(approved.headers.get("Location")!);
   expect(returned.searchParams.get("state")).toBe(state);
@@ -99,11 +87,12 @@ async function grant(clientId: string): Promise<string> {
   expect(issued.scope).toBe(SCOPES);
   return issued.access_token;
 }
-async function connect(token: string, meta: [key: string, value: unknown][], opts: { role?: "subscriber"; version?: string } = {}): Promise<Conn> {
+// `name`: the MCP client info name the client declares.
+async function connect(token: string, meta: [key: string, value: unknown][], opts: { role?: "subscriber"; version?: string; name?: string } = {}): Promise<Conn> {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
   if (opts.role) headers.set("X-Grayboard-Client", opts.role);
   const version = opts.version ?? MCP_PROTOCOL_VERSIONS[0]!;
-  const client = new Client({ name: "brokered-client", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
+  const client = new Client({ name: opts.name ?? "brokered-client", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/hosted/mcp`), {
     fetch: async (input, init) => {
@@ -132,7 +121,8 @@ function json(result: CallToolResult) {
 // Native tools answer `error: <message>`, native bind a JSON body, the subscriber role a structured code.
 function refused(result: CallToolResult): unknown {
   expect(result.isError).toBe(true);
-  if (result.structuredContent && "code" in result.structuredContent) return result.structuredContent.code;
+  const structured = result.structuredContent as Record<string, unknown> | undefined;
+  if (structured && "code" in structured) return structured.code;
   const text = textOf(result);
   return text.startsWith("error: ") ? /^error: (\w+)/.exec(text)?.[1] : JSON.parse(text).code;
 }
@@ -146,8 +136,9 @@ async function readResource(c: Conn, uri: string) {
   if (!first || !("text" in first)) throw new Error("expected JSON resource content");
   return JSON.parse(first.text);
 }
-const attachment = (token: string, raw: string, id?: number) => fetch(`${base}/hosted/mcp/attachments${id === undefined ? "?filename=report.txt" : `/${id}`}`, {
-  method: id === undefined ? "POST" : "GET",
+// An upload without `id`; with one, a GET (or `method`) of that attachment.
+const attachment = (token: string, raw: string, id?: number, method = "GET") => fetch(`${base}/hosted/mcp/attachments${id === undefined ? "?filename=report.txt" : `/${id}`}`, {
+  method: id === undefined ? "POST" : method,
   headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(raw), ...(id === undefined ? { "Content-Length": String(bytes.length) } : {}) },
   ...(id === undefined ? { body: bytes } : {}),
 });
@@ -178,7 +169,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: an opted-in opera
   expect(inbox.items).toMatchObject([{ id: `direct:${sent.message_id}`, event: { kind: "direct", message: { body: "brokered hello" } } }]);
   json(await call(sub, "delivery_renew"));
   json(await call(sub, "delivery_receipt", { ids: inbox.items.map((i: { id: string }) => i.id) }));
-  expect(app.repo.cursors.directFor("alice@example.com/broker-run")).toBe(sent.message_id);
+  expect(await app.repo.cursors.directFor(app.repo.read, "alice@example.com/broker-run")).toBe(sent.message_id);
 
   const upload = await attachment(token, root);
   expect(upload.status).toBe(201);
@@ -204,11 +195,16 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
   await bind(owner, "owner");
   json(await call(owner, "board_create", { name: "brokered", purpose: "visible to the user" }));
   json(await call(owner, "board_post", { board: "brokered", body: "readable" }));
+  const upload = await attachment(kept, "owner");
+  expect(upload.status).toBe(201);
+  const { id } = await upload.json() as { id: number };
   // De-opt: config is read only at startup, so removing sessionSource takes effect on restart.
   await stop();
   start([operator(BROKER, false)]);
   // The bound root keeps its name; its client's requests are unmapped from now on.
-  expect(app.repo.hosted.all().filter(r => app.application.hostedHolds(r.session_id).some(a => a.endsWith("/owner"))).map(r => r.client_id)).toEqual([BROKER]);
+  const rows = await app.repo.hosted.all(app.repo.read);
+  const holds = await Promise.all(rows.map(r => app.application.hostedHolds(app.application.repo.read, r.session_id)));
+  expect(rows.filter((_, i) => holds[i]!.some(a => a.endsWith("/owner"))).map(r => r.client_id)).toEqual([BROKER]);
   const tokens = { kept, fresh: await grant(BROKER), cimd: await grant(CIMD_CLIENT) };
   for (const [label, token] of Object.entries(tokens)) {
     const meta: [string, string][] = [[GRAYBOARD_SESSION_META, "owner"], [OPENCODE_SESSION_META, "owner"]];
@@ -222,12 +218,14 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
     expect(refused(await call(native, "dm_send", { to: "owner", body: "write" })), label).toBe("unbound");
     expect(refused(await call(sub, "session_register", { child: "child" })), label).toBe("unbound");
     expect(refused(await call(sub, "delivery_open")), label).toBe("unbound");
-    const upload = await attachment(token, "owner");
-    expect(upload.status, label).toBe(403);
-    expect(await upload.json(), label).toMatchObject({ code: "unbound" });
+    for (const [route, response] of [["upload", attachment(token, "owner")], ["GET", attachment(token, "owner", id)], ["DELETE", attachment(token, "owner", id, "DELETE")]] as const) {
+      const r = await response;
+      expect(r.status, `${label} ${route}`).toBe(403);
+      expect(await r.json(), `${label} ${route}`).toMatchObject({ code: "unbound" });
+    }
   }
-  expect(app.repo.aliases.find("alice@example.com/intruder")).toBeUndefined();
-  expect(app.repo.hosted.all().map(r => r.source_session_id)).toEqual(["owner"]);
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/intruder")).toBeUndefined();
+  expect((await app.repo.hosted.all(app.repo.read)).map(r => r.source_session_id)).toEqual(["owner"]);
 });
 
 test("OpenCode maps only its own key and an opted-in client only the generic key", async () => {
@@ -246,8 +244,8 @@ test("OpenCode maps only its own key and an opted-in client only the generic key
     const alone = await connect(token, [[own, `root ${own}`]]);
     expect(json(await call(alone, "whoami"))).toMatchObject({ primary: `alice@example.com/${own === OPENCODE_SESSION_META ? "oc-run" : "broker-run"}` });
   }
-  expect(app.repo.aliases.find("alice@example.com/wrong-key")).toBeUndefined();
-  expect(app.repo.hosted.all().map(r => [r.client_id, r.source_session_id]).sort()).toEqual([
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/wrong-key")).toBeUndefined();
+  expect((await app.repo.hosted.all(app.repo.read)).map(r => [r.client_id, r.source_session_id]).sort()).toEqual([
     [BROKER, `root ${GRAYBOARD_SESSION_META}`], [OPENCODE_CLIENT, `root ${OPENCODE_SESSION_META}`],
   ]);
 });
@@ -260,15 +258,16 @@ test("one raw source under two clients of one user is two hosted sessions", asyn
   await bind(second, "second");
   expect(json(await call(first, "whoami"))).toMatchObject({ primary: "alice@example.com/first" });
   expect(json(await call(second, "whoami"))).toMatchObject({ primary: "alice@example.com/second" });
-  const rows = app.repo.hosted.all().filter(r => r.source_session_id === "shared");
+  const rows = (await app.repo.hosted.all(app.repo.read)).filter(r => r.source_session_id === "shared");
   expect(rows.map(r => r.client_id).sort()).toEqual([BROKER, BROKER_TWO].sort());
   expect(new Set(rows.map(r => r.session_id)).size).toBe(2);
 });
 
+// Each declares a built-in client's name, which only a generic service credential's session reads (#1298).
 test("peer_list shows an opted-in client's sessions under its client ID and OpenCode's as opencode", async () => {
   start([operator(BROKER, true)]);
-  const broker = await connect(await grant(BROKER), [[GRAYBOARD_SESSION_META, "broker root"]]);
-  const opencode = await connect(await grant(OPENCODE_CLIENT), [[OPENCODE_SESSION_META, "opencode root"]]);
+  const broker = await connect(await grant(BROKER), [[GRAYBOARD_SESSION_META, "broker root"]], { name: "grayboard-omp" });
+  const opencode = await connect(await grant(OPENCODE_CLIENT), [[OPENCODE_SESSION_META, "opencode root"]], { name: "grayboard-omp" });
   await bind(broker, "broker-run");
   await bind(opencode, "oc-run");
   const peers = json(await call(broker, "peer_list", { include_offline: true })).peers as { handle: string; harness?: string }[];
@@ -291,7 +290,7 @@ test("with no operator clients, each built-in client signs in through consent, b
   }
   const peers = json(await call(conns[0]!, "peer_list", { include_offline: true })).peers as { handle: string; harness?: string }[];
   expect(peers.filter(p => p.handle.endsWith("-run")).map(p => [p.handle, p.harness]).sort()).toEqual(harnesses.map(h => [`alice@example.com/${h}-run`, h]).sort());
-  expect(app.repo.hosted.all().map(r => r.client_id).sort()).toEqual([...BUILTIN_CLIENT_IDS].sort());
+  expect((await app.repo.hosted.all(app.repo.read)).map(r => r.client_id).sort()).toEqual([...BUILTIN_CLIENT_IDS].sort());
 });
 
 test("a built-in client's delivery declaration selects its initialize and bind text", async () => {
@@ -321,10 +320,12 @@ test("a built-in client's delivery declaration selects its initialize and bind t
   expect(pushText).toContain(`Board activity arrives as <channel source="grayboard-pi" board="..."`);
   expect(pushText).not.toContain("Poll dm_inbox");
   const absentText = await instructions([[GRAYBOARD_SESSION_META, "poll root"]]);
-  expect(absentText).toStartWith(`You are "alice@example.com/poll-run" on grayboard. Poll dm_inbox and board_list for pending work. Requests from peer agents`);
+  // No declaration and no lease: it polls, and says why nothing is pushed yet (#531).
+  const noLease = `No delivery lease is open for this session, so DMs to "alice@example.com/poll-run" wait until the client opens one (delivery_open).`;
+  expect(absentText).toStartWith(`You are "alice@example.com/poll-run" on grayboard. Poll dm_inbox and board_list for pending work. ${noLease} Requests from peer agents`);
   expect(absentText).not.toContain("<channel");
   const pollText = await instructions([[GRAYBOARD_SESSION_META, "poll root"], [GRAYBOARD_DELIVERY_META, poll]]);
-  expect(pollText).toBe(absentText!.replace("for pending work.", "for pending work. No pushes reach this session; check dm_inbox and board_read yourself."));
+  expect(pollText).toBe(absentText!.replace(noLease, "No pushes reach this session; check dm_inbox and board_read yourself."));
 });
 
 test("a malformed delivery declaration is bad_request on initialize and on a native tool call; other clients' and roles' are never read", async () => {
@@ -355,6 +356,13 @@ test("a malformed delivery declaration is bad_request on initialize and on a nat
     expect(await (await connect(oc, [[OPENCODE_SESSION_META, "oc root"], [GRAYBOARD_DELIVERY_META, declared]])).client.getInstructions()).toBe(plainText);
   }
   expect(plainText).toStartWith(`You are "alice@example.com/oc-run" on grayboard. Poll dm_inbox and board_list for pending work.`);
+  // With its plugin's lease open, the same session's text says its mail is pushed (#531).
+  const ocSub = await connect(oc, [[OPENCODE_SESSION_META, "oc root"]], { role: "subscriber" });
+  ocSub.headers.set("X-Grayboard-Lease", json(await call(ocSub, "delivery_open")).capability);
+  const leasedText = await (await connect(oc, [[OPENCODE_SESSION_META, "oc root"]])).client.getInstructions();
+  expect(leasedText).toStartWith(`You are "alice@example.com/oc-run" on grayboard. Direct messages arrive as <channel source="grayboard" message_id="..."`);
+  expect(leasedText).not.toContain("Poll dm_inbox");
+  expect(leasedText).not.toContain("delivery_open");
 });
 
 test("no server refusal text names the plugin or OpenCode", () => {

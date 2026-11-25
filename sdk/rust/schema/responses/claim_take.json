@@ -1,0 +1,21 @@
+{
+  "arguments": {
+    "key": "ticket:ENG-142",
+    "note": "recording",
+    "board": "rec"
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"ok\": true,\n  \"claim\": {\n    \"key\": \"ticket:ENG-142\",\n    \"holder\": \"you@example.com/rec-a\",\n    \"note\": \"recording\",\n    \"board\": \"rec\",\n    \"acquired_at\": 1700000000000,\n    \"expires_at\": 1700000000000\n  },\n  \"renewed\": false\n}"
+      }
+    ]
+  }
+}

@@ -16,7 +16,9 @@ import type { DiagnosticSink } from "./diagnostics.js";
 import type { Lock } from "./lock.js";
 import { accessExpiry, DeliveryHeldElsewhere, Refusal, type AccessExpired, type Identity, type Item } from "./model.js";
 import type { HostPort } from "./port.js";
-import { failure, hostTools, snapshotTools, type NativeTool, type ToolProxy } from "./proxy.js";
+import { CallAborted, failure, hostTools, snapshotTools, type NativeTool, type ToolProxy } from "./proxy.js";
+import { refusalOf } from "./results.js";
+import { end, register } from "./children.js";
 import { AncestryError } from "./sessions.js";
 import { deliveryPath, FileStorage, sessionPath, tryDelivery, waitDelivery } from "./storage.js";
 
@@ -26,9 +28,18 @@ export type RootOptions = {
   place: () => string;              // the bind's `where`
   push: boolean;                    // false: tools-only (Claude Code with channels off): no lock, no Controller
   carried?: string[];               // a /new or /fork's carried holds (pi/omp), taken by the first start that binds them
+  // An explicit BUS_IDENTITY (normalized, #443): a session with nothing to
+  // take back (no remembered or carried names) binds it at its first start,
+  // creating it if new, as local mode does. Done once it binds or the server
+  // refuses it; unreachable or signed out, a later start (tools-only: a later
+  // call) tries again.
+  configured?: string;
+  // false: the host starts a turn for every item it admits (Claude Code), so the lease withholds non-waking ones (#854).
+  context?: false;
   // The host renders and delivers; `signal` is the Controller run loop's, which
   // a host whose admit waits (Claude Code's `initialized`) races.
   admit(item: Item, stableID: string, identity: Identity, signal: AbortSignal): Promise<void>;
+  receipted?(ids: readonly string[]): void; // the server committed these items' receipt (HostPort.receipted)
   onTools(tools: NativeTool[]): void;
 };
 export type RootStatus = {
@@ -48,6 +59,11 @@ export class NotStarted extends Error {
 const SLOTS = ["held", "start", "sink", "first", "last"] as const;
 type Slot = typeof SLOTS[number];
 
+// The server's answers that refuse a configured name for good: held, the
+// user's handle, malformed. Anything else (unreachable, signed out) is tried
+// again by the next start.
+const REFUSED = new Set(["alias_held", "refused", "bad_request", "forbidden", "not_found"]);
+
 export class RootDelivery {
   private closed = false;          // shutdown began: nothing new starts
   private done = false;            // shutdown finished: nothing more is said
@@ -63,6 +79,7 @@ export class RootDelivery {
   private signedOut: AccessExpired | undefined;
   private begun: string | undefined;     // the store epoch this root last (re)started under
   private carrying: string[] | undefined;  // the carried holds, until a start takes them
+  private configuring: string | undefined; // the configured name, until the server answers its bind
   private starting: Promise<void> | undefined;   // own(): the Controller and push proxy coming up
   private restarting: Promise<void> | undefined;
   private used = false;                  // a call went out under this session's id
@@ -70,9 +87,12 @@ export class RootDelivery {
   private lastBinding: string | undefined;
   private lastRecord: string | undefined;
   private storeUnreadable = false;       // the sign-in store's read failure was said
+  private hooked: ToolProxy | undefined; // the push proxy, whose Controller registers children itself
+  private readonly children = new Set<string>();                  // child ids a host call passed
 
   constructor(private readonly client: HostedClient, private readonly o: RootOptions) {
     this.carrying = o.carried;
+    this.configuring = o.configured;
   }
 
   // Said through the host until shutdown finishes: the shutdown's own
@@ -80,7 +100,7 @@ export class RootDelivery {
   private log(text: string, level: "info" | "warning" | "error") {
     if (!this.done) this.client.options.log(text, level);
   }
-  private path() { return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.options.clientId, this.o.sessionID); }
+  private path() { return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.login.stateKey, this.o.sessionID); }
   // An unreadable store leaves the epoch unknown, so the sink may take a
   // later pause for a credential change and drop it: said once per root.
   private async epoch() {
@@ -97,8 +117,8 @@ export class RootDelivery {
   async start(): Promise<void> {
     if (this.closed || this.watcher) return;
     this.watcher = this.client.watch();
-    this.subscription = this.client.onChange(signedIn => { if (signedIn) void this.restartIfChanged(); });
-    if (!this.o.push) { this.toolsOnly(); return; }
+    this.subscription = this.client.onChange(signedIn => { if (signedIn) void (this.o.push ? this.restartIfChanged() : this.bindConfigured()); });
+    if (!this.o.push) { this.toolsOnly(); void this.bindConfigured(); return; }
     await this.take();
   }
   private async take(): Promise<void> {
@@ -152,6 +172,44 @@ export class RootDelivery {
   }
   private listed(tools: NativeTool[]) { if (!this.closed) this.o.onTools(tools); }
 
+  // Tools-only by the host's choice (no delivery for anyone to hold): the
+  // configured name binds through this process's own connection, at start,
+  // after a sign-in, and before the agent's next call while an unreachable
+  // try left it unbound. Bound or refused (REFUSED): done. One try at a time;
+  // a call waits for it, so the agent's own bind lands after it. Never rejects.
+  private bindingConfigured: Promise<void> | undefined;
+  private bindConfigured(): Promise<void> {
+    if (!this.configuring || !this.proxy || this.closed) return Promise.resolve();
+    return this.bindingConfigured ??= this.tryConfigured(this.configuring, this.proxy).finally(() => { this.bindingConfigured = undefined; });
+  }
+  private async tryConfigured(name: string, proxy: ToolProxy): Promise<void> {
+    try {
+      // Signed out: the sign-in's change binds it; the proxy would only answer "sign in".
+      try { await this.client.login.token(); }
+      catch (error) { if (accessExpiry(error)) return; throw error; }
+      if (this.closed) return;
+      this.used = true;
+      const result = await this.client.call(proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
+      if (this.closed) return;
+      if (!result.isError) { this.configuring = undefined; return; }
+      const { code, why } = refusalOf(result);
+      if (code && REFUSED.has(code)) this.configuring = undefined;
+      this.configuredMissed(name, code ? `${code}: ${why}` : why, !this.configuring);
+    } catch (error) {
+      if (!this.closed) this.configuredMissed(name, message(error), false);
+    }
+  }
+  // Said once per distinct outcome: an unreachable server retried before
+  // every call would otherwise repeat the same line on each.
+  private configuredSaid: string | undefined;
+  private configuredMissed(name: string, why: string, final: boolean) {
+    const text = `BUS_IDENTITY asked for "${name}", but this session couldn't bind it (${why}); it ${final ? "started unbound" : "is unbound until a later try binds it"}`;
+    if (text === this.configuredSaid) return;
+    this.configuredSaid = text;
+    this.notices.set("start", text);
+    this.log(text, "warning");
+  }
+
   // The lock is ours: run the Controller and declare push delivery. Never
   // rejects. Every await re-checks `closed`, so a start the shutdown overtook
   // builds nothing more; the shutdown awaits it, then closes the connection
@@ -167,13 +225,13 @@ export class RootDelivery {
       // makes (an unreadable state file) is weighed against this epoch.
       this.begun = await this.epoch();
       if (this.closed) return;
-      const controller = this.controller = new Controller(this.port(), { sink: this.sink });
+      const controller = this.controller = new Controller(this.port(), { sink: this.sink, ...(this.o.context === false ? { context: false as const } : {}) });
       await controller.restore();
       if (this.closed) return;
       // The tools-only proxy's calls in flight finish on it.
       const proxy = this.client.proxy("push", { hooks: controller, onTools: tools => this.listed(tools), onAfterFailure: () => controller.backgroundFailure("after") });
       const old = this.proxy;
-      this.proxy = proxy;
+      this.proxy = this.hooked = proxy;
       if (old) void this.client.retire(old);
       await this.client.connect(proxy);
       if (this.closed) return;
@@ -185,12 +243,15 @@ export class RootDelivery {
     const c = this.client.options, id = this.o.sessionID, wire = this.client.wireOptions("push");
     return {
       harness: c.harness, resumeHint: c.resumeHint, loginAction: c.loginAction, sessionKey: wire.sessionKey,
-      client: wire.client, delivery: wire.delivery!,
-      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
+      client: wire.client, delivery: wire.delivery!, ...(wire.launcher ? { launcher: true as const } : {}), ...(wire.facts ? { facts: wire.facts } : {}), ...(wire.suggested ? { suggested: wire.suggested } : {}),
+      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, this.client.login.stateKey, id)),
       place: this.o.place,
+      // This root, or a child a host call passed (Claude Code's subagents, #551);
+      // any other session is refused.
       ancestry: async sessionID => {
-        if (sessionID !== id) throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
-        return { sessionID, root: id, via: [] };
+        if (sessionID === id) return { sessionID, root: id, via: [] };
+        if (this.children.has(sessionID)) return { sessionID, root: id, via: [] };
+        throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
       },
       credential: this.client.login.credential(),
       approval: null,
@@ -199,6 +260,7 @@ export class RootDelivery {
         if (signal.aborted) throw new Refusal("paused", `the ${c.harness} session closed`);
         await this.o.admit(item, stableID, identity, signal);
       },
+      ...(this.o.receipted ? { receipted: (_e: unknown, ids: readonly string[]) => this.o.receipted!(ids) } : {}),
     };
   }
 
@@ -217,8 +279,20 @@ export class RootDelivery {
       // Set before the start: the sink weighs a pause its run loop reaches
       // before resume returns against this epoch.
       this.begun = await this.epoch();
-      const expected = carried ?? await controller.carried(id);
-      const status = carried ? await controller.enroll(id, carried, false) : await controller.resume(id);
+      // Taking back what this session held, or a /new's carried names, comes
+      // before BUS_IDENTITY, as a local restart's names do (#443).
+      const back = carried ? undefined : await controller.takeBack(id);
+      const remembered = back === "unreadable" ? undefined : back;
+      // Only a session with nothing to take back binds it, and only until it
+      // first lands: a later restart (a sign-in, an unpause) after the agent
+      // unbound never brings it back. Remembered holds that couldn't be read
+      // may exist, so this start resumes instead and a later one decides.
+      if (carried || remembered) this.configuring = undefined;
+      const configured = back === "unreadable" ? undefined : this.configuring;
+      const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
+      const status = carried ? await controller.enroll(id, carried, false)
+        : configured ? await controller.enroll(id, [configured], true)
+        : await controller.resume(id);
       if (this.closed) return;
       this.signedOut = undefined;
       // The Controller's own bind changed what the server's instructions say.
@@ -227,11 +301,25 @@ export class RootDelivery {
       // enroll's and resume's failures record operation "enroll"; a resume
       // names its root before the rebind, so the name alone proves nothing.
       const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
+      // An enroll whose binds landed but whose prepare failed records "prepare" with the
+      // failure's code (#544 item 2; prepare's own progress records carry none): the
+      // server holds what it asked for, though delivery didn't start.
+      const landed = (carried || configured) && root?.operation === "prepare" && root.code !== undefined ? expected : undefined;
       if (carried && bound?.length && this.carrying === carried) this.carrying = undefined;
-      const missing = (expected ?? []).filter(address => !bound?.includes(address));
-      if (missing.length && root?.state !== "paused") {
+      // Bound, or refused by the server (held, the user's handle): tried for
+      // good. Unreachable or signed out: the next start tries again.
+      // The configured name is bare; holds are qualified (`<email>/<name>`).
+      const holds = (address: string) => !![...bound ?? [], ...landed ?? []].some(b => b === address || b.endsWith(`/${address}`));
+      if (configured && (holds(configured) || REFUSED.has(root?.code ?? ""))) this.configuring = undefined;
+      const missing = (expected ?? []).filter(address => !holds(address));
+      if (landed && root?.state !== "paused") {
+        const text = `this session is bound as ${landed.join(", ")}, but delivery couldn't start (${root?.message ?? status.message})`;
+        this.notices.set("start", text);
+        this.log(text, "warning");
+      } else if (missing.length && root?.state !== "paused") {
         const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
-        const text = carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}`
+        const text = configured ? `BUS_IDENTITY asked for "${configured}", but this session couldn't bind it (${root?.message ?? status.message}); ${now}`
+          : carried ?`this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}`
           : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
         this.notices.set("start", text);
         this.log(text, "warning");
@@ -305,8 +393,19 @@ export class RootDelivery {
   // A held root refuses bind and unbind; then the host's `before` (the
   // plugin's sign-in offer and unpause), whose notice is shown last; then
   // the call. The notices go first, each as its own text block.
-  async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>): Promise<CallToolResult> {
+  //
+  // `child` (a raw session id): the call is a direct child's of this root
+  // (Claude Code's subagents, #551). It registers under the root first: the
+  // push proxy's Controller does so in its beforeCall, through the ancestry
+  // above; the tools-only proxy has no hooks, so the root registers it here,
+  // once. The server refuses a child's bind and unbind. The root's notices
+  // stay for the root's next result: a child's agent isn't the one to act on them.
+  // `passed` runs once the child is this root's to end (the plugin notes it, #555).
+  // `signal`: the harness's abort of this call (ToolProxy.call).
+  async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, o: { child?: string; passed?: () => void; signal?: AbortSignal } = {}): Promise<CallToolResult> {
+    if (o.signal?.aborted) throw new CallAborted();
     if (!this.proxy) return failure(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
+    if (o.child !== undefined) return this.childCall(o.child, tool, args, before, o.passed, o.signal);
     // The process holding delivery owns this session's binding: a tools-only
     // one rebinding it would fight the holder. Checked again after `before`,
     // whose retry of a lock error (the plugin's unpause) can find it held.
@@ -316,11 +415,44 @@ export class RootDelivery {
     const after = before ? await before() : undefined;
     const late = refused();
     if (late) return late;
+    // Tools-only: a configured name not yet bound goes first (#443).
+    if (!this.o.push) await this.bindConfigured();
     this.used = true;
-    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
+    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID, o.signal);
     const shown = [...SLOTS.map(slot => this.notices.get(slot)), after].filter((n): n is string => !!n);
     this.notices.clear();
     return shown.length ? { ...result, content: [...shown.map(n => ({ type: "text" as const, text: `grayboard: ${n}` })), ...result.content] } : result;
+  }
+
+  private async childCall(child: string, tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, passed?: () => void, signal?: AbortSignal): Promise<CallToolResult> {
+    if (this.closed) return failure(`this ${this.client.options.harness} session is closing`);
+    const after = before ? await before() : undefined;
+    const proxy = this.proxy!;
+    this.children.add(child);
+    passed?.();
+    this.used = true;
+    // The push proxy's Controller registers the child before each call. The
+    // tools-only proxy does the same here: a registration remembered across
+    // calls would outlive a root the server ended (idle, disabled), and the
+    // child's next call would then make it a root of its own (#553 audit 3).
+    if (proxy !== this.hooked) {
+      try { await register(this.client.temporary, { root: this.o.sessionID, via: [], child }); }
+      catch (error) { return failure(`couldn't register this subagent's grayboard session ${child} under its root, so the call didn't run: ${message(error)}; ${this.client.options.retryHint}`); }
+    }
+    const result = await this.client.call(proxy, tool, args, child, signal);
+    return after ? { ...result, content: [{ type: "text" as const, text: `grayboard: ${after}` }, ...result.content] } : result;
+  }
+  // A child's agent finished (Claude Code's SubagentStop): its hosted session
+  // ends now: the server's idle sweep ends only roots, so a child's session
+  // otherwise lasts until its root's does. Only a child a call passed; said on
+  // failure. `called`: the host knows a call passed in an earlier process of
+  // this session (the plugin's record dir survives its restart, #555); the
+  // host forgets a call once its root's release ended the child, which spares
+  // a request (the end's wire admits nothing, #1099). Never rejects.
+  async endChild(child: string, called = false): Promise<void> {
+    if (!this.children.delete(child) && !called) return;
+    try { await end(this.client.temporary, { child }); }
+    catch (error) { this.log(`couldn't end subagent session ${child} on the server: ${message(error)}`, "warning"); }
   }
 
   tools(): NativeTool[] { return this.proxy?.tools() ?? hostTools(snapshotTools()); }

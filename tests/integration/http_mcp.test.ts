@@ -1,58 +1,60 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startServer } from "../../src/server/app.ts";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { TestServer } from "../support/server.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
-import { verifySessionToken } from "../../src/server/auth.ts";
-import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
-import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { AppSession, type AppSessionOptions } from "../support/app_session.ts";
+import { type AppSession, type AppSessionOptions, signedIn } from "../support/app_session.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
+import { GRAYBOARD_LAUNCHER_META } from "../../src/shared/session_meta.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
+import { seed } from "../support/seed.ts";
+import { drained, row, rows } from "../support/repo_sql.ts";
+import { stubAuthRead } from "../support/auth_stub.ts";
+import { until } from "../support/until.ts";
+import { queueSkippedCount, render as renderMetrics } from "../../src/server/metrics.ts";
+import { queueFor, type WriteQueue } from "../../src/server/store/queue.ts";
 
-let app: ReturnType<typeof startServer>;
+let srv: TestServer;
+let app: TestServer["app"];
 let base: string;
-let blobDir: string;
 let clock: number | undefined;
 const clients: Client[] = [];
 const appSessions: AppSession[] = [];
 const publicUrl = "https://grayboard.example.com:443/hosted";
 const trustedOrigin = "https://grayboard.example.com";
-beforeEach(() => {
+beforeEach(async () => {
   clock = undefined;
-  blobDir = mkdtempSync(join(tmpdir(), "gb-http-mcp-"));
-  app = startServer({ dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock ?? Date.now() } });
+  srv = await TestServer.open({ publicUrl, admins: ["alice@example.com"] }, { hostname: "127.0.0.1", oauth: { now: () => clock ?? Date.now() } });
+  app = srv.app;
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
   for (const s of appSessions.splice(0)) s.close();
   await Promise.all(clients.splice(0).map(c => c.close()));
-  await app.stop();
-  app.db.close();
-  rmSync(blobDir, { recursive: true, force: true });
+  await srv.stop();
 });
 async function login(email = "alice@example.com", scopes = ["grayboard:tools"]) {
-  return issueOAuth(app.repo, app.oauth.resource, email, scopes, Date.now(), OPENCODE_CLIENT).token;
+  return (await issueOAuth(app.repo, app.oauth.resource, email, scopes, Date.now(), OPENCODE_CLIENT)).token;
 }
 async function legacyLogin(email = "alice@example.com") {
   const res = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
   const token = (await res.json() as { session_token: string }).session_token;
-  const user = app.repo.users.findByEmail(email)!;
-  for (const name of ["be", "allowed"]) {
-    if (!app.repo.aliases.find(`${user.email}/${name}`)) app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: name }, user.email);
-  }
+  const user = (await app.repo.users.findByEmail(app.repo.read, email))!;
+  await seed(app.repo, async tx => {
+    for (const name of ["be", "allowed"]) {
+      if (!(await app.repo.aliases.find(tx, `${user.email}/${name}`))) await app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: name }, user.email);
+    }
+  });
   return token;
 }
 // An application session (#282) signed in with a session token: the launcher
 // the hosted MCP has no form of yet (#451).
 function appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-  const authed = verifySessionToken(token, app.repo, app.touches);
-  if (!authed) throw new Error("appSession: the token doesn't authenticate");
-  const s = new AppSession(app.application, authed, identity, opts);
+  const s = signedIn(app, token, identity, opts);
   appSessions.push(s);
   return s;
 }
@@ -63,7 +65,7 @@ async function connect(token: string, identity = "be", version = "2026-07-28", o
   });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity, ...(origin === undefined ? {} : { Origin: origin }) } },
+    requestInit: { headers: { Authorization: `Bearer ${token}`, ...(origin === undefined ? {} : { Origin: origin }) } },
     fetch: async (input, init) => fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, identity)),
   }));
   if (bind) await bindFixture(client, identity);
@@ -93,27 +95,24 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
-// hosted twin: #451 (the launcher)
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation uses the live owning launcher without becoming one`, async () => {
   const token = await login();
-  const owner = appSession(await legacyLogin(), "allowed");
+  const owner = appSession(await legacyLogin(), "allowed", { launcher: true });
   await owner.connect();
-  // The hello's launcher flag is gone (#282); the row is what delegate and peer_list read.
-  app.db.query(`UPDATE ids SET launcher = 1 WHERE id = ?`).run(owner.id);
   const client = await connect(token, "be", version);
   expect((await client.listTools()).tools.map(t => t.name)).toContain("delegate");
   const result = value(await client.callTool({ name: "delegate", arguments: { persona: "a researcher", task: "inspect the fixture", to: "AlLoWeD" } }));
   expect(result).toMatchObject({ to: "alice@example.com/allowed", delivered_now: true, pending: true });
   expect(result.note).toContain("settle the thread");
-  expect(app.repo.messages.getById(result.message_id)).toMatchObject({ sender: "alice@example.com/be", recipient: "alice@example.com/allowed", pending: 1 });
-  expect(JSON.parse(app.repo.audit.last("delegation.requested", "alice@example.com/allowed")!.detail!)).toMatchObject({ via: "explicit", message_id: result.message_id });
+  expect((await app.repo.messages.getById(app.repo.read, result.message_id))).toMatchObject({ sender: "alice@example.com/be", recipient: "alice@example.com/allowed", pending: 1 });
+  expect(JSON.parse((await app.repo.audit.last(app.repo.read, "delegation.requested", "alice@example.com/allowed"))!.detail!)).toMatchObject({ via: "explicit", message_id: result.message_id });
   expect((value(await client.callTool({ name: "peer_list", arguments: {} })).peers as { handle: string; launcher?: boolean }[]).find(p => p.handle === "alice@example.com/be")?.launcher).toBeUndefined();
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin gates discovery and tools before identity creation`, async () => {
   const token = await login();
   await expect(connect(token, "refused", version, "https://foreign.example.com")).rejects.toThrow();
-  expect(app.repo.aliases.find("alice@example.com/refused")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/refused")).toBeUndefined();
   let origin = trustedOrigin;
   let identity = "allowed";
   const client = new Client({ name: "origin-test", version: "1" }, {
@@ -126,7 +125,6 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin
     fetch: (input, init) => {
       const req = new Request(input, init);
       req.headers.set("Origin", origin);
-      req.headers.set("X-Grayboard-Identity", identity);
       return fetch(req);
     },
   }));
@@ -140,11 +138,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin
     await expect(client.callTool({ name: "board_create", arguments: { name: "forbidden", purpose: "must not dispatch" } })).rejects.toThrow();
     for (const method of ["POST", "GET", "DELETE", "OPTIONS", "PUT", "PATCH", "HEAD"]) {
       const res = await fetch(`${base}/mcp`, {
-        method, headers: { Origin: forbidden, Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity, "MCP-Protocol-Version": version },
+        method, headers: { Origin: forbidden, Authorization: `Bearer ${token}`, "MCP-Protocol-Version": version },
       });
       expect(res.status).toBe(403);
     }
-    expect(app.repo.aliases.find(`alice@example.com/${identity}`)).toBeUndefined();
+    expect(await app.repo.aliases.find(app.repo.read, `alice@example.com/${identity}`)).toBeUndefined();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   }
   origin = trustedOrigin;
@@ -171,7 +169,7 @@ test("all HTTP methods authenticate; identity headers never bind an uncontextual
     expect((await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "no context" } })).isError).toBe(true);
     expect((await client.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).toBe(true);
   }
-  expect(app.repo.aliases.find("alice@example.com/human")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/human")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
@@ -183,7 +181,7 @@ test("concurrent requests are principal isolated; inbox reads never acknowledge 
   const histories = await Promise.all(Array.from({ length: 12 }, (_, i) => (i % 2 ? a : b).callTool({ name: "peer_list", arguments: { include_offline: true } })));
   histories.forEach((r, i) => expect(value(r).you).toBe(`${i % 2 ? "alice" : "bob"}@example.com/be`));
   expect(value(await b.callTool({ name: "dm_inbox", arguments: {} })).unanswered).toHaveLength(1);
-  expect(app.repo.cursors.directFor("bob@example.com/be")).toBe(0);
+  expect(await app.repo.cursors.directFor(app.repo.read, "bob@example.com/be")).toBe(0);
   expect(value(await a.callTool({ name: "dm_inbox", arguments: {} })).unanswered).toHaveLength(0);
   expect(value(await a.callTool({ name: "dm_inbox", arguments: {} })).promised).toHaveLength(1);
   const c = await connect(await login("carol@example.com"));
@@ -191,7 +189,7 @@ test("concurrent requests are principal isolated; inbox reads never acknowledge 
   expect((await c.callTool({ name: "dm_ack", arguments: { message_id: sent.message_id } })).isError).toBe(true);
   expect(value(await b.callTool({ name: "dm_ack", arguments: { message_id: [sent.message_id, 999999] } }))).toMatchObject({ acked: [sent.message_id], not_found: [999999] });
   expect(value(await b.callTool({ name: "dm_inbox", arguments: {} })).unanswered).toHaveLength(0);
-  expect(app.repo.cursors.directFor("bob@example.com/be")).toBe(0);
+  expect(await app.repo.cursors.directFor(app.repo.read, "bob@example.com/be")).toBe(0);
   expect((await a.callTool({ name: "dm_retract", arguments: { message_id: sent.message_id } })).isError).not.toBe(true);
   expect(value(await b.callTool({ name: "dm_history", arguments: {} }))).toEqual([]);
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
@@ -220,9 +218,10 @@ test("invalid schemas and local paths fail without mutation; application errors 
 test("attachment IDs bind only the caller's uploads and downloads stay access checked", async () => {
   const [alice, bob, carol] = await Promise.all([login(), login("bob@example.com"), login("carol@example.com")]);
   const [a, b, c] = await Promise.all([connect(alice), connect(bob), connect(carol)]);
-  const uploaded = await fetch(`${base}/api/attachments?as=be&filename=note.txt`, {
-    method: "POST", headers: { Authorization: `Bearer ${await legacyLogin()}` }, body: "public fixture text",
-  });
+  // The hosted byte routes act as the session the header names: each user's connection is keyed "be".
+  const bytes = (token: string, path: string, init: RequestInit = {}) =>
+    fetch(`${base}/mcp/attachments${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Session": "be" } });
+  const uploaded = await bytes(alice, "?filename=note.txt", { method: "POST", body: "public fixture text" });
   expect(uploaded.status).toBe(201);
   const attachment = await uploaded.json() as { id: number };
   expect((await c.callTool({ name: "dm_send", arguments: { to: "bob@example.com/be", body: "stolen", attachment_ids: [attachment.id] } })).isError).toBe(true);
@@ -230,19 +229,30 @@ test("attachment IDs bind only the caller's uploads and downloads stay access ch
   expect(sent.attachments).toMatchObject([{ id: attachment.id }]);
   const thread = value(await b.callTool({ name: "dm_thread", arguments: { thread: sent.message_id } }));
   expect(thread[0].attachments).toMatchObject([{ id: attachment.id }]);
-  for (const [token, status] of [[await legacyLogin("bob@example.com"), 200], [await legacyLogin("carol@example.com"), 404]] as const) {
-    const download = await fetch(`${base}/api/attachments/${attachment.id}?as=be`, { headers: { Authorization: `Bearer ${token}` } });
+  for (const [token, status] of [[bob, 200], [carol, 404]] as const) {
+    const download = await bytes(token, `/${attachment.id}`);
     expect(download.status).toBe(status);
     if (status === 200) expect(await download.text()).toBe("public fixture text");
+    else await download.body?.cancel();
   }
   expect((await a.callTool({ name: "dm_send", arguments: { to: "bob@example.com/be", body: "reuse", attachment_ids: [attachment.id] } })).isError).toBe(true);
+});
+
+// #475: the session-token attachment routes (`/api/attachments?as=`) are gone; files travel only through the hosted byte routes.
+test("the old /api/attachments routes answer 404", async () => {
+  const token = await legacyLogin();
+  for (const [method, path] of [["POST", "/api/attachments?as=be&filename=note.txt"], ["GET", "/api/attachments/1?as=be"], ["DELETE", "/api/attachments/1?as=be"]] as const) {
+    const response = await fetch(`${base}${path}`, { method, headers: { Authorization: `Bearer ${token}` }, ...(method === "POST" ? { body: "x" } : {}) });
+    expect([method, response.status]).toEqual([method, 404]);
+    await response.body?.cancel();
+  }
 });
 
 test("revocation is checked on subsequent calls, including legacy", async () => {
   for (const version of ["2026-07-28", "2025-11-25"]) {
     const token = await login("bob@example.com");
     const c = await connect(token, "be", version);
-    app.repo.sessions.revokeAllForUser(app.repo.users.findByEmail("bob@example.com")!.id);
+    await seed(app.repo, async tx => app.repo.sessions.revokeAllForUser(tx, (await app.repo.users.findByEmail(tx, "bob@example.com"))!.id));
     await expect(c.listTools()).rejects.toThrow();
   }
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
@@ -251,15 +261,15 @@ test("revocation is checked on subsequent calls, including legacy", async () => 
 test("OAuth challenges and actual scope precede identity validation on every method", async () => {
   const legacy = await legacyLogin();
   const delivery = await login("alice@example.com", ["grayboard:delivery"]);
-  const expired = issueOAuth(app.repo, app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now() - 3_600_001).token;
+  const expired = (await issueOAuth(app.repo, app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now() - 3_600_001)).token;
   for (const method of ["POST", "GET", "DELETE", "OPTIONS", "PUT", "PATCH", "HEAD"]) {
     for (const [token, status, error] of [[legacy, 401, "invalid_token"], [expired, 401, "invalid_token"], [delivery, 403, "insufficient_scope"], ["wrong", 401, "invalid_token"]] as const) {
-      const response = await fetch(`${base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } });
+      const response = await fetch(`${base}/mcp`, { method, headers: { Authorization: `Bearer ${token}` } });
       expect(response.status).toBe(status);
       expect(response.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${app.oauth.resourceMetadata}", scope="${status === 401 ? "grayboard:delivery grayboard:tools" : "grayboard:tools"}", error="${error}"`);
     }
   }
-  expect(app.repo.aliases.find("alice@example.com/unselected")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
@@ -273,13 +283,17 @@ test("combined shared native grant remains non-owning with read-only resources",
 
 test("live access, family, disable and admin revocation never reuse a cached principal", async () => {
   for (const action of ["access", "family", "disable", "admin"] as const) {
-    const issued = issueOAuth(app.repo, app.oauth.resource, `${action}@example.com`, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
+    const issued = await issueOAuth(app.repo, app.oauth.resource, `${action}@example.com`, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
     const client = await connect(issued.token);
     switch (action) {
-      case "access": app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now()); break;
-      case "family": app.repo.oauth.revokeToken(issued.tokens.refreshHash, issued.binding.clientId, Date.now()); break;
-      case "disable": app.repo.users.setDisabled(issued.authed.user_id, true); app.repo.users.setDisabled(issued.authed.user_id, false); break;
-      case "admin": app.repo.sessions.revokeAllForUser(issued.authed.user_id); break;
+      case "access": await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, Date.now())); break;
+      case "family": await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.refreshHash, issued.binding.clientId, Date.now())); break;
+      // Two bodies, as the two autocommit writes were: the disable commits before the re-enable.
+      case "disable":
+        await seed(app.repo, tx => app.repo.users.setDisabled(tx, issued.authed.user_id, true));
+        await seed(app.repo, tx => app.repo.users.setDisabled(tx, issued.authed.user_id, false));
+        break;
+      case "admin": await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, issued.authed.user_id)); break;
     }
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "revoked" } })).rejects.toThrow();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
@@ -289,16 +303,17 @@ test("live access, family, disable and admin revocation never reuse a cached pri
 test("old session remains accepted on retained API but not new MCP", async () => {
   const token = await legacyLogin();
   const headers = { Authorization: `Bearer ${token}` };
-  expect((await fetch(`${base}/api/auth/config`, { headers })).status).toBe(200);
+  expect((await fetch(`${base}/api/whoami`, { headers })).status).toBe(200);
   expect((await fetch(`${base}/api/identities`, { headers })).status).toBe(200);
-  expect((await fetch(`${base}/mcp`, { headers: { ...headers, "X-Grayboard-Identity": "be" } })).status).toBe(401);
+  expect((await fetch(`${base}/mcp`, { headers: headers })).status).toBe(401);
 });
 
 test("connected clients cannot dispatch after their actual access deadline", async () => {
   const client = await connect(await login());
   clock = Date.now() + 3_600_001;
   await expect(client.callTool({ name: "board_create", arguments: { name: "expired", purpose: "blocked" } })).rejects.toThrow();
-  expect(app.db.query("SELECT name FROM boards WHERE name = 'expired'").get()).toBeNull();
+  await drained(srv);
+  expect(await row(srv, "SELECT name FROM boards WHERE name = 'expired'")).toBeNull();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
@@ -315,22 +330,22 @@ test("shutdown closes MCP before OAuth and refuses subsequent authentication", a
   await app.stop();
   expect(closed).toBe(true);
   expect((await app.mcp.fetch(new Request(base + "/mcp"))).status).toBe(503);
-  const auth = app.oauth.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+  const auth = await app.oauth.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
   expect(auth).toBeInstanceOf(Response);
   expect((auth as Response).status).toBe(401);
   app.oauth.close = original;
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "revoke", "storage"] as const) test(`${version}: streamed body preserves factory ${failure} refusal`, async () => {
-  const issued = issueOAuth(app.repo, app.oauth.resource);
+  const issued = await issueOAuth(app.repo, app.oauth.resource);
   const original = app.oauth.authenticate;
   let boundary!: () => void;
   const authenticated = new Promise<void>(resolve => { boundary = resolve; });
   let checks = 0;
-  app.oauth.authenticate = (...args) => {
+  app.oauth.authenticate = async (...args) => {
     if (args[0].headers.get("Authorization") !== `Bearer ${issued.token}`) return original(...args);
     if (++checks === 2 && failure === "storage") throw new Error("SELECT secret FROM /private/oauth.sqlite");
-    const result = original(...args);
+    const result = await original(...args);
     if (checks === 1) { expect(result).not.toBeInstanceOf(Response); boundary(); }
     return result;
   };
@@ -339,10 +354,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
   const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; c.enqueue(encoder.encode("{")); } });
   const json = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" }, ...(version === "2026-07-28" ? { _meta: { "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientInfo": { name: "barrier", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } : {}) } });
   try {
-    const pending = fetch(base + "/mcp", { method: "POST", headers: { Authorization: `Bearer ${issued.token}`, "X-Grayboard-Identity": "unselected", "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body });
+    const pending = fetch(base + "/mcp", { method: "POST", headers: { Authorization: `Bearer ${issued.token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body });
     await authenticated;
     if (failure === "expiry") clock = Date.now() + 3_600_001;
-    if (failure === "revoke") app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now());
+    if (failure === "revoke") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, Date.now()));
     const valid = failure === "revoke" ? await connect(await login("bob@example.com")) : undefined;
     controller.enqueue(encoder.encode(json.slice(1))); controller.close();
     const [response, validResult] = await Promise.all([pending, valid?.callTool({ name: "board_list", arguments: {} })]);
@@ -356,22 +371,537 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
       await response.arrayBuffer();
     }
     expect(checks).toBe(2);
-    expect(app.repo.aliases.find(`${issued.authed.user_email}/unselected`)).toBeUndefined();
-    expect(app.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
+    expect(await app.repo.aliases.find(app.repo.read, `${issued.authed.user_email}/unselected`)).toBeUndefined();
+    await drained(srv);
+    expect(await row(srv, "SELECT name FROM boards WHERE name = 'blocked'")).toBeNull();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   } finally { app.oauth.authenticate = original; }
 });
 
 test("production MCP storage errors are generic 500s, not invalid-token guesses", async () => {
   const token = await login();
-  const original = app.repo.oauth.findActiveAccess;
-  app.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); };
+  const restoreFindActiveAccess = stubAuthRead(app.repo, "findActiveAccess", original => () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); });
   try {
-    const response = await fetch(`${base}/mcp`, { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } });
+    const response = await fetch(`${base}/mcp`, { headers: { Authorization: `Bearer ${token}` } });
     expect(response.status).toBe(500);
     expect(response.headers.has("WWW-Authenticate")).toBe(false);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
-  } finally { app.repo.oauth.findActiveAccess = original; }
-  expect(app.repo.aliases.find("alice@example.com/unselected")).toBeUndefined();
+  } finally { restoreFindActiveAccess(); }
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
+});
+
+// #521 item 6: the launcher declaration rides a real HTTP request's `_meta` and is stored for that session; the
+// next initialize carries the launcher sentence only once delivery is live (#521 4).
+test("HTTP: a launcher declared in _meta is stored for its session; initialize carries the launcher sentence once a delivery lease opens", async () => {
+  // One grant with both scopes, as a harness installation holds (docs/server-hosted-mcp.md): the subscriber role adds only its header.
+  const token = await login("alice@example.com", ["grayboard:tools", "grayboard:delivery"]);
+  const open = async (raw: string, launcher: boolean, subscriber = false) => {
+    const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+    clients.push(client);
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+      requestInit: { headers: { Authorization: `Bearer ${token}`, ...(subscriber ? { "X-Grayboard-Client": "subscriber" } : {}) } },
+      fetch: async (input, init) => {
+        const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, raw);
+        return fetch(launcher ? await withMeta(req, GRAYBOARD_LAUNCHER_META, true) : req);
+      },
+    }));
+    return client;
+  };
+  const sentence = "You're a launcher session";
+  const lead = await open("lead-root", true), plain = await open("plain-root", false);
+  await bindFixture(lead, "lead");
+  await bindFixture(plain, "plain");
+  // The declaration reached the server: the flag is stored for lead's session only.
+  const flags = (await rows<{ launcher: number }>(srv, `SELECT i.launcher FROM aliases a JOIN alias_holds h ON h.address = a.address JOIN ids i ON i.id = h.id WHERE a.address IN ('alice@example.com/lead', 'alice@example.com/plain') ORDER BY a.address`)).map((r) => r.launcher);
+  expect(flags).toEqual([1, 0]);
+  // A second initialize of each session, with no declaration on the wire and no delivery lease: neither carries
+  // the sentence, since a launcher whose delivery isn't live is no delegation target (#521 4).
+  expect((await open("lead-root", false)).getInstructions()).not.toContain(sentence);
+  expect((await open("plain-root", false)).getInstructions()).not.toContain(sentence);
+  // #883: a delivery lease opened over HTTP by each session's subscriber role: the next initialize follows the stored flag.
+  for (const raw of ["lead-root", "plain-root"]) {
+    const opened = await (await open(raw, false, true)).callTool({ name: "delivery_open", arguments: {} });
+    expect(opened.isError).not.toBe(true);
+  }
+  expect((await open("lead-root", false)).getInstructions()).toContain(sentence);
+  expect((await open("plain-root", false)).getInstructions()).not.toContain(sentence);
+});
+
+// #1312: a revoke that lands after admission, while a tool call is in flight (here between bind's commit and its
+// post-commit check), answers the 401 a dead token draws at admission, not a tool-level `unauthenticated`, on both
+// roles' bind. A live token at the same point answers the tool's result; a server stopping there never answers 401;
+// nor does a refusal there whose bearer still authenticates (`refused`: the post-commit check alone answers false).
+for (const role of ["native", "subscriber"] as const) for (const outcome of ["revoked", "live", "stopping", "refused"] as const) test(`HTTP ${role}: a ${outcome} token at bind's post-commit check ${outcome === "revoked" ? "answers 401" : "never answers 401"} (#1312)`, async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const statuses: number[] = [];
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}`, ...(role === "subscriber" ? { "X-Grayboard-Client": "subscriber" } : {}) } },
+    fetch: async (input, init) => { const r = await fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, `post-commit-${role}`)); statuses.push(r.status); return r; },
+  }));
+  const dir = mkdtempSync(join(tmpdir(), "gb-1312-")), go = join(dir, "go"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  const isAuthorized = app.oauth.isAuthorized;
+  process.env.BUS_TEST_PAUSE = "hosted:bind:after-commit";
+  process.env.BUS_TEST_PAUSE_FILE = go;
+  try {
+    const before = statuses.length;
+    const call = client.callTool({ name: "bind", arguments: { name: `pc-${role}`, create: true } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => hits.some(h => h.includes("test pause hit: hosted:bind:after-commit")), 10_000, "bind's post-commit pause");
+    let stopping: Promise<void> | undefined;
+    if (outcome === "revoked") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.refreshHash, issued.binding.clientId, Date.now()));
+    if (outcome === "stopping") stopping = app.stop();
+    if (outcome === "refused") app.oauth.isAuthorized = async () => false;
+    writeFileSync(go, "");
+    const settled = await call;
+    await stopping;
+    const status = statuses.slice(before);
+    if (outcome === "revoked") {
+      expect(status).toEqual([401]);
+      expect("error" in settled).toBe(true);
+    } else if (outcome === "live") {
+      expect(status).toEqual([200]);
+      expect("result" in settled && settled.result.isError).not.toBe(true);
+    } else if (outcome === "refused") {
+      expect(status).toEqual([200]);
+      expect("result" in settled && settled.result.structuredContent).toEqual({ code: "unauthenticated" });
+    } else {
+      // The stop may close the connection before any answer: whatever came back, none was a 401.
+      expect(status).not.toContain(401);
+    }
+  } finally {
+    app.oauth.isAuthorized = isAuthorized;
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #1324: the guards on #1312's 401 (`lostRefusal`) past its re-authenticate. A revoke at bind's post-commit check
+// makes the bearer's 401 the answer; the call is then held at `mcp:lost:authenticated`, after that 401 was computed,
+// while the MCP side closes (mcp.close directly, as app.stop runs it first, but with no `stop(true)` to reset the
+// connection) or the request aborts. The exchange goes through `app.mcp.fetch` in process, so the response the
+// server chose reaches the test whatever a socket would do: it must be the tool's `unauthenticated`, never the 401.
+for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call ${outcome} past the lost-token re-authenticate keeps the tool error, never 401 (#1324)`, async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const statuses: number[] = [];
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, `lost-${outcome}`);
+      const r = await app.mcp.fetch(target ? new Request(req, { signal: abort.signal }) : req, "127.0.0.1");
+      statuses.push(r.status);
+      return r;
+    },
+  }));
+  const dir = mkdtempSync(join(tmpdir(), "gb-1324-")), committed = join(dir, "committed"), authenticated = join(dir, "authenticated"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  process.env.BUS_TEST_PAUSE = "hosted:bind:after-commit";
+  process.env.BUS_TEST_PAUSE_FILE = committed;
+  let closing: Promise<void> | undefined;
+  try {
+    const before = statuses.length;
+    target = true;
+    const call = client.callTool({ name: "bind", arguments: { name: `lost-${outcome}`, create: true } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => hits.some(h => h.includes("test pause hit: hosted:bind:after-commit")), 10_000, "bind's post-commit pause");
+    // The held point read its file already: the next point waits on its own.
+    process.env.BUS_TEST_PAUSE = "mcp:lost:authenticated";
+    process.env.BUS_TEST_PAUSE_FILE = authenticated;
+    await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.refreshHash, issued.binding.clientId, Date.now()));
+    writeFileSync(committed, "");
+    await until(() => hits.some(h => h.includes("test pause hit: mcp:lost:authenticated")), 10_000, "the lost-token pause past the re-authenticate");
+    if (outcome === "closing") closing = app.mcp.close();
+    else abort.abort();
+    writeFileSync(authenticated, "");
+    const settled = await call;
+    expect(statuses.slice(before)).toEqual([200]);
+    expect("result" in settled && settled.result.structuredContent).toEqual({ code: "unauthenticated" });
+  } finally {
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+    await closing;
+  }
+});
+
+// #1332: the catch-path guard on a stored admission refusal (`refuse()`), which #1324 pinned on the success path. The
+// token is revoked right after the boundary's authenticate passes, so selection's authenticate draws the 401; the call
+// is held at `mcp:select:refused` with that 401 in hand while the MCP side closes or the request aborts, then
+// `refuse()` stores it and throws into fetch's catch. In process, as #1324's: the answer must be the catch's
+// fall-through (503 on a closing endpoint, else an internal error), never the stored 401.
+for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call ${outcome} while selection's refusal is held falls through, never 401 (#1332)`, async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const statuses: number[] = [];
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, `refused-${outcome}`);
+      const r = await app.mcp.fetch(target ? new Request(req, { signal: abort.signal }) : req, "127.0.0.1");
+      statuses.push(r.status);
+      return r;
+    },
+  }));
+  const dir = mkdtempSync(join(tmpdir(), "gb-1332-")), go = join(dir, "go"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  const authenticate = app.oauth.authenticate;
+  let revoked = false;
+  // The boundary's authenticate is the targeted call's first: the revoke lands right after it passes.
+  app.oauth.authenticate = async (...args) => {
+    const result = await authenticate.apply(app.oauth, args);
+    if (target && !revoked) {
+      revoked = true;
+      await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.refreshHash, issued.binding.clientId, Date.now()));
+    }
+    return result;
+  };
+  process.env.BUS_TEST_PAUSE = "mcp:select:refused";
+  process.env.BUS_TEST_PAUSE_FILE = go;
+  let closing: Promise<void> | undefined;
+  try {
+    const before = statuses.length;
+    target = true;
+    const call = client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => hits.some(h => h.includes("test pause hit: mcp:select:refused")), 10_000, "selection's refusal pause");
+    if (outcome === "closing") closing = app.mcp.close();
+    else abort.abort();
+    writeFileSync(go, "");
+    const settled = await call;
+    // A closing endpoint answers 503, as it does a call arriving after close (#1336); an aborted call's 500 nobody reads.
+    expect(statuses.slice(before)).toEqual([outcome === "closing" ? 503 : 500]);
+    expect("error" in settled).toBe(true);
+  } finally {
+    app.oauth.authenticate = authenticate;
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+    await closing;
+  }
+});
+
+// The process-wide count of board_create calls settled (the metrics registry's histogram, success or throw).
+const boardCreates = () => Number(/^grayboard_tool_call_duration_seconds_count\{tool="board_create"\} (\d+)$/m.exec(renderMetrics())?.[1] ?? 0);
+// #1342: a modern call already dispatched (held inside board_create's handler at `hosted:tool:in-gate`, before its
+// write) when the MCP side closes. The SDK unwinds it with ConnectionClosed and answers 499 through the success path,
+// never fetch's catch; a closing endpoint answers 503 there too, with a body that says the call was dispatched, over
+// real HTTP. A client abort at the same point is not a close: its 499 stays (in process, since an aborted socket
+// reads no answer).
+for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a dispatched call ${outcome === "closing" ? "cut off by close answers 503" : "aborted by its client keeps 499"} (#1342)`, async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const answers: { status: number; body: string }[] = [];
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, `dispatched-${outcome}`);
+      const r = outcome === "aborted" && target ? await app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1") : await fetch(req);
+      if (target) answers.push({ status: r.status, body: await r.clone().text() });
+      return r;
+    },
+  }));
+  await bindFixture(client, `dispatched-${outcome}`);
+  const dir = mkdtempSync(join(tmpdir(), "gb-1342-")), go = join(dir, "go"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  process.env.BUS_TEST_PAUSE = "hosted:tool:in-gate";
+  process.env.BUS_TEST_PAUSE_FILE = go;
+  let closing: Promise<void> | undefined;
+  const calls = boardCreates();
+  try {
+    target = true;
+    const call = client.callTool({ name: "board_create", arguments: { name: `cut-${outcome}`, purpose: "held" } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => hits.some(h => h.includes("test pause hit: hosted:tool:in-gate")), 10_000, "board_create's in-gate pause");
+    if (outcome === "closing") closing = app.mcp.close();
+    else abort.abort();
+    const settled = await call;
+    expect(answers.map(a => a.status)).toEqual([outcome === "closing" ? 503 : 499]);
+    if (outcome === "closing") {
+      expect(answers[0]!.body).toBe("MCP endpoint closed during the call");
+      expect(hits.filter(h => h.includes("hosted MCP failed") && h.includes('"class":"EndpointClosedError"'))).toHaveLength(1);
+    }
+    expect("error" in settled).toBe(true);
+  } finally {
+    writeFileSync(go, "");
+    // The held handler runs on after its answer: it settles (a closing server's refusal, or the aborted call's write)
+    // before afterEach closes the database.
+    await until(() => boardCreates() === calls + 1, 10_000, "the held board_create to settle");
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    await closing;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #1535: a client that aborts while its request waits in the write queue. The waiting body is skipped (never run), and
+// the request is logged as a client abort, its own line and category, not `hosted MCP failed … unexpected`. Two
+// stages: the exchange's selection (its gate body), and the tool body after the gate (held at `hosted:tool:in-gate`
+// while the queue is taken). In process, as #1342's abort is, since an aborted socket reads no answer.
+const writeQueue = (): WriteQueue => (app.repo as { writeQueue?: WriteQueue }).writeQueue ?? queueFor(app.db);
+for (const stage of ["selection", "tool body"] as const) test(`HTTP native: a client abort while the ${stage} waits in the write queue skips it and logs client_aborted (#1535)`, async () => {
+  const identity = `aborted-${stage === "selection" ? "select" : "tool"}`;
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, identity);
+      return target ? app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1") : fetch(req);
+    },
+  }));
+  await bindFixture(client, identity);
+  const q = writeQueue();
+  const site = stage === "selection" ? "gate" : "tool";
+  const skipped = queueSkippedCount(site);
+  const dir = mkdtempSync(join(tmpdir(), "gb-1535-")), go = join(dir, "go"), lines: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  let release: (() => void) | undefined, holder: Promise<void> | undefined;
+  const hold = () => { holder = q.run(() => new Promise<void>(r => { release = r; })); };
+  if (stage === "tool body") { process.env.BUS_TEST_PAUSE = "hosted:tool:in-gate"; process.env.BUS_TEST_PAUSE_FILE = go; }
+  try {
+    if (stage === "selection") hold();
+    target = true;
+    const call = stage === "selection"
+      ? client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }))
+      : client.callTool({ name: "board_create", arguments: { name: "abandoned", purpose: "never" } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    if (stage === "tool body") {
+      await until(() => lines.some(h => h.includes("test pause hit: hosted:tool:in-gate")), 10_000, "board_create's in-gate pause");
+      hold();
+      writeFileSync(go, "");
+    }
+    await until(() => q.waitingAt(site) === 1, 10_000, `the ${stage}'s body queued behind the holder`);
+    abort.abort();
+    await call;
+    await until(() => lines.some(l => l.includes("hosted MCP client aborted")), 10_000, "the client-abort line");
+    expect(queueSkippedCount(site) - skipped).toBe(1);
+  } finally {
+    writeFileSync(go, "");
+    release?.();
+    await holder;
+    said.mockRestore(); warned.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+  }
+  expect(lines.filter(l => l.includes("hosted MCP failed"))).toEqual([]);
+  const aborted = lines.filter(l => l.includes("hosted MCP client aborted"));
+  expect(aborted).toHaveLength(1);
+  expect(aborted[0]).toContain('"category":"client_aborted"');
+  expect(aborted[0]).toContain('"class":"RequestAbortedError"');
+  expect(aborted[0]).toContain(stage === "selection" ? '"operation":"admission"' : '"operation":"tool"');
+  // The skipped tool body wrote nothing.
+  if (stage === "tool body") expect(await app.repo.boards.get(app.repo.read, "abandoned")).toBeUndefined();
+});
+
+// #1535: an ending call's selection is never skipped. A subscriber's session_end or delivery_release whose client
+// aborts while its selection waits behind a held queue: the selection's gate body still runs (no skip counted). The
+// call itself is then refused by select()'s post-selection abort check, as before #1535. Mutation: mcp.ts passing
+// request.signal to an ending call's snapshot (the gate body is skipped and counted).
+for (const ending of ["session_end", "delivery_release"] as const) test(`HTTP subscriber: a client abort while ${ending}'s selection waits never skips its gate body (#1535)`, async () => {
+  const identity = `ending-${ending === "session_end" ? "end" : "release"}`;
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const headers = new Headers({ Authorization: `Bearer ${issued.token}`, "X-Grayboard-Client": "subscriber" });
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    fetch: async (input, init) => {
+      const plain = new Request(input, init);
+      for (const [k, v] of headers) plain.headers.set(k, v);
+      const req = await withMeta(plain, OPENCODE_SESSION_META, identity);
+      return target ? app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1") : fetch(req);
+    },
+  }));
+  const ok = async (name: string, args: Record<string, unknown> = {}) => {
+    const r = await client.callTool({ name, arguments: args });
+    if (r.isError) throw new Error(JSON.stringify(r));
+    const first = r.content?.[0];
+    if (first?.type !== "text") return undefined;
+    try { return JSON.parse(first.text); } catch { return first.text; }
+  };
+  await ok("bind", { name: identity, create: true });
+  const address = `carol@example.com/${identity}`;
+  expect(await app.application.aliasHolderId(app.repo.read, address)).not.toBeNull();
+  if (ending === "delivery_release") {
+    headers.set("X-Grayboard-Lease", (await ok("delivery_open")).capability);
+    expect(app.mcp.activeLeases).toBe(1);
+  }
+  const q = writeQueue();
+  const skipped = queueSkippedCount("gate");
+  const lines: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  let release!: () => void;
+  const holder = q.run(() => new Promise<void>(r => { release = r; }));
+  try {
+    target = true;
+    const call = client.callTool({ name: ending, arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => q.waitingAt("gate") === 1, 10_000, `${ending}'s selection queued behind the holder`);
+    abort.abort();
+    release();
+    await call;
+    await app.repo.write(() => {});
+  } finally {
+    release();
+    await holder;
+    said.mockRestore(); warned.mockRestore();
+  }
+  expect(queueSkippedCount("gate") - skipped).toBe(0);
+  expect(lines.filter(l => l.includes('"operation":"admission"'))).toEqual([]);
+});
+
+// #1342: the close-time 500 the SDK makes of the modern factory's own closed check (the endpoint closed while the
+// factory's authenticate awaited). Nothing was dispatched: the pre-dispatch 503 and its body, over real HTTP.
+test("HTTP native: a call whose factory meets the close answers 503, not 500 (#1342)", async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const answers: { status: number; body: string }[] = [];
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const r = await fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, "factory-closing"));
+      if (target) answers.push({ status: r.status, body: await r.clone().text() });
+      return r;
+    },
+  }));
+  const said = spyOn(console, "error").mockImplementation(() => {});
+  const authenticate = app.oauth.authenticate;
+  let seen = 0;
+  let closing: Promise<void> | undefined;
+  // The targeted call authenticates at the boundary, at selection, then in the factory: the close lands in the third.
+  app.oauth.authenticate = async (...args) => {
+    const result = await authenticate.apply(app.oauth, args);
+    if (target && ++seen === 3) closing = app.mcp.close();
+    return result;
+  };
+  try {
+    target = true;
+    const settled = await client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    expect(seen).toBe(3);
+    expect(answers).toEqual([{ status: 503, body: "MCP endpoint is closed" }]);
+    expect("error" in settled).toBe(true);
+  } finally {
+    app.oauth.authenticate = authenticate;
+    said.mockRestore();
+    await closing;
+  }
+});
+
+// #1541: the endpoint closes while the factory's authenticate awaits, and the request's signal fires too (a shutdown
+// cuts the connection as it closes the endpoint). The close decides: the endpoint-closed error, never a client abort.
+test("HTTP native: a factory meeting the close and an aborted signal is a server cut, not a client abort (#1541)", async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const abort = new AbortController(), statuses: number[] = [], lines: string[] = [];
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, "factory-cut");
+      if (!target) return fetch(req);
+      const r = await app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1");
+      statuses.push(r.status);
+      return r;
+    },
+  }));
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const authenticate = app.oauth.authenticate;
+  let seen = 0;
+  let closing: Promise<void> | undefined;
+  app.oauth.authenticate = async (...args) => {
+    const result = await authenticate.apply(app.oauth, args);
+    if (target && ++seen === 3) { closing = app.mcp.close(); abort.abort(); }
+    return result;
+  };
+  try {
+    target = true;
+    const settled = await client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    expect(seen).toBe(3);
+    expect("error" in settled).toBe(true);
+  } finally {
+    app.oauth.authenticate = authenticate;
+    said.mockRestore(); warned.mockRestore();
+    await closing;
+  }
+  expect(statuses).toEqual([503]);
+  expect(lines.filter(l => l.includes("hosted MCP failed") || l.includes("hosted MCP client aborted"))).toEqual([]);
+  const cut = lines.filter(l => l.includes("hosted MCP request cut by server"));
+  expect(cut).toHaveLength(1);
+  expect(cut[0]).toContain('"category":"server_cut"');
+  expect(cut[0]).toContain('"class":"RequestClosedError"');
+});
+
+// #1541: a forced shutdown. app.stop() sets `stopping` and cuts every connection (server.stop(true)) before it closes
+// hosted MCP, so a request waiting in the write queue can see its signal fire while `closed` is still false. It is the
+// server's cut, not the client's abort. The close is held until the line is logged, so the cut lands while the endpoint
+// still reads open, as a real shutdown's does. Mutation: report()'s RequestAbortedError arm without `opts.stopping?.()` fails it.
+test("HTTP native: a request the shutdown cuts while it waits in the write queue logs server_cut, not client_aborted (#1541)", async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, "stop-cut");
+      return target ? app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1") : fetch(req);
+    },
+  }));
+  await bindFixture(client, "stop-cut");
+  const q = writeQueue();
+  const lines: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  let release: (() => void) | undefined, open: (() => void) | undefined;
+  const holder = q.run(() => new Promise<void>(r => { release = r; }));
+  const gate = new Promise<void>(r => { open = r; });
+  const close = app.mcp.close;
+  app.mcp.close = async () => { await gate; return close.call(app.mcp); };
+  let stopped: Promise<void> | undefined;
+  try {
+    target = true;
+    const call = client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => q.waitingAt("gate") === 1, 10_000, "whoami's selection queued behind the holder");
+    // The listener's cut, in process: the request's signal fires as stop() begins, before hosted MCP closes.
+    stopped = app.stop();
+    abort.abort();
+    await call;
+    await until(() => lines.some(l => l.includes("hosted MCP request cut by server") || l.includes("hosted MCP client aborted")), 10_000, "the cut's log line");
+  } finally {
+    open?.();
+    release?.();
+    await holder;
+    await stopped?.catch(() => {});
+    app.mcp.close = close;
+    said.mockRestore(); warned.mockRestore();
+  }
+  expect(lines.filter(l => l.includes("hosted MCP failed") || l.includes("hosted MCP client aborted"))).toEqual([]);
+  const cut = lines.filter(l => l.includes("hosted MCP request cut by server"));
+  expect(cut).toHaveLength(1);
+  expect(cut[0]).toContain('"category":"server_cut"');
+  expect(cut[0]).toContain('"class":"RequestAbortedError"');
 });

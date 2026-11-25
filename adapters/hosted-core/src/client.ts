@@ -1,7 +1,8 @@
 // One hosted harness session's connection to the server (#444), for every
 // kind of session a harness adapter runs: a root (under root.ts's
 // RootDelivery), and pi/omp's subagent children and unattributed (loose)
-// sessions. The host builds the Login (its sign-in presentation differs);
+// sessions. The host builds the Login (its sign-in presentation differs),
+// or static.ts's StaticLogin for a launcher-set run token (#1243);
 // this holds the rest: the bearer, the wire options every request sends
 // (the generic session key and the declared delivery), the credential watch
 // that says a sign-out once, the one tool-call error wrapper, its tool
@@ -12,9 +13,10 @@
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 import type { Temporary } from "./children.js";
 import { failureMessage } from "./diagnostics.js";
-import type { Login } from "./login.js";
+import type { SignIn } from "./login.js";
 import { accessExpiry } from "./model.js";
-import { failure, ToolProxy, type CallHooks, type NativeTool } from "./proxy.js";
+import { CallAborted, failure, ToolProxy, type CallHooks, type NativeTool } from "./proxy.js";
+import type { SessionFacts } from "./port.js";
 import { SubscriberError, Wire, type WireOptions } from "./wire.js";
 import { GRAYBOARD_SESSION_META } from "../../../src/shared/session_meta.ts";
 
@@ -25,17 +27,22 @@ export type HostedClientOptions = {
   harness: string;          // "pi" | "omp" | "Claude Code", in messages
   clientId: string;         // the server's built-in client
   version: string;
-  login: Login;             // built by the host: its sign-in presentation differs
+  login: SignIn;            // built by the host: a Login (its sign-in presentation differs) or a StaticLogin (static.ts)
   source: string;           // channel source ("grayboard" | "plugin:grayboard:grayboard")
   loginAction: string;
   resumeHint: string;       // how to restart a paused root (the Controller's pause records)
   retryHint: string;        // a failed tool call's remedy: pi/omp "call the tool again"; Claude Code its resume hint
   roots?: string[];         // ToolProxy attachment roots
   env?: Record<string, string | undefined>;
+  launcher?: boolean;       // the harness can spawn subagents (BUS_LAUNCHER=1): every request declares it (#473)
+  facts?: (sessionID: string) => SessionFacts | undefined; // the session's current model and effort, sent on every request (#364)
+  suggested?: (sessionID: string) => string | undefined;    // the name the harness suggests for the session, sent on every request (#522)
   log(message: string, level: Level): void;
 };
 
 export const message = (error: unknown) => (error as Error)?.message ?? String(error);
+// A session_end that failed, as every surface says it.
+export const endFailedText = (id: string, error: unknown) => `couldn't end session ${id} on the server: ${message(error)}`;
 
 // A failed call's text: failureMessage's, and where that names no cause (its
 // refusal and generic text) the error's own message, the only detail there
@@ -67,15 +74,24 @@ export class HostedClient {
     };
   }
 
-  get login(): Login { return this.options.login; }
+  get login(): SignIn { return this.options.login; }
 
   wireOptions(mode: "push" | "poll"): WireOptions {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source } };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...(this.options.launcher ? { launcher: true as const } : {}), ...(this.options.facts ? { facts: this.facts } : {}), ...(this.options.suggested ? { suggested: this.options.suggested } : {}) };
   }
+  // The host's facts provider; a failure is said once per session and sends none.
+  private readonly factsFailed = new Set<string>();
+  private readonly facts = (sessionID: string): SessionFacts | undefined => {
+    try { return this.options.facts!(sessionID); }
+    catch (error) {
+      if (!this.factsFailed.has(sessionID)) { this.factsFailed.add(sessionID); this.options.log(`couldn't read session ${sessionID}'s model and effort; the server gets none: ${message(error)}`, "warning"); }
+      return undefined;
+    }
+  };
 
   // One short-lived poll wire under `sessionID` (a child's register and end, a session's end).
-  temporary: Temporary = async (sessionID, run) => {
-    const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(10_000), sessionID);
+  temporary: Temporary = async (sessionID, run, ending) => {
+    const wire = new Wire({ ...this.wireOptions("poll"), ...(ending ? { ending: true as const } : {}) }, this.auth, AbortSignal.timeout(10_000), sessionID);
     try { await wire.connect(); return await run(wire); }
     finally { await wire.close().catch(() => {}); }
   };
@@ -85,8 +101,8 @@ export class HostedClient {
   // the server's idle sweep. Every failure is said, a sign-out included: the
   // session then stays bound until that sweep.
   async endSession(id: string): Promise<void> {
-    try { await this.temporary(id, wire => wire.call("session_end")); }
-    catch (error) { this.options.log(`couldn't end session ${id} on the server: ${message(error)}`, "warning"); }
+    try { await this.temporary(id, wire => wire.call("session_end"), true); }
+    catch (error) { this.options.log(endFailedText(id, error), "warning"); }
   }
 
   proxy(mode: "push" | "poll", o: { hooks?: CallHooks; onTools(tools: NativeTool[]): void; onAfterFailure?(): void }): ToolProxy {
@@ -128,10 +144,14 @@ export class HostedClient {
   // refusal, the transport, a JSON-RPC error) comes back as an error result
   // with the retry hint and failureText's detail. `proxy` is any call (pi's
   // child wraps its unattributed retry, so a converted failure never
-  // triggers that retry's whoami probe).
-  async call(proxy: Pick<ToolProxy, "call">, tool: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    try { return await proxy.call(tool, args, sessionID); }
-    catch (error) { return failure(failureText(error, this.options.retryHint)); }
+  // triggers that retry's whoami probe). A call `signal` aborted throws
+  // (CallAborted): the harness cancelled it, so there's no one to read a result.
+  async call(proxy: Pick<ToolProxy, "call">, tool: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    try { return await proxy.call(tool, args, sessionID, signal); }
+    catch (error) {
+      if (signal?.aborted) throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
+      return failure(failureText(error, this.options.retryHint));
+    }
   }
 
   // One Login.watch per session: a change of the grant store's epoch (a

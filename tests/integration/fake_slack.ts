@@ -5,7 +5,7 @@ import type { ServerWebSocket } from "bun";
 type Call = { method: string; body: Record<string, any> };
 
 // Just enough Slack: auth.test, apps.connections.open, chat.postMessage,
-// reactions.add, the external file upload (get URL, send bytes, complete),
+// reactions.add, users.info (emails), the external file upload (get URL, send bytes, complete),
 // files.info (hosted files, and uploaded ones with their shares) and file
 // downloads, and a Socket Mode WebSocket that says hello and records acks.
 export class FakeSlack {
@@ -15,9 +15,13 @@ export class FakeSlack {
   acks: string[] = [];
   opens = 0;
   failPosts = 0;
+  /** Called with each chat.postMessage body before it's answered. */
+  onPost: ((body: Record<string, any>) => void) | null = null;
   badAppToken = false;
   /** An error files.getUploadURLExternal answers with, e.g. "file_type_not_allowed". */
   refuseUploads: string | null = null;
+  /** An error chat.postMessage answers with, e.g. "msg_too_long". */
+  refusePosts: string | null = null;
   /** Bytes sent to each upload URL, by file id. */
   readonly uploaded = new Map<string, Uint8Array>();
   /** Where completeUploadExternal shared each uploaded file: files.info's `shares`. */
@@ -25,8 +29,13 @@ export class FakeSlack {
   /** files.info answers for an uploaded file this many times before its shares show. */
   shareLag = 0;
   /** Files the owner can share: what say() sends in an event's files. */
-  private readonly hosted = new Map<string, { name: string; data: Uint8Array }>();
+  private readonly hosted = new Map<string, { name: string; data: Uint8Array; forbidden?: boolean }>();
   private fileN = 0;
+  /** users.info's profile.email per Slack user; null answers missing_scope (no users:read.email). */
+  readonly emails = new Map<string, string>();
+  emailScope = true;
+  /** users.info answers HTTP 500 (Slack unreachable) while set. */
+  usersInfoDown = false;
   /** The ts each successful chat.postMessage got. */
   readonly postTs = new WeakMap<Record<string, any>, string>();
   private sockets: ServerWebSocket<unknown>[] = [];
@@ -34,7 +43,7 @@ export class FakeSlack {
   private envelope = 0;
   readonly server = Bun.serve({
     port: 0,
-    fetch: async (req, srv) => {
+    fetch: async (req, srv): Promise<Response | undefined> => {
       const url = new URL(req.url);
       if (url.pathname === "/ws") return srv.upgrade(req) ? undefined : new Response("no", { status: 400 });
       if (url.pathname.startsWith("/upload/")) {
@@ -43,9 +52,10 @@ export class FakeSlack {
       }
       if (url.pathname.startsWith("/files/")) {
         const f = this.hosted.get(url.pathname.slice("/files/".length));
-        // Slack serves its sign-in page to a request it won't authorize.
+        // Slack answers 403 to a token without files:read, or (as it once did) its sign-in page.
+        if (f?.forbidden) return new Response("", { status: 403 });
         if (!f || !req.headers.get("authorization")?.startsWith("Bearer xoxb-")) return new Response("<html>sign in</html>", { headers: { "Content-Type": "text/html" } });
-        return new Response(f.data);
+        return new Response(f.data as Uint8Array<ArrayBuffer>);
       }
       const method = url.pathname.replace(/^\/api\//, "");
       const body = await parseBody(req);
@@ -58,15 +68,24 @@ export class FakeSlack {
           this.opens++;
           return Response.json({ ok: true, url: `ws://localhost:${this.server.port}/ws` });
         case "chat.postMessage":
+          this.onPost?.(body);
           if (this.failPosts > 0) {
             this.failPosts--;
             return new Response("unavailable", { status: 503 });
           }
+          if (this.refusePosts) return Response.json({ ok: false, error: this.refusePosts });
           const ts = `${++this.ts}.000100`;
           this.postTs.set(body, ts);
           return Response.json({ ok: true, channel: body.channel, ts });
         case "reactions.add":
           return Response.json({ ok: true });
+        case "users.info": {
+          if (this.usersInfoDown) return new Response("down", { status: 500 });
+          if (!this.emailScope) return Response.json({ ok: false, error: "missing_scope" });
+          const email = this.emails.get(String(body.user));
+          if (email === undefined) return Response.json({ ok: false, error: "user_not_found" });
+          return Response.json({ ok: true, user: { id: body.user, profile: { email } } });
+        }
         case "files.getUploadURLExternal": {
           if (this.refuseUploads) return Response.json({ ok: false, error: this.refuseUploads });
           if (!body.filename || !(Number(body.length) > 0)) return Response.json({ ok: false, error: "missing_argument" });
@@ -132,10 +151,10 @@ export class FakeSlack {
       .map((c) => ({ ...c.body, files: JSON.parse(c.body.files), blocks: c.body.blocks ? JSON.parse(c.body.blocks) : undefined, ts: this.postTs.get(c.body) }));
   }
 
-  /** A file the owner can attach to a message; its event object, or only its id with `idOnly`. */
-  host(name: string, data: Uint8Array | string, opts: { idOnly?: boolean; size?: number } = {}): Record<string, any> {
+  /** A file the owner can attach to a message; its event object, or only its id with `idOnly`; `forbidden` serves it as 403. */
+  host(name: string, data: Uint8Array | string, opts: { idOnly?: boolean; size?: number; forbidden?: boolean } = {}): Record<string, any> {
     const id = `FH${++this.fileN}`;
-    const f = { name, data: typeof data === "string" ? new TextEncoder().encode(data) : data };
+    const f = { name, data: typeof data === "string" ? new TextEncoder().encode(data) : data, forbidden: opts.forbidden };
     this.hosted.set(id, f);
     return opts.idOnly ? { id, mode: "file_access", file_access: "check_file_info" } : { ...this.fileObject(id, f), ...(opts.size ? { size: opts.size } : {}) };
   }

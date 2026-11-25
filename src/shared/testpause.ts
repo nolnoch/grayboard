@@ -3,17 +3,29 @@
 // BUS_TEST_PAUSE_FILE exists, and says on stderr that the pause was hit, so a
 // test can assert the overlap happened. Synchronous, because some points sit
 // inside a SQLite transaction. Inert unless both are set. A test that fails
-// before releasing the pause deletes its dir: the process exits then, or it
-// would wait forever, never reading its closed stdin.
+// before releasing the pause deletes its dir, and a test process that dies
+// (SIGKILL, which runs no cleanup) leaves this one reparented: either way the
+// pause is abandoned, or the process would wait forever, never reading its
+// closed stdin (#1169). No grayboard process daemonizes, so a parent that
+// changes is a parent that died.
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
+
+const parent = process.ppid;
+const abandoned = (file: string) => !existsSync(dirname(file)) || process.ppid !== parent;
+
+// Whether `point` is armed: a caller on a hot path awaits testPauseAsync only then, so an inert point costs no
+// microtask and the code's timing is unchanged outside tests (#1493).
+export function testPaused(point: string, env = process.env): boolean {
+  return env.BUS_TEST_PAUSE === point && !!env.BUS_TEST_PAUSE_FILE;
+}
 
 export async function testPauseAsync(point: string, env = process.env): Promise<void> {
   const file = env.BUS_TEST_PAUSE_FILE;
   if (env.BUS_TEST_PAUSE !== point || !file) return;
   console.error(`[grayboard] test pause hit: ${point}`);
   while (!existsSync(file)) {
-    if (!existsSync(dirname(file))) throw new Error(`test pause abandoned: ${point}`);
+    if (abandoned(file)) throw new Error(`test pause abandoned: ${point}`);
     await Bun.sleep(10);
   }
   console.error(`[grayboard] test pause released: ${point}`);
@@ -24,7 +36,7 @@ export function testPause(point: string, env = process.env): void {
   if (env.BUS_TEST_PAUSE !== point || !file) return;
   console.error(`[grayboard] test pause hit: ${point}`);
   while (!existsSync(file)) {
-    if (!existsSync(dirname(file))) {
+    if (abandoned(file)) {
       console.error(`[grayboard] test pause abandoned: ${point}`);
       process.exit(1);
     }

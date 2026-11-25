@@ -1,5 +1,11 @@
 # New pi releases arrive as PRs, so the Test workflow runs the pi adapter's
-# end-to-end test against them before anyone updates.
+# end-to-end test against them before anyone updates. OpenCode and MCP SDK
+# releases do the same for the hosted OpenCode package, so its hosted gates
+# run against them (#379); each family's pins in that package move in one
+# PR. The MCP client is also pinned at the root and in hosted-core, which
+# Dependabot doesn't move: ci_sources.test.ts fails until the PR moves them.
+# The Rust SDK's crates (sdk/rust, #929) arrive as one grouped PR, which the
+# hosted matrix's rust-sdk leg tests.
 # Actions are pinned by commit SHA (#161; the repo requires it), so new
 # releases arrive as PRs that move the SHA and its version comment together.
 version: 2
@@ -10,9 +16,36 @@ updates:
       interval: weekly
     allow:
       - dependency-name: "@earendil-works/pi-coding-agent"
+  - package-ecosystem: bun
+    directory: /adapters/opencode-v2
+    schedule:
+      interval: weekly
+    allow:
+      - dependency-name: "@opencode/*"
+      - dependency-name: "@modelcontextprotocol/*"
+    groups:
+      opencode:
+        patterns:
+          - "@opencode/*"
+      mcp-sdk:
+        patterns:
+          - "@modelcontextprotocol/*"
+  - package-ecosystem: cargo
+    directory: /sdk/rust
+    schedule:
+      interval: weekly
+    groups:
+      rust-sdk:
+        patterns:
+          - "*"
   - package-ecosystem: github-actions
     directories:
       - /
       - /.github/actions/setup
+    schedule:
+      interval: weekly
+  # The server image's base (deploy/Dockerfile, #1418), pinned by digest.
+  - package-ecosystem: docker
+    directory: /deploy
     schedule:
       interval: weekly

@@ -1,6 +1,6 @@
 // An application-level session: no socket, no frames, no hosted store (#282).
 // It is a session the way application.hostedSession builds one, registered
-// with hostedRegister and given its aliases by application.bind, so tests
+// with hostedRegister and given its aliases by application.bindNow, so tests
 // drive the application's own operations (send, bind, call, replay...) with
 // no transport in between. It is not a hosted-store root: it has no lease, no
 // ownership and no generation, and nothing in the hosted service sees it. A
@@ -11,6 +11,7 @@ import { expect } from "bun:test";
 import { idAddress, mintSessionKey } from "../../src/core/bindings.ts";
 import type { PendingRef } from "../../src/core/boards.ts";
 import {
+  ApplicationError,
   type Application,
   type ApplicationSession,
   type BindResult,
@@ -20,12 +21,19 @@ import {
   type HistoryMessage,
   type IdentityInfo,
   type InboxResult,
+  type RefusalRow,
   type SendResult,
   type UnbindResult,
 } from "../../src/server/application.ts";
-import type { AuthedUser } from "../../src/server/auth.ts";
+import type { startServer } from "../../src/server/app.ts";
+import type { Repo } from "../../src/server/db.ts";
+import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
 import type { DelegateRequest, DelegateResult, ErrorCode } from "../../src/shared/protocol.ts";
+import { seed } from "./seed.ts";
 import { until } from "./until.ts";
+import type { Tx } from "../../src/server/store/tx.ts";
+
+type StartedServer = ReturnType<typeof startServer>;
 
 export type AppEvent =
   | DeliveryEvent
@@ -35,22 +43,34 @@ export type AppEvent =
 // push/hold/key: a session with push: false and no hold is tools-only, whose
 // identity is the alias it writes as; key: the session key its ID derives
 // from, minted when absent. harness: what hostedRegister records. bind:
-// further fields for the identity's bind. probe: how the session answers a
-// bind's probe of its alias (a contender asking whether the holder is alive):
-// "answer" (the default), "silent" (no answer: false after the probe's ms), or
-// a function of the ms.
+// further fields for the identity's bind. launcher: the declaration a hosted
+// request's `_meta` carries (#473), declared as `rowFor` does.
 export type AppSessionOptions = {
   push?: boolean;
+  launcher?: boolean;
   hold?: boolean;
   key?: string;
   harness?: string;
   bind?: Record<string, unknown>;
-  probe?: "answer" | "silent" | ((ms: number) => Promise<boolean>);
 };
 
 // What connect() answers: the session's ID and what its user's instructions
 // would carry, and the bind's result when the identity was bound.
 export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
+
+// An AppSession of the server `app`, signed in with the session token
+// `token` as an API request resolves it; connect() it. The caller closes it.
+// The token is read now; connect() rejects when it didn't authenticate.
+export function signedIn(app: Pick<StartedServer, "application" | "repo" | "touches">, token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
+  return new AppSession(app.application, app.repo, verifySessionToken(token, app.repo, app.touches, 0, 0), identity, opts);
+}
+
+// The ApplicationError `p` (a connect, a bind, a call) is refused with.
+export async function refusal(p: Promise<unknown>): Promise<ApplicationError> {
+  const e = await p.then(() => undefined, (e: unknown) => e);
+  if (!(e instanceof ApplicationError)) throw new Error(`expected an ApplicationError, got ${e}`);
+  return e;
+}
 
 type Waiter = { pred: (e: AppEvent) => boolean; resolve: (e: AppEvent) => void; reject: (e: Error) => void };
 
@@ -66,7 +86,10 @@ export class AppSession {
 
   constructor(
     private readonly application: Application,
-    private readonly authed: AuthedUser,
+    // A handler that writes runs in a queued body, as hosted `run` holds the write queue around it (#807 P1b-4f).
+    private readonly repo: Pick<Repo, "write" | "read">,
+    // A token's sign-in may still be resolving (signedIn): connect() awaits it.
+    private readonly authed: AuthedUser | Promise<AuthedUser | null>,
     // The alias to bind after connecting; null stays an unbound session.
     private readonly identity: string | null,
     private readonly opts: AppSessionOptions = {},
@@ -78,6 +101,35 @@ export class AppSession {
     return this.identity ?? (this.id || "unbound");
   }
 
+  // fn, a handler on `session`, in one queued transaction, as hosted `run` runs a tool: a refusal's rows (the
+  // session's `afterRollback`) are written after the rollback, in a body of their own. As Slack's inWrite does, the
+  // collector is set and cleared inside the body, which holds the write queue, so overlapping calls on one session
+  // can't leave it pointing at another call's. fn may be async (an application operation, #807 P1c-3).
+  private async write<T>(session: ApplicationSession, fn: (tx: Tx) => T | Promise<T>): Promise<Awaited<T>> {
+    const rows: RefusalRow[] = [];
+    try {
+      return await this.repo.write(async tx => {
+        rows.length = 0;
+        session.afterRollback = (w) => { rows.push(w); };
+        try { return await fn(tx); } finally { session.afterRollback = undefined; }
+      }) as Awaited<T>;
+    } catch (e) {
+      await this.flushRefusal(rows);
+      throw e;
+    }
+  }
+
+  // A refusal's rows in a body of their own, each in its own savepoint, as hosted's flushQueued writes them: one that
+  // fails is logged and the rest still land, so the caller's ApplicationError is what it rethrows.
+  private async flushRefusal(rows: RefusalRow[]): Promise<void> {
+    if (!rows.length) return;
+    await seed(this.repo, async tx => {
+      for (const w of rows) {
+        try { await tx.savepoint(w); } catch (failure) { console.error("[app_session] refusal row failed:", failure); }
+      }
+    }).catch(failure => console.error("[app_session] refusal rows failed:", failure));
+  }
+
   // The sink a hosted session has, with events in place of a stream.
   private sink(): DeliverySink {
     return {
@@ -85,14 +137,6 @@ export class AppSession {
       closed: (error) => {
         this.arrive({ kind: "closed", code: error.code, message: error.message });
         this.drop(`closed by the server (${error.code}: ${error.message})`);
-      },
-      probe: (ms) => {
-        const probe = this.opts.probe ?? "answer";
-        if (probe === "answer") return Promise.resolve(!this.closed);
-        if (typeof probe === "function") return probe(ms);
-        const { promise, resolve } = Promise.withResolvers<boolean>();
-        setTimeout(() => resolve(false), ms);
-        return promise;
       },
     };
   }
@@ -118,7 +162,8 @@ export class AppSession {
   private live(): ApplicationSession {
     if (!this.session) throw new Error(`${this.label}: not connected`);
     try {
-      this.application.revalidateSession(this.session, true);
+      // The operation's own `valid` reads the user; this checks only that the session is open (#807 P3 A7u1).
+      this.application.revalidateNow(this.session, true);
     } catch (e) {
       this.drop(`refused: ${(e as Error).message}`);
       throw e;
@@ -131,14 +176,24 @@ export class AppSession {
   // with the ApplicationError that refused either.
   async connect(): Promise<AppConnected> {
     if (this.session || this.closed) throw new Error(`${this.label}: connect() runs once, before close()`);
+    const authed = await this.authed;
+    if (!authed) throw new Error("appSession: the token doesn't authenticate");
     const toolsOnly = this.opts.push === false && this.opts.hold !== true;
     const id = idAddress(this.key);
     let info: IdentityInfo;
+    // A refusal's rows, written after its rollback, as hosted registration hands them to `later` (#807 P1b-4f).
+    const rows: RefusalRow[] = [], later = (w: RefusalRow) => { rows.push(w); };
     try {
-      const writesAs = toolsOnly && this.identity !== null ? this.application.hostedWritesAs(this.authed, id, this.identity, true) : null;
-      this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs);
-      ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.hold === true, this.opts.push !== false));
+      ({ session: this.session, info } = await seed(this.repo, async tx => {
+        const writesAs = toolsOnly && this.identity !== null
+          ? await this.application.hostedWritesAs(tx, authed, id, this.identity, true, (address, detail) => later(w => this.application.hostedRefused(w, id, address, detail)), later)
+          : null;
+        await this.application.hostedRegister(tx, authed, id, this.opts.harness ?? "test", writesAs, why => later(w => this.application.hostedCollided(w, authed, id, why)));
+        if (this.opts.launcher && writesAs === null) await this.application.hostedDeclareLauncher(tx, authed, id, { ownership: 0, client_id: "test" });
+        return await this.application.hostedSession(tx, authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
+      }));
     } catch (e) {
+      await this.flushRefusal(rows);
       this.drop(`connect refused: ${(e as Error).message}`);
       throw e;
     }
@@ -150,19 +205,20 @@ export class AppSession {
 
   // bind, then the new alias's mail and boards. The first bind makes the
   // session a writer, as a rebuilt hosted session is.
-  async bind(alias: string, extra: { create?: boolean; meta?: unknown; restored_from?: string; previous_key?: string } = {}): Promise<BindResult> {
+  async bind(alias: string, extra: { create?: boolean; meta?: unknown } = {}): Promise<BindResult> {
     const session = this.live();
-    const ok = await this.application.bind(session, { alias, ...extra } as Parameters<Application["bind"]>[1]);
+    const ok = await this.write(session, tx => this.application.bindNow(tx, session, { alias, ...extra } as Parameters<Application["bindNow"]>[2], true));
     if (session.readOnly) {
       session.readOnly = false;
       session.writerId = this.id;
     }
-    this.application.replay(session, [ok.alias]);
+    await this.application.replay(session, [ok.alias]);
     return ok;
   }
 
   async unbind(alias: string): Promise<UnbindResult> {
-    return this.application.unbind(this.live(), alias);
+    const session = this.live();
+    return this.write(session, tx => this.application.unbind(tx, session, alias));
   }
 
   async send(
@@ -170,23 +226,30 @@ export class AppSession {
     body: string,
     opts: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
   ): Promise<SendResult> {
-    return this.application.send(this.live(), recipient, body, opts);
+    const session = this.live();
+    return this.write(session, tx => this.application.send(tx, session, recipient, body, opts));
   }
 
   async delegate(req: Omit<DelegateRequest, "type" | "req_id">): Promise<DelegateResult> {
-    return this.application.delegate(this.live(), req);
+    const session = this.live();
+    return this.write(session, tx => this.application.delegate(tx, session, req));
   }
 
   async history(opts: { peer?: string; limit?: number; before_id?: number } = {}): Promise<HistoryMessage[]> {
-    return this.application.history(this.live(), opts);
+    return this.application.history(this.repo.read, this.live(), opts);
   }
 
   async thread(id: number): Promise<DirectMessage[]> {
-    return this.application.thread(this.live(), id);
+    return this.application.thread(this.repo.read, this.live(), id);
   }
 
   async inbox(days?: number): Promise<InboxResult> {
-    return this.application.inbox(this.live(), days);
+    return this.application.inbox(this.repo.read, this.live(), days);
+  }
+
+  // The hosted pull (application.pending()): what a lease's next pull carries, writer marks included.
+  async pending(limit?: number): Promise<DeliveryEvent[]> {
+    return this.application.pending(this.repo.read, this.live(), limit);
   }
 
   // A board or claim tool; resolves with the result the call publishes, after
@@ -195,24 +258,28 @@ export class AppSession {
   async call<T = unknown>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
     const session = this.live();
     const { promise, resolve } = Promise.withResolvers<T>();
-    this.application.call(session, tool, args, (result) => resolve(result as T));
+    await this.write(session, tx => this.application.call(tx, session, tool, args, (result) => resolve(result as T)));
     return promise;
   }
 
   async ack(ids: number[]): Promise<void> {
-    this.application.receiptDirect(this.live(), ids);
+    const session = this.live();
+    await this.write(session, tx => this.application.receiptDirect(tx, session, ids));
   }
 
   async boardAck(refs: PendingRef[]): Promise<void> {
-    this.application.receiptBoards(this.live(), refs);
+    const session = this.live();
+    await this.write(session, tx => this.application.receiptBoards(tx, session, refs));
   }
 
   async dmAck(id: number): Promise<void> {
-    this.application.acknowledgeDm(this.live(), id);
+    const session = this.live();
+    await this.write(session, tx => this.application.acknowledgeDm(tx, session, id));
   }
 
   async retract(id: number): Promise<{ note?: string }> {
-    return this.application.retract(this.live(), id);
+    const session = this.live();
+    return this.write(session, tx => this.application.retract(tx, session, id));
   }
 
   // The first event matching pred, taken from those already here or the
@@ -250,6 +317,8 @@ export class AppSession {
   }
 
   // The session closes (application.close). Later operations are refused.
+  // Its holds stay: a closed session no longer ends after a grace (#282), so
+  // a test that needs the hold released ends or unbinds it (#475 item 7e).
   close(): void {
     this.drop("closed");
   }

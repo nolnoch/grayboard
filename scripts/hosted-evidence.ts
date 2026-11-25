@@ -3,9 +3,11 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { matrixObservation } from "./hosted-matrix.ts";
 
-const suites = ["strict", "git", "config", "public", "host", "live", "matrix", "native", "durable"];
+export const HOSTED_SUITES = ["strict", "git", "config", "public", "host", "live", "matrix", "native", "durable"];
 const hex = (value: unknown, length: number): value is string => typeof value === "string" && new RegExp(`^[a-f0-9]{${length}}$`).test(value);
 const root = resolve(import.meta.dir, "..");
+// The one Bun pin (#379): CI's setup action and the pre-push hook read the same file.
+export const BUN_VERSION = readFileSync(join(root, ".bun-version"), "utf8").trim();
 
 // Repository-local/discovery settings and inherited command config must not escape a caller's checkout.
 const localGit = new Set(["GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_INTERNAL_SUPER_PREFIX", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_TEMPLATE_DIR"]);
@@ -103,7 +105,7 @@ export function junitCounts(raw: string): Counts {
 }
 
 export function provenance(value: any, checkout = root, suite = "strict") {
-  if (!suites.includes(suite) || value?.bun !== "1.4.4" || typeof value.installed !== "boolean" || typeof value.publicInstalled !== "boolean") throw new Error("Invalid provenance");
+  if (!HOSTED_SUITES.includes(suite) || value?.bun !== BUN_VERSION || typeof value.installed !== "boolean" || typeof value.publicInstalled !== "boolean") throw new Error("Invalid provenance");
   const tracked = Bun.spawnSync(["git", "ls-files", "-z"], { cwd: checkout, env: repositoryGitEnv() });
   if (tracked.exitCode) throw new Error("Cannot enumerate public paths");
   const paths = new Set(tracked.stdout.toString().split("\0"));
@@ -130,7 +132,7 @@ export function provenance(value: any, checkout = root, suite = "strict") {
   complete(installedChecks, suite !== "strict", value.installed);
   complete(publicChecks, suite === "public", value.publicInstalled);
   const mismatches = [...installedChecks, ...publicChecks].filter(e => e.sha256 !== e.expected);
-  return { bun: "1.4.4", installed: value.installed, publicInstalled: value.publicInstalled, installedChecks, publicChecks, mismatches, backend: entries(value.backend, false), drivers: entries(value.drivers, false) };
+  return { bun: BUN_VERSION, installed: value.installed, publicInstalled: value.publicInstalled, installedChecks, publicChecks, mismatches, backend: entries(value.backend, false), drivers: entries(value.drivers, false) };
 }
 
 function readJUnit(path: string, maximum = 8 * 1024 * 1024): string {
@@ -149,7 +151,7 @@ function readJUnit(path: string, maximum = 8 * 1024 * 1024): string {
 
 async function main() {
   const [suite, destination] = process.argv.slice(2);
-  if (!suite || !suites.includes(suite) || !destination) throw new Error("Invalid invocation");
+  if (!suite || !HOSTED_SUITES.includes(suite) || !destination) throw new Error("Invalid invocation");
   const output = resolve(destination, "evidence");
   if (existsSync(output)) throw new Error("Evidence destination occupied");
   const scratch = mkdtempSync(join(tmpdir(), "grayboard-evidence-"));

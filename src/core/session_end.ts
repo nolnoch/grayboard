@@ -13,9 +13,11 @@ import type { Database } from "bun:sqlite";
 import { coreAuditSink, type AuditSink } from "./audit.ts";
 import { addressParts } from "./addresses.ts";
 import { forgetHandle } from "./boards.ts";
-import { logBinding } from "./bindings.ts";
-import { logEvent, release, sweepIn, type Claim } from "./claims.ts";
+import { holdsOf, logBinding, primaryOf } from "./bindings.ts";
+import { logEvent, queuePostOrder, release, sweepIn, type Claim } from "./claims.ts";
 import { CoreError } from "./errors.ts";
+import { heldText, Undeliverable, undeliverableFrom } from "./undeliverable.ts";
+import type { ErrorCode } from "../shared/protocol.ts";
 import { testPause } from "../shared/testpause.ts";
 
 /** The ended ID's mail, as its mode stores it. Calls run inside the end's transaction. */
@@ -44,18 +46,20 @@ const NOT_ENDED: EndedSession = { ended: false, held: [], wake: [] };
  * poke `wake` and sweep the freed upload bytes after it commits. `why` details the release events (a reap names the dead pid).
  * `legacyNames`: a name a 1.x process holds through its bindings row.
  * `audit`: where the id.ended row goes (the server's access_log); audit_log when absent.
+ * `by`: who ended it (local: `by_pid`), on its row and its children's; `evidence`:
+ * what an ender saw (a reap's dead row and probe), on its row only (#330).
  * A session already ended is left alone.
  */
 export function endSession(
   db: Database,
   mail: MailPort,
   id: string,
-  opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink } = {},
+  opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink; by?: Record<string, unknown>; evidence?: Record<string, unknown> } = {},
 ): EndedSession {
   const now = opts.now ?? Date.now();
   const row = db.prepare(`SELECT ended_at, principal FROM ids WHERE id = ?`).get(id) as { ended_at: number | null; principal: string | null } | null;
   if (row?.ended_at != null) return NOT_ENDED;
-  const holds = (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address`).all(id) as { address: string }[]).map((r) => r.address);
+  const holds = holdsOf(db, id);
   const held = [...new Set([...holds, ...(opts.legacyNames ?? [])])];
   db.prepare(`UPDATE ids SET ended_at = ?, held_aliases_json = ? WHERE id = ?`).run(now, JSON.stringify(held), id);
   // A send that reaches the write lock after this point is refused with
@@ -63,28 +67,37 @@ export function endSession(
   testPause("end:in-txn");
 
   const wake = new Set<string>();
-  const body = bounceBody(id, now, held);
+  // One bounce per sender (#334), threaded under its latest unread message
+  // and naming the others. `bounced` and `unbounced` count messages.
+  const bySender = new Map<string, number[]>();
+  for (const m of mail.unread(id)) {
+    const ids = bySender.get(m.sender);
+    if (ids) ids.push(m.id);
+    else bySender.set(m.sender, [m.id]);
+  }
   let bounced = 0;
   let unbounced = 0;
-  for (const m of mail.unread(id)) {
-    // A bounce to an ID that has itself ended would only bounce back.
-    if (isEndedId(db, m.sender)) {
-      unbounced++;
+  for (const [sender, ids] of bySender) {
+    // A bounce to an ID that has ended would only bounce back, and one whose
+    // row is gone (pruned) can never be read.
+    if (!liveIdOrAlias(db, sender)) {
+      unbounced += ids.length;
       continue;
     }
-    mail.bounce(id, m.sender, m.id, body, now);
-    bounced++;
-    wake.add(m.sender);
+    const latest = Math.max(...ids);
+    mail.bounce(id, sender, latest, bounceBody(id, now, held, ids.filter((x) => x !== latest).sort((a, b) => a - b)), now);
+    bounced += ids.length;
+    wake.add(sender);
   }
 
   // Lapsed claims first, so they end as lapses (announced, redelivered) rather than releases.
   for (const h of sweepIn(db, now)) wake.add(h);
-  const claims = db.prepare(`SELECT key FROM claims WHERE holder = ? AND expires_at > ?`).all(id, now) as { key: string }[];
+  const claims = db.prepare(`SELECT key FROM claims WHERE holder = ? AND expires_at > ? ORDER BY key`).all(id, now) as { key: string }[];
   // A release that fails for any reason but a lapse (the sweep below takes
   // those) still frees the claim, unannounced, and the failure goes in the
   // id.ended audit: an end must not leave a claim on an ID that can't act.
   const releaseFailed: { key: string; error: string }[] = [];
-  for (const c of claims) {
+  for (const c of queuePostOrder(claims, (c) => c.key)) {
     try {
       for (const h of release(db, id, c.key, "session ended", { session: id }).wake) wake.add(h);
     } catch (e) {
@@ -106,6 +119,11 @@ export function endSession(
   db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(id);
   const detail = opts.why ? `session_end: ${opts.why}` : "session_end";
   for (const name of held) logBinding(db, id, name, "released", detail, now);
+  // Its child sessions (#523) act under its addresses, so they end with it, each audited.
+  const children = (db.prepare(`SELECT id FROM ids WHERE root_id = ? AND ended_at IS NULL ORDER BY id`).all(id) as { id: string }[]).map((r) => r.id);
+  for (const child of children) {
+    for (const h of endSession(db, mail, child, { why: `its root ${id} ended`, now, ...(opts.audit ? { audit: opts.audit } : {}), ...(opts.by ? { by: opts.by } : {}) }).wake) wake.add(h);
+  }
   (opts.audit ?? coreAuditSink(db))("id.ended", id, id, {
     principal: row?.principal ?? null,
     held,
@@ -113,30 +131,34 @@ export function endSession(
     bounced,
     ...(unbounced ? { unbounced } : {}),
     ...(releaseFailed.length ? { release_failed: releaseFailed } : {}),
+    ...(children.length ? { children } : {}),
+    ...opts.by,
+    ...opts.evidence,
   });
   wake.delete(id);
   return { ended: true, held, wake: [...wake] };
 }
 
-function isEndedId(db: Database, address: string): boolean {
-  if (addressParts(address)?.kind !== "id") return false;
+/** False for an ID sender that has ended or whose row is gone; an alias is durable, so always true. */
+function liveIdOrAlias(db: Database, address: string): boolean {
+  if (addressParts(address)?.kind !== "id") return true;
   const r = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(address) as { ended_at: number | null } | null;
-  return r?.ended_at != null;
+  return r != null && r.ended_at == null;
 }
 
-function heldText(held: string[]): string {
-  return held.length ? `it held ${held.map((a) => `\`${a}\``).join(", ")}` : "it held no alias";
-}
-
-export function bounceBody(id: string, endedAt: number, held: string[]): string {
-  return `${id} ended at ${new Date(endedAt).toISOString()} before reading this; ${heldText(held)}.`;
+/** A bounce's text. `earlier`: the sender's other unread message ids, ascending; the bounce threads under the latest. */
+export function bounceBody(id: string, endedAt: number, held: string[], earlier: number[] = []): string {
+  const also = earlier.length ? ` or your earlier ${earlier.length === 1 ? "message" : "messages"} ${earlier.join(", ")}` : "";
+  return `\`${id}\` ended at ${new Date(endedAt).toISOString()} before reading this${also}; ${heldText(held)}.`;
 }
 
 /**
  * Refuse a send or mention to an ID that can't receive it, inside the
  * sender's write transaction so it can't race the end: an ended ID
  * (id_ended, naming what it held), one with no row (not_found: never
- * existed, or pruned past retention), a viewer (not_found) or a tools-only
+ * existed, or pruned past retention), a viewer (not_found), a child session
+ * (child_session, naming its root's primary: a child acts under its root's
+ * addresses, ended or not, so its ID is never an address) or a tools-only
  * session (no_delivery, naming the alias its owner writes as).
  */
 export function assertDeliverableId(db: Database, id: string): void {
@@ -144,32 +166,36 @@ export function assertDeliverableId(db: Database, id: string): void {
   if (why) throw why;
 }
 
-/**
- * assertDeliverableId's refusal. Its message reads `<code>: <detail>`, the
- * text a local tool error shows; the server sends `code` as the error
- * frame's code and `detail` as its message, so both modes read the same.
- */
-export class Undeliverable extends CoreError {
-  constructor(
-    readonly code: "not_found" | "id_ended" | "no_delivery",
-    readonly detail: string,
-  ) {
-    super(`${code}: ${detail}`);
-  }
+// assertDeliverableId's refusal (core/undeliverable.ts, which the Postgres store shares).
+export { Undeliverable };
+
+/** A refused core call's wire code, both modes: an ID that can't receive names its own (#284 S18), as does a CoreError built with one; any other is a bad request. */
+export function coreRefusalCode(e: CoreError): ErrorCode {
+  return e instanceof Undeliverable ? e.code : e.refusalCode ?? "bad_request";
 }
 
 /** Why `id` can't receive a send or mention (assertDeliverableId's refusal), or null when it can. */
 export function undeliverableId(db: Database, id: string): Undeliverable | null {
-  const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer FROM ids WHERE id = ?`).get(id) as
-    | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number }
+  const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer, root_id FROM ids WHERE id = ?`).get(id) as
+    | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number; root_id: string | null }
     | null;
-  if (!r || r.viewer) return new Undeliverable("not_found", `no session ${id}`);
-  if (r.ended_at != null) {
-    const held = r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [];
-    return new Undeliverable("id_ended", `${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`);
-  }
-  if (r.delivery === "none") {
-    return new Undeliverable("no_delivery", `${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`);
-  }
-  return null;
+  return undeliverableFrom(id, r && {
+    ...r,
+    viewer: !!r.viewer,
+    held: () => r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [],
+  }, (root) => rootPrimary(db, root));
+}
+
+/**
+ * The address a child's root writes as by default: its oldest hold, else
+ * its writes_as, else (once ended) the first alias it held, else its ID.
+ */
+function rootPrimary(db: Database, root: string): string {
+  const holds = holdsOf(db, root);
+  if (holds.length) return primaryOf(holds, root);
+  const r = db.prepare(`SELECT ended_at, held_aliases_json, writes_as FROM ids WHERE id = ?`).get(root) as
+    | { ended_at: number | null; held_aliases_json: string | null; writes_as: string | null }
+    | null;
+  if (r?.writes_as) return r.writes_as;
+  return primaryOf(r?.ended_at != null && r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [], root);
 }

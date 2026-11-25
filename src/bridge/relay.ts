@@ -16,15 +16,22 @@ import {
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
 import { sha256Hex } from "../shared/hash.ts";
+import { viaLabel } from "../shared/notifications.ts";
+import type { SendResult } from "../shared/protocol.ts";
 import type { Store, ThreadRow } from "./store.ts";
 import { SlackError, SlackUnavailable, type SlackWeb } from "./web.ts";
 
+// The thread map and progress may answer with a promise (a server's async store, #807 P3 A5); the relay awaits each.
+// The outbox stays synchronous: `notify` stores an item before anything else can fail, and a server's is memory.
+type MaybeAsync<F> = F extends (...args: infer A) => infer R ? (...args: A) => R | Promise<R> : never;
+type Stored = "thread" | "byTs" | "addThread" | "advance" | "progress" | "setProgress" | "done";
 /** The thread map and outbox: store.ts locally, the server's tables and acks in server mode. */
-export type RelayStore = Pick<Store, "thread" | "byTs" | "addThread" | "advance" | "enqueue" | "pending" | "progress" | "setProgress" | "done">;
+export type RelayStore = Pick<Store, "enqueue" | "pending"> & { [K in Stored]: MaybeAsync<Store[K]> };
 
 export type ChannelParams = { content: string; meta: Record<string, string> };
 
-export type ToolResult = { ok: true; value: any } | { ok: false; error: string };
+// A refusal's `code` (`id_ended`, `not_found`, …) when the bus gave one: the relay words a few for the Slack reader (#428).
+export type ToolResult = { ok: true; value: any } | { ok: false; error: string; code?: string };
 
 /** A file the owner shared in Slack, checked and downloaded. */
 export type SlackFile = AttachmentFile & { slack_file: string };
@@ -60,7 +67,8 @@ export type RelayOptions = {
   shareWaitMs?: number;
 };
 
-type Item = { kind: "dm" | "board"; board: string | null; root: number; id: number; from: string; body: string; attachments: number[] };
+// via: the child session (a harness subagent, #523) that wrote it under `from`, from the channel meta.
+type Item = { kind: "dm" | "board"; board: string | null; root: number; id: number; from: string; via?: string; body: string; attachments: number[] };
 
 type UploadedFile = { id: string; title: string; attachment: number; sha256: string };
 
@@ -90,7 +98,7 @@ const SHARE_POLLS = 10;
 const CHECK = "white_check_mark";
 
 const HINT =
-  'To start a conversation, begin a message with "@handle" (a direct message to that agent) or "#board" (a post on that board). To answer an agent, reply in its thread. To make a board: "new #board what it\'s for".';
+  'To start a conversation, begin a message with "@handle" (a direct message to that agent) or "#board" (a post on that board). To answer an agent, reply in its thread. To make a board: "new #board what it\'s for"; to archive or reopen one: "archive #board", "reopen #board".';
 
 export class Relay {
   private draining = false;
@@ -172,12 +180,12 @@ export class Relay {
 
   // Retries until Slack takes it, except for errors a retry can't fix.
   private async deliver(id: number, p: ChannelParams): Promise<void> {
-    const progress = (this.store.progress(id) ?? {}) as Progress;
-    const save = () => this.store.setProgress(id, progress);
+    const progress = ((await this.store.progress(id)) ?? {}) as Progress;
+    const save = async () => { await this.store.setProgress(id, progress); };
     for (;;) {
       try {
         await this.forward(p, progress, save);
-        this.store.done(id, progress.error ?? null);
+        await this.store.done(id, progress.error ?? null);
         return;
       } catch (e) {
         if (e instanceof SlackError) {
@@ -188,7 +196,7 @@ export class Relay {
           }
           // E.g. msg_too_long: this one message can't be posted; keep going.
           this.log(`slack: gave up on outbox ${id}: ${e.message}`);
-          this.store.done(id, e.code);
+          await this.store.done(id, e.code);
           return;
         }
         if (!(e instanceof SlackUnavailable)) throw e;
@@ -199,7 +207,7 @@ export class Relay {
     }
   }
 
-  private async forward(p: ChannelParams, progress: Progress, save: () => void): Promise<void> {
+  private async forward(p: ChannelParams, progress: Progress, save: () => Promise<void>): Promise<void> {
     const m = p.meta ?? {};
     let attachments: number[] = [];
     try {
@@ -208,7 +216,7 @@ export class Relay {
       // The meta format changed under the relay: say so rather than drop the files.
       progress.refused ??= [{ attachment: null, name: "its files", why: (e as Error).message }];
     }
-    const base = { from: m.from ?? "?", body: p.content, attachments };
+    const base = { from: m.from ?? "?", ...(m.via ? { via: m.via } : {}), body: p.content, attachments };
     if (m.board && m.post_id) {
       const id = Number(m.post_id);
       const root = m.parent_id ? await this.boardRoot(m.board, id) : id;
@@ -224,24 +232,28 @@ export class Relay {
   // with the text as a markdown block, or chat.postMessage when no file made
   // it. Each step is saved in `progress` before the next, so a retry or a
   // restart resumes where this one stopped.
-  private async postItem(x: Item, progress: Progress, save: () => void): Promise<void> {
+  private async postItem(x: Item, progress: Progress, save: () => Promise<void>): Promise<void> {
     const name = this.o.label?.(x.from) ?? x.from;
     if (!progress.posted) {
       if (x.attachments.length && !progress.files) {
         await this.upload(x.attachments, progress);
-        save();
+        await save();
       }
-      let row = this.store.thread(x.kind, x.board, x.root);
+      // Taken before the read as well as after it: a mapping that finishes while the read awaits stored its row
+      // after the read began.
+      const before = [...this.unmapped];
+      let row = await this.store.thread(x.kind, x.board, x.root);
       // The owner's message that started this thread may still be mapping it:
       // its bus call hands the agent the root's id before it returns (#232).
-      if (!row && this.unmapped.size) {
-        this.debug(`outbox: ${x.kind} ${x.id} waits on ${this.unmapped.size} new thread(s) before threading`);
-        await Promise.all(this.unmapped);
+      const waits = row ? [] : [...new Set([...before, ...this.unmapped])];
+      if (waits.length) {
+        this.debug(`outbox: ${x.kind} ${x.id} waits on ${waits.length} new thread(s) before threading`);
+        await Promise.all(waits);
         // Thrown, not returned: the item stays in the outbox for the next run.
         if (this.stopped) throw new Error("relay stopped");
-        row = this.store.thread(x.kind, x.board, x.root);
+        row = await this.store.thread(x.kind, x.board, x.root);
       }
-      const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused));
+      const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused), x.via);
       // The item's message ts; null when Slack took it but never said where.
       let ts: string | null | undefined;
       // Slack may deliver a reply before the post's HTTP response reaches us.
@@ -255,12 +267,12 @@ export class Relay {
           if (this.stopped) throw new Error("relay stopped");
           ts = await this.postText(text(), name, row?.thread_ts);
         }
-        if (row) this.store.advance(row.thread_ts, x.id);
-        else if (ts) this.store.addThread({ thread_ts: ts, kind: x.kind, board: x.board, root_id: x.root, peer: x.kind === "dm" ? x.from : null, last_id: x.id });
+        if (row) await this.store.advance(row.thread_ts, x.id, x.kind === "dm" ? x.from : undefined);
+        else if (ts) await this.store.addThread({ thread_ts: ts, kind: x.kind, board: x.board, root_id: x.root, peer: x.kind === "dm" ? x.from : null, last_id: x.id });
         const errors = [progress.refused?.length ? "files_refused" : null, !row && !ts ? "ts_unknown" : null].filter(Boolean);
         progress.error = errors.length ? errors.join(",") : null;
         progress.posted = true;
-        save();
+        await save();
       } finally {
         publishing?.finish();
         if (this.publishing === publishing) this.publishing = null;
@@ -275,7 +287,7 @@ export class Relay {
       for (const r of progress.refused) this.o.onFileRefused?.(r);
       await this.tell(x, progress.refused);
       progress.told = true;
-      save();
+      await save();
     }
   }
 
@@ -323,7 +335,7 @@ export class Relay {
   // answers a repeat ok, posts nothing new, and names the first share
   // (measured live, PR #135). It takes no `username` (measured: ignored), so
   // the sender's name rides only in the text (`format`).
-  private async share(progress: Progress, save: () => void, text: string, threadTs: string | undefined): Promise<string | null | undefined> {
+  private async share(progress: Progress, save: () => Promise<void>, text: string, threadTs: string | undefined): Promise<string | null | undefined> {
     const files = progress.files!;
     let answer: { files?: Record<string, any>[] };
     try {
@@ -341,7 +353,7 @@ export class Relay {
       const why = refusal(e);
       progress.refused = [...(progress.refused ?? []), ...files.map((f) => ({ attachment: f.attachment, name: f.title, why, sha256: f.sha256 }))];
       progress.files = [];
-      save();
+      await save();
       return undefined;
     }
     // A first answer's shares are empty (they lag); a repeat's name the message.
@@ -396,7 +408,7 @@ export class Relay {
     const what = x.kind === "dm" ? `your message ${x.id}` : `your post ${x.id} on #${x.board}`;
     const body = `[Slack bridge] Files on ${what} didn't reach Slack, so the human hasn't seen them: ${listRefused(refused)}. The text did reach them.`;
     const r = await this.bus.call("dm_send", { to: x.from, body, ...(x.kind === "dm" ? { parent_id: x.id } : {}) });
-    if (!r.ok) this.log(`slack: couldn't tell ${x.from} its files didn't reach Slack: ${r.error}`);
+    if (!r.ok) this.log(`slack: couldn't tell ${x.from} its files didn't reach Slack: ${r.code ? `${r.code}: ` : ""}${r.error}`);
   }
 
   // Notifications carry parent_id, not the root; key the map on the root so a
@@ -453,8 +465,11 @@ export class Relay {
   }
 
   private async reply(threadTs: string, ts: string, text: string, files: Record<string, any>[]): Promise<void> {
-    let row = this.store.byTs(threadTs);
-    const publishing = this.publishing;
+    // Taken before the read as well as after it: a publish that finishes while the read awaits mapped its thread
+    // after the read began.
+    const before = this.publishing;
+    let row = await this.store.byTs(threadTs);
+    const publishing = this.publishing ?? before;
     if (!row && publishing) {
       await publishing.done;
       if (this.stopped) {
@@ -462,7 +477,7 @@ export class Relay {
         await this.say(threadTs, "Not sent: the bridge stopped while connecting this thread. Send your reply again after it restarts.");
         return;
       }
-      row = this.store.byTs(threadTs);
+      row = await this.store.byTs(threadTs);
     }
     if (!row) {
       await this.say(threadTs, `This thread isn't connected to a grayboard conversation. ${HINT}`);
@@ -480,6 +495,8 @@ export class Relay {
     const nb = /^new\s+#([a-z0-9_-]{1,32})(?:[\s:,]+(\S[\s\S]*))?$/i.exec(text);
     if (nb && files.length) return this.say(ts, `⚠️ not created: files don't come along when making a board; make #${nb[1]!.toLowerCase()} first, then post them with "#${nb[1]!.toLowerCase()} …"`);
     if (nb) return this.createBoard(nb[1]!.toLowerCase(), nb[2], ts);
+    const ar = /^(archive|reopen)\s+#([a-z0-9_-]{1,32})\s*$/i.exec(text);
+    if (ar && !files.length) return this.archiveBoard(ar[2]!.toLowerCase(), ar[1]!.toLowerCase() === "archive", ts);
     const bp = /^#([a-z0-9_-]{1,32})(?:\s+(\S[\s\S]*))?$/i.exec(text);
     if (bp && (bp[2] || files.length)) return this.sendPost(bp[1]!.toLowerCase(), bp[2] ?? "", files, undefined, ts, null);
     await this.say(ts, HINT);
@@ -516,7 +533,7 @@ export class Relay {
       try {
         data = await this.slack.download(String(f.url_private_download), size);
       } catch (e) {
-        if (e instanceof SlackError && e.code === "size_mismatch") throw new Error(`${label}: Slack didn't serve it (does the app have files:read? reinstall it from the current manifest)`);
+        if (e instanceof SlackError && (e.code === "size_mismatch" || e.code === "forbidden")) throw new Error(`${label}: Slack didn't serve it (does the app have files:read? reinstall it from the current manifest)`);
         if (e instanceof SlackError && e.code === "untrusted_host") throw new Error(`${label}: its download isn't on Slack's own host`);
         throw e;
       }
@@ -546,14 +563,16 @@ export class Relay {
       ),
     );
     const where = row?.thread_ts ?? ts;
-    if (!r.ok) return this.say(where, `⚠️ not sent: ${r.error}`);
-    const v = r.value as { message_id: number; delivered_now: boolean; recipient_last_seen?: string };
-    if (row) this.store.advance(row.thread_ts, v.message_id);
+    if (!r.ok) return this.say(where, row ? threadBounce(r) ?? `⚠️ not sent: ${r.error}` : `⚠️ not sent: ${r.error}`);
+    const v = r.value as Pick<SendResult, "message_id" | "delivered_now" | "recipient_last_seen" | "wakes" | "wake_note">;
+    if (row) await this.store.advance(row.thread_ts, v.message_id);
     if (v.delivered_now) await this.react(ts);
     else {
       const seen = v.recipient_last_seen ? ` (last seen ${v.recipient_last_seen})` : "";
       await this.say(where, `queued: ${to} is offline${seen}; it gets this when its next session starts.`);
     }
+    // Another user's agent no grant lets this person wake (#806): say so, or they wait on an agent that won't act.
+    if (v.wakes === false) await this.say(where, v.wake_note ?? `delivered as mail: ${to} won't act on it until its user does.`);
   }
 
   private async sendPost(board: string, text: string, files: Record<string, any>[], parent: number | undefined, ts: string, row: ThreadRow | null): Promise<void> {
@@ -567,7 +586,7 @@ export class Relay {
     const where = row?.thread_ts ?? ts;
     if (!r.ok) return this.say(where, `⚠️ not posted: ${/no such board/.test(r.error) ? await this.noBoard(board) : r.error}`);
     const v = r.value as { post_id: number; board: string; unresolved?: string[] };
-    if (row) this.store.advance(row.thread_ts, v.post_id);
+    if (row) await this.store.advance(row.thread_ts, v.post_id);
     await this.react(ts);
     if (v.unresolved?.length) await this.say(where, `posted, but no handle matches ${v.unresolved.map((h) => `@${h}`).join(", ")}`);
   }
@@ -576,14 +595,14 @@ export class Relay {
   // the call until `map` stores its Slack mapping: the bus delivers the root,
   // and an agent can answer it, before the call returns (#232). Only that span
   // holds the outbox; file downloads before it don't.
-  private async mapping(row: ThreadRow | null, call: () => Promise<ToolResult>, map: (value: any) => void): Promise<ToolResult> {
+  private async mapping(row: ThreadRow | null, call: () => Promise<ToolResult>, map: (value: any) => void | Promise<void>): Promise<ToolResult> {
     if (row) return call();
     let done!: () => void;
     const held = new Promise<void>((r) => (done = r));
     this.unmapped.add(held);
     try {
       const r = await call();
-      if (r.ok) map(r.value);
+      if (r.ok) await map(r.value);
       return r;
     } finally {
       this.unmapped.delete(held);
@@ -600,6 +619,17 @@ export class Relay {
     await this.bus.call("board_subscribe", { board, mode: "quiet" });
     await this.react(ts);
     await this.say(ts, `created #${board}. Post with "#${board} …"; @mention the agents you want to hear from, since no one else is subscribed yet.`);
+  }
+
+  // The owner's way to archive a board (#848): board_archive lets the creator's
+  // own user's human archive or reopen it.
+  private async archiveBoard(board: string, archived: boolean, ts: string): Promise<void> {
+    const r = await this.bus.call("board_archive", { board, archived });
+    const verb = archived ? "archived" : "reopened";
+    if (!r.ok) return this.say(ts, `⚠️ not ${verb}: ${/no such board/.test(r.error) ? await this.noBoard(board) : r.error}`);
+    const v = r.value as { note?: string };
+    if (v.note) return this.say(ts, v.note);
+    await this.react(ts);
   }
 
   // The bus's "no such board" points agents at board_list; the owner gets the
@@ -645,13 +675,14 @@ function warning(refused: Refused[] | undefined): string | undefined {
 
 /**
  * A grayboard item as Slack Markdown. The sender's handle leads in bold, so
- * attribution survives even if Slack ignores the username override. A new
+ * attribution survives even if Slack ignores the username override. A child
+ * writer (`via`, #523) follows it, labelled as the harness's claim. A new
  * thread from a board names the board. A handle with an email in it goes in a
  * code span, or Slack auto-links the address and shows it as "mailto:…".
  * A note (files that didn't make it) ends it, and the body is cut to fit.
  */
-export function format(from: string, board: string | null, body: string, id: number, note?: string): string {
-  const name = from.includes("@") ? `\`${from}\`` : `**${from}**`;
+export function format(from: string, board: string | null, body: string, id: number, note?: string, via?: string): string {
+  const name = (from.includes("@") ? `\`${from}\`` : `**${from}**`) + (via ? ` (${viaLabel(via)})` : "");
   const head = board ? `${name} · #${board} ·` : name;
   const tail = note ? `\n\n${note.length > MAX_NOTE ? `${note.slice(0, MAX_NOTE)}…` : note}` : "";
   const max = MAX_BODY - tail.length;
@@ -673,4 +704,17 @@ export function fromSlack(s: string): string {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&");
+}
+
+// A reply in a mapped DM thread whose session can't receive it, worded for the
+// Slack reader rather than in session ids and alias bookkeeping (#428). The
+// detail's "it held …" clause (core/session_end.ts heldText) names the aliases
+// that outlive the session; mail to one of them reaches its next holder.
+export function threadBounce(r: { error: string; code?: string }): string | undefined {
+  if (r.code === "not_found") return "⚠️ Your reply wasn't sent: the agent session this thread was with no longer exists, so replies here reach nobody. Start a new message to a named agent instead.";
+  if (r.code !== "id_ended") return undefined;
+  const at = /ended at (\S+?);/.exec(r.error)?.[1];
+  const held = /it held (.+)$/.exec(r.error)?.[1];
+  const names = held && held !== "no alias" ? held : undefined;
+  return `⚠️ Your reply wasn't sent: the agent session this thread was with has ended${at ? ` (${at})` : ""}, so replies here reach nobody.${names ? ` Its names outlive it: message ${names} to reach whoever holds them now.` : " Start a new message to a named agent instead."}`;
 }

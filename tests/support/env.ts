@@ -22,6 +22,8 @@ export function cleanEnv(extra: Record<string, string> = {}): Record<string, str
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined && !INHERITED.test(k) && !DROPPED.includes(k)) env[k] = v;
   }
+  // The refusal of the live bus (preload.ts) follows every child.
+  if (process.env.GRAYBOARD_TEST_FORBID_BUS) env.GRAYBOARD_TEST_FORBID_BUS = process.env.GRAYBOARD_TEST_FORBID_BUS;
   return { ...env, ...extra };
 }
 

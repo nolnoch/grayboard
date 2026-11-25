@@ -8,8 +8,8 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { BUNDLE, bundle } from "../../scripts/build_claude_plugin.ts";
-import { pinMarketplace, SHA_RE, TAG_RE } from "../../scripts/pin_claude_plugin.ts";
+import { BUNDLE, BUNDLES, bundle } from "../../scripts/build_claude_plugin.ts";
+import { pinMarketplace, renderMarketplace, SHA_RE, TAG_RE, verifyPin } from "../../scripts/pin_claude_plugin.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const ROOT = resolve(import.meta.dir, "../..");
@@ -20,11 +20,31 @@ const marketplace = JSON.parse(readFileSync(join(ROOT, ".claude-plugin/marketpla
 // The build resolves hosted-core's dependencies from the root install, so the
 // bundle is the same whether or not hosted-core's own gate has installed
 // adapters/hosted-core/node_modules, and carries one copy of each package.
-test("the committed bundle is a fresh build of plugins/claude-code/src (run `bun scripts/build_claude_plugin.ts`)", async () => {
-  const fresh = await bundle();
-  expect(fresh.includes("// adapters/hosted-core/node_modules/")).toBe(false);
-  expect(readFileSync(BUNDLE, "utf8") === fresh).toBe(true);
+test("the committed bundles are fresh builds of plugins/claude-code/src (run `bun scripts/build_claude_plugin.ts`)", async () => {
+  for (const b of BUNDLES) {
+    const fresh = await bundle(b.entry);
+    expect(fresh.includes("// adapters/hosted-core/node_modules/")).toBe(false);
+    expect({ path: b.path, fresh: readFileSync(b.path, "utf8") === fresh }).toEqual({ path: b.path, fresh: true });
+  }
 }, 60_000);
+
+// The hooks that make a subagent's calls its own child session (#551): every
+// grayboard tool's PreToolUse, and the session's start, end and subagent stops;
+// a confirmed model switch, for the root's model (#545); and every grayboard
+// tool's PostToolUse and PostToolUseFailure, which show the sign-in link (#500).
+test("the plugin's hooks run the hook bundle with bun for each event", () => {
+  const hooks = JSON.parse(readFileSync(join(PLUGIN, "hooks/hooks.json"), "utf8")).hooks;
+  const run = (event: string) => [{ type: "command", command: `bun "\${CLAUDE_PLUGIN_ROOT}/dist/hook.js" ${event} --data "\${CLAUDE_PLUGIN_DATA}"`, timeout: 10 }];
+  expect(hooks).toEqual({
+    SessionStart: [{ matcher: "startup|resume|clear|fork", hooks: run("session-start") }],
+    PreToolUse: [{ matcher: "mcp__plugin_grayboard_grayboard__.*", hooks: run("pre-tool-use") }],
+    PostToolUse: [{ matcher: "mcp__plugin_grayboard_grayboard__.*", hooks: run("post-tool-use") }],
+    PostToolUseFailure: [{ matcher: "mcp__plugin_grayboard_grayboard__.*", hooks: run("post-tool-use") }],
+    PostModelSwitch: [{ hooks: run("model-switch") }],
+    SubagentStop: [{ hooks: run("subagent-stop") }],
+    SessionEnd: [{ hooks: run("session-end") }],
+  });
+});
 
 test("the manifest carries package.json's version and runs the bundle with bun, with the server URL from userConfig", () => {
   expect(manifest.name).toBe("grayboard");
@@ -40,9 +60,9 @@ test("the manifest carries package.json's version and runs the bundle with bun, 
   expect(skill).toContain('!`bun "${CLAUDE_PLUGIN_ROOT}/dist/grayboard.js" logout --data "${CLAUDE_PLUGIN_DATA}"`');
 });
 
-const expectPinned = (doc: { name: string; plugins: { name: string; source: unknown }[] }) => {
+const expectPinned = (doc: { name: string; plugins: unknown[] }) => {
   expect(doc.name).toBe("grayboard");
-  for (const entry of doc.plugins) {
+  for (const entry of doc.plugins as { name: string; source: unknown }[]) {
     expect(entry.name).toBe("grayboard");
     expect(entry.source).toEqual({ source: "git-subdir", url: "https://github.com/nolnoch/grayboard.git", path: "plugins/claude-code", ref: expect.stringMatching(TAG_RE), sha: expect.stringMatching(SHA_RE) });
   }
@@ -65,6 +85,47 @@ test("the release job's pin writes that entry, replacing any earlier pin, and re
   expect({ ...next, plugins: [] }).toEqual({ ...marketplace, plugins: [] });
   expect(() => pinMarketplace(marketplace, "2.3.0", sha)).toThrow("isn't a release tag");
   expect(() => pinMarketplace(marketplace, "v2.3.0", sha.slice(1))).toThrow("isn't a full 40-hex commit");
+});
+
+// #507: a pin-only PR skips the suites, so its check must prove the file is
+// only a forward pin: anything else beside the pin, or a downgrade, fails.
+test("the pin PR's check accepts exactly the script's re-pin of the base to a newer release", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const base = renderMarketplace(pinMarketplace(marketplace, "v2.3.0", sha));
+  const pinned = (ref: string, doc = JSON.parse(base)) => renderMarketplace(pinMarketplace(doc, ref, sha.replace("0", "f")));
+  expect(verifyPin(base, pinned("v2.3.1"))).toEqual({ ref: "v2.3.1", sha: sha.replace("0", "f") });
+  expect(verifyPin(renderMarketplace({ ...marketplace, plugins: [] }), pinned("v2.3.0"))).toEqual({ ref: "v2.3.0", sha: sha.replace("0", "f") });
+  const head = JSON.parse(pinned("v2.3.1"));
+  const changed = (edit: (doc: any) => void) => { const doc = structuredClone(head); edit(doc); return renderMarketplace(doc); };
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins[0].mcpServers = { x: { command: "sh" } }; }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins[0].source.extra = 1; }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, changed((doc) => { doc.owner = { name: "someone" }; }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins.push(doc.plugins[0]); }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins[0].source.url = "https://example.com/x.git"; }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, JSON.stringify(head))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, pinned("v2.3.0"))).toThrow("v2.3.0 isn't newer than the base's pin v2.3.0");
+  expect(() => verifyPin(base, pinned("v2.2.9"))).toThrow("isn't newer");
+  expect(() => verifyPin(base, pinned("v2.3.0-rc1"))).toThrow("isn't newer");
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins[0].source.sha = "HEAD"; }))).toThrow("isn't a full 40-hex commit");
+  expect(() => verifyPin(base, renderMarketplace({ ...head, plugins: [] }))).toThrow("no pinned grayboard entry");
+});
+
+test("`verify <base>` checks the committed marketplace against a base file and exits 1 naming the failure", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-pin-verify-"));
+  try {
+    const run = (base: string) => {
+      writeFileSync(join(dir, "base.json"), base);
+      return Bun.spawnSync([process.execPath, join(ROOT, "scripts/pin_claude_plugin.ts"), "verify", join(dir, "base.json")], { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
+    };
+    const ok = run(renderMarketplace({ ...marketplace, plugins: [] }));
+    expect(ok.stderr.toString()).toBe("");
+    expect(ok.stdout.toString()).toContain(`only moves the pin, to ${marketplace.plugins[0].source.ref}`);
+    expect(ok.exitCode).toBe(0);
+    const same = run(readFileSync(join(ROOT, ".claude-plugin/marketplace.json"), "utf8"));
+    expect(same.stderr.toString()).toContain("pin check failed:");
+    expect(same.stderr.toString()).toContain("isn't newer than the base's pin");
+    expect(same.exitCode).toBe(1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("the bundle runs under bun: logout on an empty data dir has nothing to sign out of", () => {

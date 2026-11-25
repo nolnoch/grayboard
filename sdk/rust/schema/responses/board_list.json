@@ -1,0 +1,17 @@
+{
+  "arguments": {},
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "[\n  {\n    \"name\": \"rec\",\n    \"purpose\": \"recorded responses\",\n    \"scope\": null,\n    \"created_by\": \"you@example.com/rec-a\",\n    \"created_at\": 1700000000000,\n    \"kind\": \"broadcast\",\n    \"posts\": 0,\n    \"mode\": \"push\",\n    \"unread\": 0\n  }\n]"
+      }
+    ]
+  }
+}

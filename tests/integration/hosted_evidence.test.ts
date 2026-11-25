@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { junitCounts, provenance, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
+import { BUN_VERSION, junitCounts, provenance, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
+import { matrixCases } from "../../scripts/hosted-matrix.ts";
 
 const checkout = resolve(import.meta.dir, "../.."), roots: string[] = [];
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -17,8 +18,10 @@ function fixtureGit(root: string, env: Record<string, string>, ...args: string[]
   if (result.exitCode !== 0) throw new Error("Owned fixture Git setup failed; subprocess diagnostics withheld");
   return result.stdout.toString().trim();
 }
-const metadata = (directory: string): string => new Bun.CryptoHasher("sha256").update(readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.name + ":" + (entry.isDirectory() ? metadata(join(directory, entry.name)) : new Bun.CryptoHasher("sha256").update(readFileSync(join(directory, entry.name))).digest("hex"))).join("\n")).digest("hex");
-const identity = ["-c", "user.name=Fixture", "-c", "user.email=you@example.com", "-c", "commit.gpgsign=false"];
+// Each file under `directory` by relative path → content digest, so a failed comparison names what changed.
+const metadata = (directory: string, prefix = ""): Record<string, string> => Object.fromEntries(readdirSync(directory, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? Object.entries(metadata(join(directory, entry.name), prefix + entry.name + "/")) : [[prefix + entry.name, new Bun.CryptoHasher("sha256").update(readFileSync(join(directory, entry.name))).digest("hex")]]));
+// maintenance.auto=false: a commit otherwise detaches `git maintenance run --auto`, whose lock under .git/objects can land in or miss the parent metadata digest (#466).
+const identity = ["-c", "user.name=Fixture", "-c", "user.email=you@example.com", "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false"];
 
 const document = (body = '<testcase name="fixture"/>', root = 'tests="1" failures="0" skipped="0"', suite = "") => `<testsuites ${root}><testsuite ${suite}>${body}</testsuite></testsuites>`;
 const invalidXML: Record<string, string> = {
@@ -64,7 +67,7 @@ for (const key of ["tests", "failures", "errors", "skipped"]) {
 }
 const matrixReady = '{"phase":"prepare","state":"started"}\n{"phase":"prepare","state":"finished","exit":0}\n';
 const matrixModes: Record<string, { raw: string; exit: number }> = {
-  "matrix-success": { raw: matrixReady + Array.from({ length: 29 }, (_, i) => JSON.stringify({ phase: "case", id: i + 1, state: "started" }) + "\n" + JSON.stringify({ phase: "case", id: i + 1, state: "finished", exit: 0 }) + "\n").join(""), exit: 0 },
+  "matrix-success": { raw: matrixReady + Array.from({ length: matrixCases.length }, (_, i) => JSON.stringify({ phase: "case", id: i + 1, state: "started" }) + "\n" + JSON.stringify({ phase: "case", id: i + 1, state: "finished", exit: 0 }) + "\n").join(""), exit: 0 },
   "matrix-prepare": { raw: matrixReady.split("\n")[0]! + "\n", exit: 1 },
   "matrix-interrupted": { raw: matrixReady + '{"phase":"case","id":1,"state":"started"}\n', exit: 143 },
   "matrix-exit": { raw: matrixReady + '{"phase":"case","id":1,"state":"started"}\n{"phase":"case","id":1,"state":"finished","exit":7}\n', exit: 7 },
@@ -78,10 +81,11 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
   const root = mkdtempSync(join(tmpdir(), "gb-evidence-test-")); roots.push(root);
   const output = mode === "cross-filesystem" ? mkdtempSync("/dev/shm/gb-evidence-public-") : join(root, "public");
   if (mode === "cross-filesystem") { roots.push(output); expect(statSync(root).dev === statSync(output).dev).toBe(false); }
-  for (const dir of ["scripts", "src", "tests/e2e", "tests/integration", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "adapters/hosted-core", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
+  for (const dir of ["scripts", "src", "tests/e2e", "tests/integration", "tests/support", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "adapters/hosted-core", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
   for (const file of ["e2e.sh", "hosted-e2e.sh", "hosted-evidence.ts", "hosted-provenance.ts", "hosted-matrix.ts", "hosted-matrix-shell.ts"]) cpSync(join(checkout, "scripts", file), join(root, "scripts", file));
+  cpSync(join(checkout, ".bun-version"), join(root, ".bun-version")); // the Bun pin hosted-evidence.ts and hosted-e2e.sh read (#379)
   writeFileSync(join(root, "src/fixture.ts"), "export {};\n");
-  writeFileSync(join(root, "tests/e2e/opencode-config.ts"), "export {};\n");
+  for (const file of ["tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts"]) writeFileSync(join(root, file), "export {};\n");
   writeFileSync(join(root, "adapters/opencode-v2/package.json"), '{"name":"fixture","version":"1.0.0"}');
   writeFileSync(join(root, "adapters/hosted-core/package.json"), '{"name":"fixture-core","version":"1.0.0"}');
   writeFileSync(join(root, "tests/integration/hosted_core_sync.test.ts"), 'import { test } from "bun:test"; test("sync", () => {});\n');
@@ -140,7 +144,7 @@ esac
   git(...identity, "commit", "-qm", "fixture");
   expect(git("rev-parse", "--absolute-git-dir") === realpathSync(join(root, ".git"))).toBe(true);
   const result = Bun.spawnSync(["bash", "scripts/e2e.sh", matrixMode ? "hosted-matrix" : "hosted-strict"], { cwd: root, env: { ...inherited, PATH: join(root, "bin") + ":" + env.PATH, TMPDIR: join(root, "private"), GRAYBOARD_E2E_RUN_DIR: output, GITHUB_SHA: secrets[1]!, GITHUB_SERVER_URL: "https://ci.example.com", GITHUB_REPOSITORY: "example/fixture", GITHUB_RUN_ID: secrets[0]!, PROBE_ROOT: root, PROBE_MODE: mode } });
-  expect(metadata(join(parent, ".git"))).toBe(before);
+  expect(metadata(join(parent, ".git"))).toEqual(before);
   expect(existsSync(join(root, "fixture-hook-ran"))).toBe(false);
   const terminal = result.stdout.toString() + result.stderr.toString(), published = texts(output);
   expect(result.exitCode).toBe(success ? 0 : 1);
@@ -176,7 +180,7 @@ test("each hosted suite requires its complete actual installation inventory and 
   });
   const env = fixtureEnv(root), git = (...args: string[]) => fixtureGit(root, env, ...args);
   git("init", "-q"); git("add", "adapters"); git(...identity, "commit", "-qm", "fixture");
-  const base = { bun: "1.4.4", backend: [], drivers: [], installed: false, publicInstalled: false, installedChecks: [] as typeof checks, publicChecks: [] as typeof checks };
+  const base = { bun: BUN_VERSION, backend: [], drivers: [], installed: false, publicInstalled: false, installedChecks: [] as typeof checks, publicChecks: [] as typeof checks };
   expect(provenance(base, root, "strict").installedChecks).toEqual([]);
   expect(() => provenance({ ...base, installed: true, installedChecks: checks }, root, "strict")).toThrow();
   for (const suite of ["git", "config", "public", "host", "live", "matrix", "native", "durable"]) {
@@ -207,4 +211,24 @@ test("JUnit counts reject partial or inconsistent documents and read the failure
   expect(junitCounts(document('<testcase name="a"><failure/></testcase><testcase name="b"/>', 'tests="2" failures="1" skipped="0"'))).toEqual({ tests: 2, failures: 1, skipped: 0 });
   expect(() => junitCounts(" ".repeat(8 * 1024 * 1024) + document())).toThrow();
   expect(() => junitCounts(document('<testcase><system-out>\u0000</system-out></testcase>'))).toThrow();
+});
+
+test("the provenance script lists tracked files only, so an untracked file passes the allowlist (#378 2)", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "gb-provenance-tracked-"))); roots.push(root);
+  const tracked = ["src/main.ts", "src/moved.ts", "adapters/opencode-v2/package.json", "adapters/opencode-v2/index.js", "adapters/opencode-v2/tui.js", "adapters/opencode-v2/README.md", "adapters/opencode-v2/src/index.ts", "adapters/opencode-v2/tests/host.test.ts", "tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts"];
+  for (const path of tracked) { mkdirSync(join(root, path, ".."), { recursive: true }); writeFileSync(join(root, path), path); }
+  const env = fixtureEnv(root), git = (...args: string[]) => fixtureGit(root, env, ...args);
+  git("init", "-q"); git("add", "."); git(...identity, "commit", "-qm", "fixture");
+  // The shape that failed every hosted gate: a new uncommitted source file and editor or OS litter beside tracked ones.
+  rmSync(join(root, "src/moved.ts")); // an unstaged mv: tracked, gone from disk
+  for (const path of ["src/new.ts", "src/.DS_Store", "adapters/opencode-v2/src/scratch.ts", "adapters/opencode-v2/tests/.DS_Store"]) writeFileSync(join(root, path), "untracked");
+  const scratch = join(root, "scratch"), installed = join(root, "installed"), output = join(root, "provenance.json");
+  mkdirSync(scratch); cpSync(join(root, "adapters/opencode-v2"), installed, { recursive: true });
+  rmSync(join(installed, "src/scratch.ts")); writeFileSync(join(scratch, "installed.txt"), installed);
+  const run = Bun.spawnSync([process.execPath, join(checkout, "scripts/hosted-provenance.ts"), root, scratch, output], { env: repositoryGitEnv() });
+  expect(run.exitCode).toBe(0);
+  const value = JSON.parse(readFileSync(output, "utf8"));
+  expect(value.backend.map((e: { path: string }) => e.path)).toEqual(["src/main.ts"]);
+  expect(value.drivers.map((e: { path: string }) => e.path)).toEqual(["adapters/opencode-v2/tests/host.test.ts", "tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts"]);
+  expect(provenance(value, root, "git").mismatches).toEqual([]);
 });

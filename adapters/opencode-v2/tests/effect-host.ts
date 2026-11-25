@@ -45,6 +45,10 @@ export async function createFixtureHost(options: OpenCode.CreateOptions) {
       activate: (input: { credentialID: string }) => run(host.credential.activate({ credentialID: Credential.ID.make(input.credentialID) })),
       create: (input: Arg<Native["credential"]["create"]>) => run(host.credential.create(input)),
     },
+    permission: {
+      list: (input: SessionArg<Arg<Native["permission"]["list"]>>) => run(host.permission.list(session(input))),
+      reply: (input: SessionArg<Arg<Native["permission"]["reply"]>>) => run(host.permission.reply(session(input))),
+    },
     rpc(group: typeof Grayboard) {
       const rpc = host.rpc(group);
       return {

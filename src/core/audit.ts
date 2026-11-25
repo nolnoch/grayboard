@@ -1,20 +1,39 @@
 // Local mode's audit trail (the server's is src/server/audit.ts through the
 // Repo facade). The delegation slice writes the same actions both modes
-// write: delegation.requested, delegation.refused, handle.launcher_set;
+// write: delegation.requested, delegation.refused, delegation.throttled,
+// delegation.throttle_ended, handle.launcher_set;
 // message.retracted, which a repeated dm_retract is answered from (#254); and
 // id.collision, a session refused because its ID already has a row;
 // id.ended, a session ended (#284 decision 4), detailing what it held;
 // id.registered, a session's first rows, with how its liveness is kept;
 // id.detached and id.reattached, a keyed session's child exiting and a
 // restart under the same harness taking its place (#284 decision 3);
+// id.facts_changed, a session's model or effort replaced by a new owner's
+// (a keyed re-attach here, #365; a hosted ownership or request, #364);
 // id.reused, a session key re-presented after retention pruned its ended
-// session's row (#284 S10); and
-// alias.created, a name's first bind or declaration (#284).
+// session's row (#284 S10);
+// alias.created, a name's first bind or declaration (#284);
+// id.signed_in_local, a local session started on a machine signed in to a
+// server, with whether its entry chose local mode (#491); and
+// id.child_fallback and id.promoted, a runner child (#523 step 5) running
+// as its own session for want of a live root, and binding a name;
+// alias.case_moved and alias.case_collision, a 1.x mixed-case handle moved
+// (or merged) into its lowercase name at open, or left where a merge would
+// change who the name is (#216); and alias.displaced, an adapter's child
+// taking its name from a sibling grayboard under the same harness (#1381).
 // Rows land in the shared audit_log table (core/schema.ts) and are pruned
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.reattached" | "id.registered" | "id.reused" | "message.retracted";
+export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "delegation.throttled" | "delegation.throttle_ended" | "handle.launcher_set" | "id.child_fallback" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.facts_changed" | "id.promoted" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
+
+/**
+ * Local mode's own actions beside the shared ones: Claude Code subagent
+ * attribution (#551), a call refused for a missing hook record and a session
+ * whose settings predate the hook. The hosted plugin refuses a missing record
+ * itself, so the server never sees either.
+ */
+export type LocalAuditAction = CoreAuditAction | "alias.case_collision" | "alias.case_moved" | "alias.displaced" | "claude.agent_record_missing" | "claude.attribution_off" | "id.conversation_selected";
 
 /**
  * Where a core function shared by both modes writes its audit row: local
@@ -28,7 +47,7 @@ export const coreAuditSink = (db: Database): AuditSink => (action, actor, target
 
 export function writeCoreAudit(
   db: Database,
-  action: CoreAuditAction,
+  action: LocalAuditAction,
   actor: string,
   target: string | null,
   detail?: Record<string, unknown>,
@@ -43,12 +62,14 @@ export function writeCoreAudit(
 }
 
 // The newest row for this action and target, or undefined.
+// The newest row for (action, target), searched by idx_audit_log_action_target (#295).
+export const AUDIT_LOG_LAST_SQL = `SELECT at, actor, detail FROM audit_log WHERE action = ? AND target = ? ORDER BY at DESC, rowid DESC LIMIT 1`;
 export function lastCoreAudit(
   db: Database,
   action: CoreAuditAction,
   target: string,
 ): { at: number; actor: string | null; detail: string | null } | undefined {
   return (db
-    .prepare(`SELECT at, actor, detail FROM audit_log WHERE action = ? AND target = ? ORDER BY at DESC, rowid DESC LIMIT 1`)
+    .prepare(AUDIT_LOG_LAST_SQL)
     .get(action, target) as { at: number; actor: string | null; detail: string | null } | null) ?? undefined;
 }

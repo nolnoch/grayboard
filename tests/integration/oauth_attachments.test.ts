@@ -12,6 +12,9 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
+import { scratchDbPath } from "../support/scratch_db.ts";
+import { seed } from "../support/seed.ts";
+import { NO_MEMBER_AUTHORITY } from "../../src/server/store/identity.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string;
@@ -21,7 +24,7 @@ const publicUrl = "https://grayboard.example.com:443/hosted";
 const bytes = new TextEncoder().encode("private report\n");
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-http-oauth-attachments-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
+  app = startServer({ store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
@@ -34,7 +37,7 @@ async function connect(token: string, version: string) {
   const client = new Client({ name: "attachment-test", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/hosted/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } },
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
     fetch: async (input, init) => fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, "attachment-root")),
   }));
   await bindFixture(client, "be");
@@ -50,9 +53,9 @@ async function attachment(token: string, method = "POST", id?: number, alias = f
 }
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant uploads, MCP binds, participant downloads, own unsent releases`, async () => {
-  const alice = issue(), bob = issue("bob@example.com"), outsider = issue("outsider@example.com");
+  const alice = await issue(), bob = await issue("bob@example.com"), outsider = await issue("outsider@example.com");
   const [a, b] = await Promise.all([connect(alice.token, version), connect(bob.token, version)]);
-  app.repo.aliases.create({ scope_kind: "person", scope_ref: outsider.authed.user_email, name: "be" }, outsider.authed.user_email);
+  await seed(app.repo, tx => app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: outsider.authed.user_email, name: "be" }, outsider.authed.user_email));
   expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
   await connect(outsider.token, version);
   const info = value(await a.callTool({ name: "whoami", arguments: {} }));
@@ -87,15 +90,18 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant up
 });
 
 test("private board visibility is checked again after reading the blob", async () => {
-  const alice = issue(), bob = issue("bob@example.com");
+  const alice = await issue(), bob = await issue("bob@example.com");
   const [a, b] = await Promise.all([connect(alice.token, "2026-07-28"), connect(bob.token, "2026-07-28")]);
-  const team = app.repo.teams.create("private", alice.authed.user_id);
-  app.repo.teams.addMember(team.id, alice.authed.user_id);
-  app.repo.teams.addMember(team.id, bob.authed.user_id);
   const { ensureTeamBoard, onTeamJoined, onTeamLeft } = await import("../../src/server/teams.ts");
-  ensureTeamBoard(app.db, team, "alice@example.com");
-  onTeamJoined(app.db, app.repo, team, alice.authed.user_id, "alice@example.com");
-  onTeamJoined(app.db, app.repo, team, bob.authed.user_id, "bob@example.com");
+  const team = await seed(app.repo, async (tx) => {
+    const team = await app.repo.teams.create(tx, "private", alice.authed.user_id);
+    await app.repo.teams.addMember(tx, team.id, alice.authed.user_id, NO_MEMBER_AUTHORITY);
+    await app.repo.teams.addMember(tx, team.id, bob.authed.user_id, NO_MEMBER_AUTHORITY);
+    await ensureTeamBoard(app.repo, tx, team, "alice@example.com");
+    await onTeamJoined(app.repo, tx, team, "alice@example.com");
+    await onTeamJoined(app.repo, tx, team, "bob@example.com");
+    return team;
+  });
   const id = (await (await attachment(alice.token)).json() as { id: number }).id;
   expect((await a.callTool({ name: "board_post", arguments: { board: "private", body: "team file", attachment_ids: [id] } })).isError).not.toBe(true);
   expect((await b.readResource({ uri: "grayboard://boards/private" })).contents.length).toBe(1);
@@ -105,8 +111,11 @@ test("private board visibility is checked again after reading the blob", async (
   app.repo.blobs.get = async hash => { const data = await get(hash); enter(); await resumed; return data; };
   const reading = attachment(bob.token, "GET", id);
   await Promise.race([entered, reading.then(response => { throw new Error(`blob read was bypassed: ${response.status}`); })]);
-  app.repo.teams.removeMember(team.id, bob.authed.user_id);
-  onTeamLeft(app.db, app.repo, team, bob.authed.user_id, "bob@example.com");
+  // The download holds no write: its blob read waits outside the queue, so this body runs now.
+  await seed(app.repo, async (tx) => {
+    await app.repo.teams.removeMember(tx, team.id, bob.authed.user_id, NO_MEMBER_AUTHORITY);
+    await onTeamLeft(app.repo, tx, team, "bob@example.com");
+  });
   resume();
   const response = await reading;
   expect(response.status).toBe(404);
@@ -114,21 +123,17 @@ test("private board visibility is checked again after reading the blob", async (
 });
 
 test("old API remains session-only and OAuth cannot become admin or WS credentials", async () => {
-  const alice = issue();
-  app.repo.aliases.create({ scope_kind: "person", scope_ref: alice.authed.user_email, name: "be" }, alice.authed.user_email);
+  const alice = await issue();
   const login = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const legacy = (await login.json() as { session_token: string }).session_token;
-  const oldUpload = await fetch(`${base}/api/attachments?as=be&filename=report.txt`, { method: "POST", headers: { Authorization: `Bearer ${legacy}`, "Content-Length": String(bytes.length) }, body: bytes });
-  expect(oldUpload.status).toBe(201);
-  const id = (await oldUpload.json() as { id: number }).id;
-  expect((await fetch(`${base}/api/attachments/${id}?as=be`, { headers: { Authorization: `Bearer ${legacy}` } })).status).toBe(200);
-  expect((await attachment(legacy, "GET", id)).status).toBe(401);
-  for (const path of ["/api/attachments/1?as=be", "/api/identities", "/api/admin/users", "/api/teams"]) {
+  expect((await attachment(legacy)).status).toBe(401);
+  expect((await attachment(legacy, "GET", 1)).status).toBe(401);
+  for (const path of ["/api/identities", "/api/admin/users", "/api/teams"]) {
     const response = await fetch(`${base}${path}`, { headers: { Authorization: `Bearer ${alice.token}` } });
     expect(response.status).toBe(401);
     await response.arrayBuffer();
   }
-  expect((await attachment(issue("alice@example.com", ["grayboard:delivery"]).token)).status).toBe(403);
+  expect((await attachment((await issue("alice@example.com", ["grayboard:delivery"])).token)).status).toBe(403);
   await connect(alice.token, "2026-07-28");
-  expect((await attachment(issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"]).token)).status).toBe(201);
+  expect((await attachment((await issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"])).token)).status).toBe(201);
 });

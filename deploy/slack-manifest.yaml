@@ -1,6 +1,6 @@
 # Slack app manifest for `grayboard bridge slack`.
 # api.slack.com/apps → Create New App → From a manifest → paste this (YAML tab).
-# Setup steps: https://github.com/nolnoch/grayboard#slack-bridge-setup
+# Setup steps: https://github.com/nolnoch/grayboard/blob/master/docs/guide/slack.md#slack-bridge-setup
 display_information:
   name: grayboard
 features:

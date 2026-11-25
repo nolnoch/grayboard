@@ -10,6 +10,8 @@ import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
+import { stubProvider } from "../support/stub_provider.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -20,17 +22,17 @@ let exchanges = 0;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-oauth-server-"));
   exchanges = 0;
-  app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0,
+  app = startServer({ store: { kind: "sqlite" as const, path: join(dir, "db.sqlite") }, blobDir: join(dir, "blobs"), httpPort: 0,
     googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     oauthClients: [{ clientId: OPENCODE_CLIENT, name: "Native fixture", redirectUris: [redirectUrl], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", allowRefresh: true }],
-  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async input => {
+  }, { hostname: "127.0.0.1", background: false, oauth: { providers: [stubProvider(async input => {
     exchanges++;
     expect(input.redirectUri).toBe(issuer + "/oauth/google/callback");
     expect(input.verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(input.nonce.length).toBeGreaterThan(30);
-    return { email: "alice@example.com", displayName: "Alice" };
-  } } });
+    return { email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" };
+  })] } });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
@@ -67,22 +69,12 @@ class Provider implements OAuthClientProvider {
   saveDiscoveryState(discovery: OAuthDiscoveryState) { this.discovery = discovery; }
   discoveryState() { return this.discovery; }
 }
-class Browser {
-  cookies = new Map<string, string>();
-  async request(url: string, init: RequestInit = {}) {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(mapped(url), { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) {
-      const [key, value] = cookie.split(";")[0]!.split("=");
-      this.cookies.set(key!, value!);
-      expect(cookie).toContain("HttpOnly");
-      expect(cookie).toContain("Secure");
-      expect(cookie).toContain("Path=/hosted/oauth");
-    }
-    return res;
-  }
-}
+// Every cookie the OAuth pages set is HttpOnly, Secure and scoped to them.
+const checkCookie = (raw: string) => {
+  expect(raw).toContain("HttpOnly");
+  expect(raw).toContain("Secure");
+  expect(raw).toContain("Path=/hosted/oauth");
+};
 
 test("AS metadata is mounted on the single production listener with canonical resource and exact issuer", async () => {
   const challenge = await fetch(base + "/hosted/mcp", { headers: { "X-Forwarded-Host": "evil.example.com", "X-Real-IP": "192.0.2.1" } });
@@ -95,8 +87,10 @@ test("AS metadata is mounted on the single production listener with canonical re
   }
   const metadata = await fetch(base + "/.well-known/oauth-authorization-server/hosted");
   expect(await metadata.json()).toMatchObject({ issuer, authorization_endpoint: issuer + "/oauth/authorize", token_endpoint: issuer + "/oauth/token" });
-  const old = await fetch(base + "/api/auth/config");
-  expect(old.status).toBe(200);
+  // The CLI's own Google routes are gone (#928 D8): it signs in through the AS above, and an unauthenticated
+  // request to either old path now meets the API's token check (401) instead of a sign-in route.
+  expect((await fetch(base + "/api/auth/config")).status).toBe(401);
+  expect((await fetch(base + "/api/auth/exchange", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).toBe(401);
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth code/S256/state/iss and tools through production app`, async () => {
@@ -106,7 +100,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth co
   expect(provider.authorization!.searchParams.get("code_challenge_method")).toBe("S256");
   expect(provider.authorization!.searchParams.get("state")).toBe(provider.stateValue);
   expect(provider.authorization!.searchParams.get("scope")).toBe("grayboard:delivery grayboard:tools");
-  const browser = new Browser();
+  const browser = new Browser({ rewrite: mapped, onSetCookie: checkCookie });
   const begin = await browser.request(provider.authorization!.href);
   expect(begin.status).toBe(303);
   const google = new URL(begin.headers.get("Location")!);
@@ -117,9 +111,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth co
   expect(page.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
   expect(page.headers.get("Cache-Control")).toContain("no-store");
   const html = await page.text();
-  const request = /name="request" value="([^"]+)"/.exec(html)![1]!;
-  const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1]!;
-  const approved = await browser.request(issuer + "/oauth/consent", { method: "POST", headers: { Origin: "https://grayboard.example.com" }, body: new URLSearchParams({ request, csrf, decision: "approve" }) });
+  const approved = await submitConsent(browser, issuer + "/oauth/consent", consentForm(html), "approve", "https://grayboard.example.com");
   expect(approved.status).toBe(303);
   const returned = new URL(approved.headers.get("Location")!);
   expect(returned.searchParams.get("state")).toBe(provider.stateValue);

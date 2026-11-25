@@ -21,15 +21,21 @@ const SQLITE_BUSY = 5;
 // like any other process instead of opening its own connection.
 const held = new Set<string>();
 
-export function tryAcquire(path: string): Lock | undefined {
+// `busyMs` is how long the attempt waits, synchronously, on a lock someone
+// holds. A one-shot attempt keeps the default, not 0: two openers racing
+// BEGIN EXCLUSIVE both take SHARED, and with no busy wait the one holding
+// PENDING gives up too, so both report BUSY and neither holds the lock; a
+// short wait lets the loser drop SHARED first. A poll passes 0: the wait
+// blocks the event loop for all of `busyMs` whenever a live holder has the
+// lock, which a poll finds on nearly every try (#438-36), and a race lost at
+// 0 only costs one interval: a 0 attempt never makes a waiting one fail
+// too, since it either wins or drops its locks at once.
+export function tryAcquire(path: string, busyMs = 50): Lock | undefined {
   const file = resolve(path);
   if (held.has(file)) return undefined;
   const db = new DatabaseSync(file);
   try {
-    // Not 0: two openers racing BEGIN EXCLUSIVE both take SHARED, and with no
-    // busy wait the one holding PENDING gives up too, so both report BUSY and
-    // neither holds the lock. A short wait lets the loser drop SHARED first.
-    db.exec("PRAGMA busy_timeout=50");
+    db.exec(`PRAGMA busy_timeout=${Math.max(0, Math.trunc(busyMs))}`);
     db.exec("BEGIN EXCLUSIVE");
   } catch (error) {
     db.close();
@@ -48,16 +54,21 @@ export function tryAcquire(path: string): Lock | undefined {
   };
 }
 
-// Polls tryAcquire every 100 ms until `deadlineMs` passes (LockTimeout) or
-// `signal` aborts.
-export async function acquire(path: string, options: { deadlineMs: number; signal?: AbortSignal }): Promise<Lock> {
-  const deadline = Date.now() + options.deadlineMs;
+// Polls tryAcquire (with no busy wait) every 100-110 ms until `deadlineMs`
+// passes (LockTimeout) or `signal` aborts. `onBusy` runs after each attempt that found the lock held,
+// so it sees only what a live holder left; what it throws ends the wait.
+export async function acquire(path: string, options: { deadlineMs: number; signal?: AbortSignal; onBusy?: () => void | Promise<void> }): Promise<Lock> {
+  // Monotonic: Date.now() counts whole ms (a deadline up to 1 ms early) and
+  // moves with the wall clock.
+  const deadline = performance.now() + options.deadlineMs;
   for (;;) {
     options.signal?.throwIfAborted();
-    const lock = tryAcquire(path);
+    const lock = tryAcquire(path, 0);
     if (lock) return lock;
-    const left = deadline - Date.now();
+    await options.onBusy?.();
+    const left = deadline - performance.now();
     if (left <= 0) throw new LockTimeout(resolve(path));
-    await sleep(Math.min(100, left), undefined, options.signal ? { signal: options.signal } : undefined);
+    // Jittered, so two pollers whose timers line up stop colliding.
+    await sleep(Math.min(100 + Math.random() * 10, left), undefined, options.signal ? { signal: options.signal } : undefined);
   }
 }

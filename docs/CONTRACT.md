@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: how docs in this repo are written, owned, and kept fresh
-invariants: one concept, one owner doc; no hand-maintained counts or catalogs; agent-only register except README.md; docs-baseline tag marks the last reconcile; meta/ is private and never cited
+invariants: one concept, one owner doc; no hand-maintained counts or catalogs; agent-only register except the human docs (README.md, docs/guide/, CONTRIBUTING.md, docs/site/); docs-baseline tag marks the last reconcile; meta/ is private and never cited
 code-pointers: scripts/docs_gate.sh, scripts/hooks/pre-push, scripts/advance_docs_baseline.sh, .claude/commands/reconcile-docs.md
 companions: ../AGENTS.md (tier 1)
 ```
@@ -11,8 +11,13 @@ Read before authoring or editing any doc. Where a doc and this file disagree, th
 
 ## 1. Readers
 
-- **Every doc except `README.md`: agents only.** The reader greps headings, reads one section, and acts. It recovers structure (files, signatures, counts, routes, flags) from code faster and fresher than a doc holds it. It can't recover from code the *why*, the invariant that must hold, or the thing that looks safe but isn't. Docs carry ~80% why/invariants/gotchas, ~20% what.
-- **`README.md`: humans.** The GitHub landing page: what grayboard is, install, setup, operations. Human register (explanation, examples, troubleshooting) is correct there. Freshness rules (§5) still apply. It links to `docs/` for design and doesn't restate it.
+- **Every doc except the human docs: agents only.** The reader greps headings, reads one section, and acts. It recovers structure (files, signatures, counts, routes, flags) from code faster and fresher than a doc holds it. It can't recover from code the *why*, the invariant that must hold, or the thing that looks safe but isn't. Docs carry ~80% why/invariants/gotchas, ~20% what.
+- **Human docs: `README.md`, `docs/guide/`, `CONTRIBUTING.md`, `docs/site/`.** Human register (explanation, examples, troubleshooting) is correct there, and freshness rules (§5) still apply. They link to the agent docs for design and don't restate it.
+  - `README.md` is the GitHub landing page for someone deciding whether to use grayboard: the pitch, the feature list, a quick start a newcomer can finish, and links into `docs/guide/`. It holds no behavior detail: an edge case, flag, env var or per-harness rule goes in the guide page that owns it, and the README links there. A reconcile that finds README drift fixes the feature list or quick start, or moves the detail to its guide page.
+  - The feature list is plain-language capabilities, not a harness × mode table; `docs/parity.md` owns per-cell status.
+  - `docs/guide/<page>.md` is the operating manual, one page per audience or task (local use, other harnesses, joining a team server, running one, Slack, reference, troubleshooting).
+  - `docs/site/index.html` is the README's one-page marketing version, served by GitHub Pages beside other human pages that each explain one mechanism (`sessions.html`); `docs/site/README.md` holds their upkeep rules (claims from the repo, generated theme, a version test that makes a minor release revisit them).
+  - `CONTRIBUTING.md` is for contributors: workflow, the parity rule as it applies to a PR, building and testing.
 - **A stale doc is worse than none.** An agent acts on a stale line confidently. Fewer, smaller, easy-to-refresh docs beat complete ones. When in doubt, cut.
 
 ## 2. Tiers
@@ -50,26 +55,59 @@ flowchart TD
 |---|---|
 | Commands, gotchas, release runbook, repo rules, hooks | `AGENTS.md` |
 | How docs work | `docs/CONTRACT.md` |
-| Process model, mode selection; the distributed server: auth and sessions, application sessions and operations, HTTP access rules, server access policy, build and deploy | `docs/architecture.md` |
-| The shared core: boards, posts, subscriptions, attention and delivery policy, mentions, claims, handles and identity uniqueness, presence; local-mode wakeup; harness adapters and push ownership; delegation (launchers, delegate); tool-surface rules; refused features | `docs/boards.md` |
-| The Slack bridges (local and org) and human handles | `docs/slack-bridge.md` |
+| What grayboard is for, who it serves, the principles that decide features | `docs/vision.md` |
+| Process model, mode selection; the server's data, auth layers and tokens, Postgres seam | `docs/architecture.md` |
+| The server's embedded OAuth authorization server, client sources, built-in clients, CLI login | `docs/server-oauth.md` |
+| The server's HTTP MCP endpoint: session binding, streams, legacy sessions, hosted core's server contract, plugin children, attachment transfer | `docs/server-hosted-mcp.md` |
+| The as-built Rust client SDK: transport, wire fixture, delivery stream and its rules, typed tools, the Stage 3 example, the conformance driver, its credentials | `docs/sdk-rust.md` |
+| Hosted admission, ownership history, grant attachment, the BindGate | `docs/server-hosted-ownership.md` |
+| The server's application sessions: request context, bind, the server's binding-event sources, address set, revalidation | `docs/server-sessions.md` |
+| The server's operations: delegation, DM send, write dedup, `call` | `docs/server-operations.md` |
+| The server's access policy: authorization seam, role bindings and admin, teams, attachment uploads and reads, retained HTTP routes | `docs/server-access.md` |
+| Ending access: logout, per-grant list and revoke, what revoke and disable end, the IdP re-auth clock | `docs/server-offboarding.md` |
+| The server's service principals: the principal's rows and admin routes, credentials' admin side, service boards' access and `service.invoke` | `docs/server-services.md` |
+| The read-only admin dashboard: the `/admin` page, its `grayboard-admin` sign-in, its read routes, their audit and cost | `docs/server-admin-dashboard.md` |
+| The server's rate limits: binds, authentication failures, the refused-token memo | `docs/server-rate-limits.md` |
+| Build, verified install, deploy files, metrics, backups, plugin distribution | `docs/server-deploy.md` |
+| The shared core's board side: boards, posts, subscriptions, attention and delivery policy, mentions, queue boards; local-mode wakeup; tool-surface rules; refused features | `docs/boards.md` |
+| Handles: names, binding, acting addresses, identity suggestion, presence | `docs/handles.md` |
+| Session lifecycle: acquisition, session end, keyed sessions, binding events, titles | `docs/sessions.md` |
+| Child sessions (subagent calls under a root) | `docs/child-sessions.md` |
+| Claims | `docs/claims.md` |
+| DMs and recovery | `docs/dms.md` |
+| Attachments (both modes) | `docs/attachments.md` |
+| Delegation: launchers, `delegate` | `docs/delegation.md` |
+| Local-mode harness adapters and push ownership | `docs/adapters.md` |
+| Server-mode harness adapters (hosted core and its harnesses) | `docs/adapters-hosted.md` |
+| A hosted adapter's sign-in, grant store, refresh and the lock rule | `docs/adapters-hosted-login.md` |
+| The local Slack bridge, the routing and threading both bridges share, human handles | `docs/slack-bridge.md` |
+| The org Slack bridge inside the server: `<email>/human`, linking, reach, death notices | `docs/slack-org-bridge.md` |
+| Capability parity across harnesses and modes: the parity matrix, its gap cells, the maintaining-parity rule | `docs/parity.md` |
+| Parity proof and reasons, rows 1–8 (tools, delivery, names, child sessions) | `docs/parity-delivery.md` |
+| Parity proof and reasons, rows 9–16 (sign-in, attachments, humans, setup, update) | `docs/parity-access.md` |
+| The opt-in factory module (orchestration outside the core): boundary, authority, store, asking, limits | `docs/factory.md` |
+| Factory children: spawning, working directories, thread commands, relayed bus tools, tree claims | `docs/factory-children.md` |
+| Factory fleets and projects: fan-out, rounds, reload | `docs/factory-fleets.md` |
 | Unbuilt designs, parked until a trigger | `docs/future/<name>.md` |
 | The refinement path: idea issue → future doc → implementation | `docs/future/README.md` |
-| What grayboard is, install, setup, operating a server (human) | `README.md` |
+| What grayboard is, its features, the quick start (human) | `README.md` |
+| Install, setup, use, operating a server, troubleshooting (human) | `docs/guide/<page>.md` |
+| The one-page overview and its upkeep rules (human) | `docs/site/` |
+| Contributor workflow, build and test (human) | `CONTRIBUTING.md` |
 | Open bugs and feature requests | GitHub issues |
 
-Placement: server-only mechanics → `architecture.md`; anything both modes share → `boards.md`; human steps → `README.md`.
+Placement: server-only mechanics → `architecture.md` or the `server-*.md` file that owns the concept; anything both modes share → `boards.md` or the core file that owns it; human steps → the owning `docs/guide/` page. A Tier-2 file stays at or under 25 KB: one that grows past it splits by concept, with a row here per new file.
 
 `docs/future/` holds a design for something not built, so the work starts from decisions. Its `doc-meta` adds `trigger:` (what event justifies building it) and `last-verified:` (date its assumptions about the code were checked). When the thing is built, its as-built facts move to the owner doc and the future doc is deleted.
 
 ## 5. Maintenance
 
 - **Rules are a point of governance.** grayboard is inherently distributed, so governance cannot live isolated on one machine — a rule that exists only in a session, a local memory file, or a conversation does not exist for the next checkout. Rules live in the repo (this file, AGENTS.md, the owner docs) or they don't exist; local copies are caches, not the record.
-- **One fact, one place, across tiers.** A fact lives in exactly one of: code (derivable, so undocumented), `AGENTS.md`, a Tier-2 doc, `README.md` (human steps), or a GitHub issue. Pick the most specific owner and link from the rest.
+- **One fact, one place, across tiers.** A fact lives in exactly one of: code (derivable, so undocumented), `AGENTS.md`, a Tier-2 doc, a human doc (README.md, `docs/guide/`, CONTRIBUTING.md), or a GitHub issue. Pick the most specific owner and link from the rest.
 - **The baseline tag drives refresh.** `docs-baseline` (a local tag) marks the last commit where docs matched code. The push gate (`scripts/docs_gate.sh`) refuses pushes that change non-doc files since `docs-baseline...<sha>`. A reconcile (`.claude/commands/reconcile-docs.md`) reviews that range, updates only drifted concepts, commits, then advances the tag with `scripts/advance_docs_baseline.sh` (commit-then-tag). A reviewed range with no doc-relevant drift still advances the tag, so bug-fix ranges don't trip the gate forever.
 - **Update only what drifted.** A reconcile edits stale sections; it doesn't rewrite accurate ones.
 - **Delete on change.** When code removes a thing, the same change or the next reconcile removes its documentation. A change that adds a feature's docs without removing the superseded feature's docs is incomplete.
-- **README is in scope.** A reconcile checks README.md for drift too (install steps, flags, behavior it describes), in its own register.
+- **Human docs are in scope.** A reconcile checks README.md, `docs/guide/`, the one-pager (`docs/site/`) and CONTRIBUTING.md for drift too (install steps, flags, behavior they describe), in their own register.
 
 ## 6. Conventions
 
@@ -86,4 +124,4 @@ Placement: server-only mechanics → `architecture.md`; anything both modes shar
   ```
   ````
 
-  If a doc can't name the one concept it owns, it shouldn't be its own file.
+  If a doc can't name the one concept it owns, it shouldn't be its own file. Human docs (README.md, `docs/guide/`, `docs/site/`, CONTRIBUTING.md) carry no `doc-meta`.

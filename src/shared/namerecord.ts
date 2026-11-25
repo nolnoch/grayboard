@@ -3,7 +3,8 @@
 // names change (every name it holds, oldest first; none while unbound). A
 // grayboard mcp restarted under the same harness process (`/mcp` reconnect, a
 // crash) finds it and takes the names back, so a session that bound names
-// mid-task doesn't come back unbound. A record whose harness has exited, or whose pid now belongs
+// mid-task doesn't come back unbound. A subagent process (BUS_PARENT_SESSION)
+// keeps none, even once promoted or fallen back, and restarts unbound (#1078). A record whose harness has exited, or whose pid now belongs
 // to another process, is stale: it's deleted, never honoured.
 //
 // The file is writable by any process running as the user, the same trust
@@ -39,9 +40,11 @@ export function recordPath(dir: string, harnessPid: number): string {
  * Record this session's name for its harness. Written to a temp file and
  * renamed, so a reader never sees half a record. Null if the harness's start
  * time can't be read (the record could never be checked, so none is written).
+ * `harnessStart`: that start time, read by a caller that writes under a lock
+ * and reads the process table before taking it.
  */
-export function writeRecord(dir: string, r: Omit<NameRecord, "harness_start" | "at">, now = Date.now()): NameRecord | null {
-  const harness_start = procStart(r.harness_pid);
+export function writeRecord(dir: string, r: Omit<NameRecord, "harness_start" | "at">, harnessStart: string | null | undefined = procStart(r.harness_pid), now = Date.now()): NameRecord | null {
+  const harness_start = harnessStart;
   if (!harness_start) {
     console.error(`[grayboard] can't read harness pid ${r.harness_pid}'s start time; no name record written, so a restart comes back unbound`);
     return null;
@@ -75,8 +78,9 @@ function parse(text: string): NameRecord | null {
  * The record for `harnessPid` on `bus`, if its harness is still the process
  * that wrote it. A stale or unreadable record is deleted; one for another bus,
  * or one whose harness start time can't be read now, is kept and ignored.
+ * `prune:false` is a read-only lookup (the transcript-title hook must not reap records).
  */
-export function freshRecord(dir: string, harnessPid: number, bus: string): NameRecord | null {
+export function freshRecord(dir: string, harnessPid: number, bus: string, o: { prune?: boolean } = {}): NameRecord | null {
   const path = recordPath(dir, harnessPid);
   let text: string;
   try {
@@ -88,7 +92,7 @@ export function freshRecord(dir: string, harnessPid: number, bus: string): NameR
   const start = procStart(harnessPid);
   if (start === null) return null;
   if (!r || r.harness_pid !== harnessPid || start !== r.harness_start) {
-    rm(path);
+    if (o.prune !== false) rm(path);
     return null;
   }
   return r.bus === bus ? { ...r, session_id: asSessionId(r.session_id) } : null;

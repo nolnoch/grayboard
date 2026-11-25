@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, constants, fchmodSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants, fchmodSync, lstatSync, openSync, readdirSync, renameSync, rmSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { LOOPBACK } from "../shared/endpoint.ts";
 import { sha256Hex } from "../shared/hash.ts";
+import { cappedBody } from "../shared/capped_body.ts";
 import { HTTP_TIMEOUT_MS, describeFetchError, transferTimeoutMs } from "../shared/http.ts";
 import { RELEASE_TAG, SIG, SUMS, verifySums } from "../shared/release_verify.ts";
 
@@ -10,8 +12,6 @@ export const REPO = process.env.GRAYBOARD_REPO || "nolnoch/grayboard";
 export const TARGET = `${process.platform}-${process.arch}`;
 // How long the downloaded binary gets to answer --version before it is refused.
 const VERSION_CHECK_MS = 30_000;
-
-const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 // GRAYBOARD_RELEASES_URL: one origin serving GitHub's paths for both its API
 // and its downloads (a mirror, or the upgrade tests' release server), without
@@ -34,29 +34,44 @@ export function releasesOrigin(raw = process.env.GRAYBOARD_RELEASES_URL): string
   return origin;
 }
 
+// What a release origin may send, so a broken or hostile one is refused by
+// name instead of exhausting memory (#316). The binary's own bound is the
+// API's size for it, which may itself be at most MAX_BINARY.
+export const MAX_API = 4 * 1024 * 1024;
+export const MAX_SUMS = 64 * 1024;
+export const MAX_BINARY = 512 * 1024 * 1024;
+
 // A fetch and its body, under one deadline, whose failure names the URL, so a
-// stale or wrong origin, or a stalled one, shows.
-async function get(url: string, what: string, ms: number, init?: RequestInit): Promise<Uint8Array<ArrayBuffer>> {
-  let status: number;
+// stale or wrong origin, or a stalled one, shows. A body over `max` bytes is
+// refused, by its Content-Length when it states one, else as it streams.
+export async function get(url: string, what: string, ms: number, max: number, init?: RequestInit): Promise<Uint8Array<ArrayBuffer>> {
+  let got: { status: number } | { body: Uint8Array<ArrayBuffer> | null };
   try {
     const res = await fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
-    if (res.ok) return new Uint8Array(await res.arrayBuffer());
-    status = res.status;
+    got = res.ok ? { body: await cappedBody(res, max) } : { status: res.status };
   } catch (e) {
     throw new Error(`couldn't fetch ${what} from ${url}: ${describeFetchError(e, ms)}`);
   }
-  throw new Error(`couldn't fetch ${what} from ${url} (HTTP ${status})`);
+  if ("status" in got) throw new Error(`couldn't fetch ${what} from ${url} (HTTP ${got.status})`);
+  if (got.body === null) throw new Error(`${what} from ${url} is larger than ${max} bytes; not updating`);
+  return got.body;
+}
+
+/** A release version, `X.Y.Z[-pre]` with an optional leading `v`: a release tag or a `package.json` version. */
+export const VERSION = /^v?\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/;
+
+/**
+ * Semver order of versions `a` and `b` (negative, zero, positive), so a
+ * pre-release sorts before its release ("2.3.1-rc1" < "2.3.1"). Throws on
+ * anything that isn't a {@link VERSION}, naming it.
+ */
+export function versionOrder(a: string, b: string): number {
+  for (const v of [a, b]) if (!VERSION.test(v)) throw new Error(`${JSON.stringify(v)} isn't a release version`);
+  return Bun.semver.order(a.replace(/^v/, ""), b.replace(/^v/, ""));
 }
 
 /** True if version `a` is newer than `b` ("v1.2.0" vs "1.10.0" compares numerically). */
-export function newer(a: string, b: string): boolean {
-  const parts = (v: string) => v.replace(/^v/, "").split(/[.-]/).map((p) => Number.parseInt(p, 10) || 0);
-  const [x, y] = [parts(a), parts(b)];
-  for (let i = 0; i < Math.max(x.length, y.length); i++) {
-    if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
-  }
-  return false;
-}
+export const newer = (a: string, b: string): boolean => versionOrder(a, b) > 0;
 
 // What selfUpdate did: nothing (already current), or installed `tag`, whose
 // SHA256SUMS key `keyId` signed. `origin` is where the release came from.
@@ -80,7 +95,7 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
   const mirror = releasesOrigin();
   const api = mirror ?? "https://api.github.com";
   const downloads = mirror ?? "https://github.com";
-  const res = await get(`${api}/repos/${REPO}/releases/latest`, "the latest release", HTTP_TIMEOUT_MS, {
+  const res = await get(`${api}/repos/${REPO}/releases/latest`, "the latest release", HTTP_TIMEOUT_MS, MAX_API, {
     headers: { accept: "application/vnd.github+json" },
   });
   const release = JSON.parse(new TextDecoder().decode(res)) as {
@@ -99,8 +114,8 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
   try {
     // A release without either file is refused like a bad signature.
     const [sums, sig] = await Promise.all([
-      get(`${base}/${SUMS}`, `the ${tag} ${SUMS}`, HTTP_TIMEOUT_MS),
-      get(`${base}/${SIG}`, `the ${tag} ${SIG}`, HTTP_TIMEOUT_MS),
+      get(`${base}/${SUMS}`, `the ${tag} ${SUMS}`, HTTP_TIMEOUT_MS, MAX_SUMS),
+      get(`${base}/${SIG}`, `the ${tag} ${SIG}`, HTTP_TIMEOUT_MS, MAX_SUMS),
     ]);
     signed = await verifySums(tag, sums, new TextDecoder().decode(sig));
   } catch (e) {
@@ -112,7 +127,8 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
   if (!listed) throw new Error(`the ${tag} ${SUMS} lists no ${asset}; not updating`);
   const meta = release.assets?.find((a) => a.name === asset);
   if (typeof meta?.size !== "number") throw new Error(`the release API lists no size for ${asset}; not updating`);
-  const body = await get(`${base}/${asset}`, `the ${tag} binary for ${TARGET}`, transferTimeoutMs(meta.size));
+  if (meta.size > MAX_BINARY) throw new Error(`the release API lists ${asset} at ${meta.size} bytes, over ${MAX_BINARY}; not updating`);
+  const body = await get(`${base}/${asset}`, `the ${tag} binary for ${TARGET}`, transferTimeoutMs(meta.size), meta.size);
 
   // Verified before it's ever written, let alone run.
   const got = sha256Hex(body);
@@ -127,6 +143,7 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
 
   // Beside the binary so the rename stays on one filesystem; a fresh random
   // name opened exclusively, so nothing planted there is written through.
+  for (const path of sweepStaleTemps(dirname(self))) console.error(`[grayboard] removed ${path}, left by an interrupted update`);
   const tmp = join(dirname(self), `.grayboard-${tag}-${randomBytes(8).toString("hex")}`);
   try {
     const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o755);
@@ -157,4 +174,34 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
     throw e;
   }
   return { updated: true, origin: downloads, tag, keyId: signed.keyId };
+}
+
+// An update's temp binary: `.grayboard-<tag>-<16 hex>` (above).
+const UPDATE_TEMP = /^\.grayboard-v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?-[0-9a-f]{16}$/;
+export const STALE_TEMP_MS = 60 * 60 * 1000;
+
+/**
+ * Removes update temp binaries in `dir` that a killed update left (#317): only
+ * regular files of this user, named as update names them, untouched for an
+ * hour, so an update running alongside keeps its own. Returns what it removed;
+ * a file it can't inspect or remove is left.
+ */
+export function sweepStaleTemps(dir: string, now = Date.now()): string[] {
+  const removed: string[] = [];
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return removed; }
+  const uid = process.getuid?.();
+  for (const name of names) {
+    if (!UPDATE_TEMP.test(name)) continue;
+    const path = join(dir, name);
+    try {
+      const st = lstatSync(path);
+      if (!st.isFile() || (uid !== undefined && st.uid !== uid) || now - st.mtimeMs < STALE_TEMP_MS) continue;
+      rmSync(path);
+      removed.push(path);
+    } catch {
+      // Gone already, or not ours to remove.
+    }
+  }
+  return removed;
 }

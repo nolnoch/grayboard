@@ -2,12 +2,15 @@ import { age } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import type { AttachmentInfo } from "./attachments.ts";
 
-type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
+type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at?: number | null; kind?: "bounce" | null; via?: string | null; attachments?: AttachmentInfo[] };
 
-export type InboxItem = { id: number; from: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
-export type PromiseItem = { id: number; to: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
+// via (#523): the child session that wrote the message under its root's address.
+// other_user, ungranted, delegated: a server marks another user's mail (#825, #256); local mode has one user.
+export type InboxItem = { id: number; from: string; via?: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[]; other_user?: true; ungranted?: true; delegated?: true };
+// No kind: a bounce is stored pending = 0, so it is never a promise.
+export type PromiseItem = { id: number; to: string; via?: string; parent_id?: number; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
 
-export const INBOX_DAYS = 3;
+const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
 // Promises don't age out with the days argument; they stay until kept or acked.
 export const PROMISE_DAYS = MAX_INBOX_DAYS;
@@ -29,9 +32,11 @@ function lastWord<M extends Msg>(me: string[], candidates: M[], threadOf: (id: n
 
 function item(m: Msg, now: number) {
   return {
+    ...(m.via ? { via: m.via } : {}),
     ...(m.parent_id !== null ? { parent_id: m.parent_id } : {}),
     ...(m.kind ? { kind: m.kind } : {}),
     age: age(now - m.created_at),
+    ...(m.delivered_at != null ? { delivered_at: m.delivered_at } : {}),
     body: m.body.length > SNIPPET ? `${m.body.slice(0, SNIPPET)}… (dm_thread for the rest)` : m.body,
     ...(m.attachments ? { attachments: m.attachments } : {}),
   };
@@ -51,12 +56,16 @@ export function promised(me: string[], candidates: Msg[], threadOf: (id: number)
   return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, to: m.recipient, ...item(m, now) }));
 }
 
-// A message as a read shows it. pending is stored as 0/1 and kind as null
-// for an ordinary message; rows show each only when set, so history and
-// threads don't pay for them on every message.
-export function showMessage<M extends { pending: number | boolean; kind?: "bounce" | null }>(m: M): Omit<M, "pending" | "kind"> & { pending?: true; kind?: "bounce" } {
-  const { pending, kind, ...rest } = m;
-  return { ...rest, ...(pending ? { pending: true as const } : {}), ...(kind ? { kind } : {}) };
+// A message as a read shows it. pending is stored as 0/1, kind as null for
+// an ordinary message, delivered_at as null until the message reaches its
+// recipient's harness and via (#523) as null for a root's own write; rows
+// show each only when set, so history and threads don't pay for them on
+// every message.
+export function showMessage<M extends { pending: number | boolean; kind?: "bounce" | null; delivered_at?: number | null; via?: string | null }>(
+  m: M,
+): Omit<M, "pending" | "kind" | "delivered_at" | "via"> & { pending?: true; kind?: "bounce"; delivered_at?: number; via?: string } {
+  const { pending, kind, delivered_at, via, ...rest } = m;
+  return { ...rest, ...(via ? { via } : {}), ...(pending ? { pending: true as const } : {}), ...(kind ? { kind } : {}), ...(delivered_at != null ? { delivered_at } : {}) };
 }
 
 // dm_history's limit, checked alike in both modes (#75).
@@ -148,7 +157,7 @@ export function undeliveredInstruction(
 
 // A queued message to a handle idle this long is likely a misaddress (a live
 // peer under another handle), so the send result says so and names the undo.
-export const STALE_RECIPIENT_MS = 3_600_000;
+const STALE_RECIPIENT_MS = 3_600_000;
 
 export function queuedNote(recipient: string, seen: number | null, now = Date.now()): string {
   if (seen !== null && now - seen < STALE_RECIPIENT_MS) return "Recipient offline; will be delivered on their next session.";
@@ -176,3 +185,10 @@ export const retractRefusal = {
   reached: (id: number, to: string) => `message ${id} already reached ${to}; send a correction instead`,
   replied: (id: number) => `message ${id} has a reply in its thread; send a correction instead`,
 };
+
+// A tool result with notices appended as text items after its own content:
+// the one append both MCP surfaces use (src/local/mcp.ts, src/server/mcp.ts;
+// #479), so they can't drift. No notices: the result itself.
+export function withNotices<R extends { content: unknown[] }>(result: R, notices: readonly string[]): R {
+  return notices.length ? { ...result, content: [...result.content, ...notices.map((text) => ({ type: "text" as const, text }))] } : result;
+}

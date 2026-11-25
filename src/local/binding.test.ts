@@ -1,13 +1,17 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
+import { Database } from "bun:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { REFUSED_COALESCE_MS, holdAlias, logBinding } from "../core/bindings.ts";
-import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess } from "../core/boards.ts";
+import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, TOUCH_EVERY_MS, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
+import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess, touchId } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { acquireName, attachSession, candidateNames, liveSessions, reap, registerSession, thisSession, type SessionRow } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, readChildren, recordYieldReads, recordYields, candidateNames, childFallback, conversationSnapshot, endLocalSession, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionKind, type SessionRow } from "./binding.ts";
+import * as proc from "../shared/proc.ts";
 import { procStart } from "../shared/proc.ts";
+import { CoreError } from "../core/errors.ts";
+import { coreRefusalCode } from "../core/session_end.ts";
 import { openLocalDb } from "./open.ts";
 
 // #182 audit 29: two processes that read the same dead row both reap it;
@@ -24,6 +28,44 @@ test("a dead row reaped twice logs one release", () => {
   // The reap ends the session (#284): its hold goes and its ID is never taken again.
   expect(db.prepare(`SELECT * FROM alias_holds`).all()).toEqual([]);
   expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id)).toEqual({ ended_at: 2 });
+});
+
+// #330: the id.ended row names the process that ended the session and,
+// for a reap, the dead row it judged and how; a child ended with its root
+// carries the ender, not the root's evidence.
+test("a reap's id.ended names the ender, the dead row and the probe", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const base = { name: null, names: [], harness: null, cwd: null, started_at: 1, attached_pid: null, attached_start: null };
+  const id = "id:0123456789abh";
+  registerSession(db, { ...base, session_id: id, pid: 999999, proc_start: "s1", harness_pid: 999999, harness_rule: "env" });
+  const child = childSessionId(id, "sub-1");
+  registerChild(db, id, child, "sub-1");
+  const rows = db.prepare(`SELECT * FROM bindings WHERE session_id = ?`).all(id) as SessionRow[];
+  db.transaction(() => reap(db, rows, 2)).immediate();
+  const detail = (target: string) => JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended' AND target = ?`).get(target) as { detail: string }).detail);
+  expect(detail(id)).toMatchObject({ by_pid: process.pid, reaped: { pid: 999999, proc_start: "s1", harness_pid: 999999, harness_rule: "env", probe: "pre_lock" } });
+  expect(detail(child)).toMatchObject({ by_pid: process.pid });
+  expect(detail(child).reaped).toBeUndefined();
+});
+
+// #335: a row judged dead before the transaction is reaped without a new
+// probe while it's unchanged, so a pid reused in between can't keep it; a row
+// that changed (a child re-attached) is probed again and kept while it lives.
+test("reap trusts the judgement for an unchanged row and re-probes a changed one", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const base = { name: null, names: [], harness: null, harness_pid: null, cwd: null, started_at: 1, harness_rule: null, attached_pid: null, attached_start: null };
+  // Judged dead while pid 999999 was gone; by the transaction, a live process (this one) has that pid.
+  const reused = "id:0123456789abd";
+  registerSession(db, { ...base, session_id: reused, pid: process.pid, proc_start: null });
+  const judged = db.prepare(`SELECT * FROM bindings WHERE session_id = ?`).all(reused) as SessionRow[];
+  db.transaction(() => reap(db, judged, 2)).immediate();
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(reused)).toEqual({ ended_at: 2 });
+  // Judged dead as pid 999999, then re-attached as this live process: kept.
+  const moved = "id:0123456789abe";
+  registerSession(db, { ...base, session_id: moved, pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const stale = [{ ...(db.prepare(`SELECT * FROM bindings WHERE session_id = ?`).get(moved) as SessionRow), pid: 999999 }];
+  db.transaction(() => reap(db, stale, 3)).immediate();
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(moved)).toEqual({ ended_at: null });
 });
 
 // #284 S7: a session holding two aliases is one live row, its primary the
@@ -128,6 +170,49 @@ test("a keyed attach is refused when the held handle and BUS_HUMAN disagree", as
   expect(await attachSession(db, self, true)).toMatchObject({ ok: false, error: expect.stringContaining(`holds "fe", which isn't the declared human handle`) });
 });
 
+// #365: a keyed restart under another model or effort replaces the stored
+// facts, audited with the before and after; the same facts write nothing.
+test("a keyed attach records the new child's model and effort", async () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const id = "id:0123456789abf";
+  const self = thisSession(id, { pid: process.pid, proc_start: procStart(process.pid) ?? null, rule: "env" });
+  registerSession(db, self, { model: "opus", effort: "high" });
+  const facts = () => db.prepare(`SELECT model, effort FROM ids WHERE id = ?`).get(id);
+  const audits = () => (db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.facts_changed' AND target = ?`).all(id) as { detail: string }[]).map((r) => JSON.parse(r.detail));
+  const restart = () => db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
+
+  restart();
+  expect(await attachSession(db, self, false, { model: "sonnet", effort: "low" })).toEqual({ ok: true, held: [] });
+  expect(facts()).toEqual({ model: "sonnet", effort: "low" });
+  expect(audits()).toEqual([{ before: { model: "opus", effort: "high" }, after: { model: "sonnet", effort: "low" }, why: "reattach" }]);
+  restart();
+  expect(await attachSession(db, self, false, { model: "sonnet", effort: "low" })).toMatchObject({ ok: true });
+  expect(audits()).toHaveLength(1);
+  // A child that reports none clears them: the old ones were the last child's.
+  restart();
+  expect(await attachSession(db, self, false)).toMatchObject({ ok: true });
+  expect(facts()).toEqual({ model: null, effort: null });
+  expect(audits()).toHaveLength(2);
+});
+
+// #1075: a keyed root's restart under a new harness conversation (pi's /new)
+// records the new id, which its subagents find it by; none keeps the old.
+test("a keyed attach records the new child's harness session", async () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const id = "id:0123456789abe";
+  const self = thisSession(id, { pid: process.pid, proc_start: procStart(process.pid) ?? null, rule: "env" });
+  registerSession(db, self, { harnessSession: "conv-1" });
+  const harness = () => (db.prepare(`SELECT harness_session FROM ids WHERE id = ?`).get(id) as { harness_session: string | null }).harness_session;
+  const restart = () => db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
+
+  restart();
+  expect(await attachSession(db, self, false, undefined, undefined, "conv-2")).toMatchObject({ ok: true });
+  expect(harness()).toBe("conv-2");
+  restart();
+  expect(await attachSession(db, self, false)).toMatchObject({ ok: true });
+  expect(harness()).toBe("conv-2");
+});
+
 // #210: a retry loop refused for the same reason is one row with a count.
 test("a session's identical refusals within the window share a row; anything else inserts", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
@@ -175,4 +260,431 @@ test("retention keeps each name's latest bound or moved event", () => {
     { session_id: s2, name: "fe", event: "bound" },
     { session_id: s1, name: "be", event: "moved" },
   ]);
+});
+
+// #523: a child session's first sight writes its ids row (the root's facts,
+// delivery 'none', root_id), a copy of the root's liveness row (#539) and one
+// id.child_seen row; a second sight is the same child; a row that isn't this
+// root's live child is refused.
+test("registerChild records a child once, audited; another root's ID or an ended child is refused", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const [root, child, other] = ["id:0123456789abc", "id:0123456789abd", "id:0123456789abe"];
+  registerSession(db, { ...thisSession(root, null, "/work/repo"), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness: "omp" }, { keyed: true });
+  registerChild(db, root, child, "reviewer-1");
+  registerChild(db, root, child, "reviewer-1");
+  expect(db.prepare(`SELECT harness, cwd, keyed, delivery, root_id, ended_at FROM ids WHERE id = ?`).get(child)).toEqual({ harness: "omp", cwd: "/work/repo", keyed: 1, delivery: "none", root_id: root, ended_at: null });
+  const seen = db.prepare(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen'`).all() as { actor: string; target: string; detail: string }[];
+  expect(seen.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([{ actor: root, target: child, detail: { child, root, raw: "reviewer-1", pid: process.pid, liveness_pid: process.pid } }]);
+  // Its process row is its root's liveness, unbound and with nothing attached: never a live receiver here.
+  const liveness = `SELECT name, pid, proc_start, harness_pid, harness_rule, attached_pid, attached_start, detached_at FROM bindings WHERE session_id = ?`;
+  expect(db.prepare(liveness).get(child)).toEqual({ ...(db.prepare(liveness).get(root) as object), attached_pid: null, attached_start: null });
+  expect(liveSessions(db).alive.map((r) => r.session_id)).toEqual([root]);
+
+  registerSession(db, { ...thisSession(other), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  expect(() => registerChild(db, root, other, "reviewer-2")).toThrow(`id_collision: ${other} is another session's ID, not a child of ${root}`);
+  expect(() => registerChild(db, other, child, "reviewer-1")).toThrow(`id_collision: ${child} is another session's ID, not a child of ${other}`);
+  db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(child);
+  expect(() => registerChild(db, root, child, "reviewer-1")).toThrow(`id_ended: child session ${child} ended at 1970-01-01T00:00:00.005Z`);
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: 1 });
+  // Each refusal carries its code to the tool result (#959): the MCP layer answers coreRefusalCode's.
+  const code = (f: () => void) => { try { f(); } catch (e) { if (e instanceof CoreError) return coreRefusalCode(e); throw e; } throw new Error("no refusal"); };
+  expect(code(() => registerChild(db, root, other, "reviewer-2"))).toBe("id_collision");
+  expect(code(() => registerChild(db, root, child, "reviewer-1"))).toBe("id_ended");
+  // A root with no liveness row has ended: its child can't be registered.
+  expect(code(() => registerChild(db, "id:0123456789abf", "id:0123456789abg", "reviewer-3"))).toBe("id_ended");
+});
+
+// #523 step 5: a runner's root is the live session that recorded its parent
+// session, only if that session's harness is among the runner's ancestors
+// (the nearest when several are; a dead one never); the runner acts under it
+// while both live, and with it gone it is a session of its own.
+test("runnerRoot finds a live root among the runner's ancestors; runnerRootLive and childFallback follow the root's liveness", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const [far, near, dead, child, self] = ["id:0123456789abc", "id:0123456789abd", "id:0123456789abe", "id:0123456789abf", "id:0123456789ab0"];
+  const live = { pid: process.pid, proc_start: procStart(process.pid) ?? null };
+  registerSession(db, { ...thisSession(far), ...live, harness_pid: 4242 }, { harnessSession: "pi-1" });
+  registerSession(db, { ...thisSession(near), ...live, harness_pid: 4244 }, { harnessSession: "pi-1" });
+  registerSession(db, { ...thisSession(dead), pid: 999999, proc_start: null, harness_pid: 4243 }, { harnessSession: "pi-1" });
+  expect(runnerRoot(db, "pi-1", [4243, 4244, 4242])).toEqual({ root: near });
+  expect(runnerRoot(db, "pi-1", [4242])).toEqual({ root: far });
+  expect(runnerRoot(db, "pi-1", [4243, 1234])).toEqual({ why: `the live session ${far} recorded harness session pi-1, but its harness pid 4242 isn't an ancestor of this process` });
+  expect(runnerRoot(db, "pi-2", [4242])).toEqual({ why: "no live session recorded harness session pi-2" });
+
+  registerChild(db, far, child, "runner-1", Date.now(), { harness: "pi", cwd: "/work/repo", harnessSession: "runner-1", detail: { parent_session: "pi-1" } });
+  expect(db.prepare(`SELECT harness, cwd, harness_session, root_id FROM ids WHERE id = ?`).get(child)).toEqual({ harness: "pi", cwd: "/work/repo", harness_session: "runner-1", root_id: far });
+  expect(runnerRootLive(db, child, far)).toBe(true);
+  expect(runnerRootLive(db, child, near)).toBe(false);
+  // The root's process exits while the runner lives on.
+  db.prepare(`UPDATE bindings SET pid = 999999, proc_start = NULL WHERE session_id = ?`).run(far);
+  expect(runnerRootLive(db, child, far)).toBe(false);
+  childFallback(db, { child, root: far, self: { ...thisSession(self), ...live }, kind: { harnessSession: "runner-1" }, detail: { parent_session: "pi-1" } });
+  expect(db.prepare(`SELECT root_id, ended_at IS NOT NULL AS ended FROM ids WHERE id = ?`).get(child)).toEqual({ root_id: far, ended: 1 });
+  expect(db.prepare(`SELECT root_id, harness_session, delivery FROM ids WHERE id = ?`).get(self)).toEqual({ root_id: null, harness_session: "runner-1", delivery: "push" });
+  const fallback = db.prepare(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_fallback'`).all() as { actor: string; target: string; detail: string }[];
+  expect(fallback.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([{ actor: self, target: self, detail: { child, root: far, pid: process.pid, parent_session: "pi-1" } }]);
+});
+
+// #523 audit 3: a root has at most MAX_CHILDREN child sessions at once, as
+// hosted. A local child has no end of its own, so the root's other children
+// count only while seen inside the idle window; a known child seen again
+// keeps its own place.
+test("a root's child past MAX_CHILDREN is refused while the others are fresh, and accepted once they've gone idle", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const root = "id:0123456789abc";
+  registerSession(db, { ...thisSession(root), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const kid = (i: number) => `id:k${String(i).padStart(12, "0")}`;
+  const t0 = 1_800_000_000_000;
+  for (let i = 0; i < MAX_CHILDREN; i++) registerChild(db, root, kid(i), `sub-${i}`, t0);
+  expect(() => registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + 1000)).toThrow(childCapacity(root));
+  expect(db.prepare(`SELECT 1 FROM ids WHERE id = ?`).get(kid(MAX_CHILDREN))).toBeNull();
+  registerChild(db, root, kid(0), "sub-0", t0 + 1000);
+  // At the window's edge the others still count; one past it, only the two seen since do.
+  const window = DEFAULT_IDLE_SECONDS * 1000;
+  expect(() => registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + window)).toThrow(childCapacity(root));
+  touchId(db, kid(1), t0 + window + 1);
+  registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + window + 1);
+  expect(db.prepare(`SELECT root_id, ended_at FROM ids WHERE id = ?`).get(kid(MAX_CHILDREN))).toEqual({ root_id: root, ended_at: null });
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: MAX_CHILDREN + 1 });
+});
+
+// #523 audit 3: the root process's child cache derives each child's ID from
+// the root's key, registers it once and touches it per call; it forgets a
+// child idle past the window, so its memory stays bounded by the cap, and the
+// forgotten child seen again is the same child, with no second audit row.
+test("ChildSessions keeps only the children seen inside the idle window, refusing past MAX_CHILDREN", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const key = "ab".repeat(32);
+  const root = idAddress(key);
+  registerSession(db, { ...thisSession(root), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const children = new ChildSessions(db, root, key);
+  const t0 = 1_800_000_000_000, window = DEFAULT_IDLE_SECONDS * 1000;
+  const first = children.resolve("sub-0", t0);
+  expect(first).toBe(childSessionId(key, "sub-0"));
+  for (let i = 1; i < MAX_CHILDREN; i++) children.resolve(`sub-${i}`, t0);
+  expect(children.size).toBe(MAX_CHILDREN);
+  expect(() => children.resolve("sub-overflow", t0 + 1)).toThrow(childCapacity(root));
+  // A known child resolves again, keeping its place; it is touched at most
+  // once per TOUCH_EVERY_MS (#894).
+  expect(children.resolve("sub-0", t0 + 2)).toBe(first);
+  expect(db.prepare(`SELECT last_seen FROM ids WHERE id = ?`).get(first)).toEqual({ last_seen: t0 });
+  children.resolve("sub-0", t0 + TOUCH_EVERY_MS);
+  expect(db.prepare(`SELECT last_seen FROM ids WHERE id = ?`).get(first)).toEqual({ last_seen: t0 + TOUCH_EVERY_MS });
+  // Past the window every child but sub-0 is forgotten; the newcomer takes a place.
+  children.resolve("sub-overflow", t0 + window + 1);
+  expect(children.size).toBe(2);
+  // sub-1, forgotten, comes back as the same child: no second id.child_seen.
+  expect(children.resolve("sub-1", t0 + window + 2)).toBe(childSessionId(key, "sub-1"));
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: MAX_CHILDREN + 1 });
+});
+
+// #894: a subagent's call soon after its last, and peer_list's read of the
+// live sessions with a dead one among them, don't wait on another process's
+// write lock: the child's touch isn't due, and the reap is skipped at once
+// while the lock is held, then ends the dead session once it's free.
+test("a known child's call and a no-wait liveSessions read don't wait on another process's lock", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db");
+  const db = openLocalDb(path).db;
+  const key = "cd".repeat(32);
+  const root = idAddress(key);
+  registerSession(db, { ...thisSession(root), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const dead = "id:0123456789dea";
+  registerSession(db, { ...thisSession(dead), pid: 999999, proc_start: null });
+  const children = new ChildSessions(db, root, key);
+  const t0 = Date.now();
+  const kid = children.resolve("sub-0", t0);
+  const lock = new Database(path);
+  lock.exec("BEGIN IMMEDIATE");
+  // An end that fails on the lock is logged here, so a waiting attempt shows.
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    db.exec("PRAGMA busy_timeout = 3000");
+    const started = performance.now();
+    expect(children.resolve("sub-0", t0 + 1)).toBe(kid);
+    expect(liveSessions(db, { wait: false })).toEqual({ alive: [expect.objectContaining({ session_id: root })], ended: [], wake: [] });
+    expect(performance.now() - started).toBeLessThan(1500);
+    expect(logged).not.toHaveBeenCalled();
+    expect(db.prepare(`PRAGMA busy_timeout`).get()).toEqual({ timeout: 3000 });
+    db.exec("PRAGMA busy_timeout = 200");
+    // The touch that comes due, and an ending read, still write: they wait on the lock.
+    expect(() => children.resolve("sub-0", t0 + TOUCH_EVERY_MS)).toThrow(/locked/);
+    expect(liveSessions(db).ended).toEqual([]);
+    expect(logged).toHaveBeenCalledWith(`grayboard: ending dead session ${dead} failed:`, expect.anything());
+  } finally {
+    logged.mockRestore();
+    lock.exec("ROLLBACK");
+    lock.close();
+  }
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(dead)).toEqual({ ended_at: null });
+  expect(liveSessions(db, { wait: false }).ended).toEqual([dead]);
+});
+
+// #523: a live root's children stay live; a child whose root is gone, ended
+// by a reap, by an older grayboard that knew no children, or pruned, ends.
+// HEAD judges a child by its root, never by its own row (#539: a copy of the
+// root's liveness for older releases), which goes when the child ends. Here
+// each copy names this live process, so only the root can end it, except the
+// live root's child's, whose dead copy must not end it.
+test("reading live sessions keeps a live root's children and ends those whose root is dead, ended or pruned", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const live = "id:0123456789abc", dead = "id:0123456789abd", old = "id:0123456789abe", pruned = "id:0123456789abf";
+  registerSession(db, { ...thisSession(live), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  for (const id of [dead, old, pruned]) registerSession(db, { ...thisSession(id), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const childOf = (root: string) => `id:${root.slice(-3)}0000000000`;
+  for (const root of [live, dead, old, pruned]) registerChild(db, root, childOf(root), `child-of-${root}`);
+  // dead: its process is gone, so a reap ends it. old: an older grayboard ended it and dropped its row.
+  // pruned: its ids row is past retention.
+  db.prepare(`UPDATE bindings SET pid = 999999, proc_start = NULL WHERE session_id = ?`).run(dead);
+  db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(old);
+  db.prepare(`DELETE FROM bindings WHERE session_id IN (?, ?)`).run(old, pruned);
+  db.prepare(`DELETE FROM ids WHERE id = ?`).run(pruned);
+  db.prepare(`UPDATE bindings SET pid = 999999, proc_start = NULL WHERE session_id = ?`).run(childOf(live));
+
+  const r = liveSessions(db);
+  expect(r.alive.map((s) => s.session_id)).toEqual([live]);
+  const ended = (id: string) => (db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null }).ended_at;
+  expect(ended(childOf(live))).toBeNull();
+  for (const root of [dead, old, pruned]) expect(ended(childOf(root))).not.toBeNull();
+  const whys = Object.fromEntries((db.prepare(`SELECT target, detail FROM audit_log WHERE action = 'id.ended'`).all() as { target: string; detail: string }[])
+    .map((a) => [a.target, JSON.parse(a.detail).why]));
+  expect(whys).toMatchObject({ [childOf(dead)]: `its root ${dead} ended`, [childOf(old)]: `its root ${old} ended`, [childOf(pruned)]: `its root ${pruned} ended` });
+  expect(whys).not.toHaveProperty(childOf(live));
+  // The ended children's rows went with them; the live root's child keeps its copy.
+  expect(db.prepare(`SELECT session_id FROM bindings ORDER BY session_id`).all()).toEqual([{ session_id: live }, { session_id: childOf(live) }]);
+  // A second read finds nothing more to end.
+  expect(liveSessions(db)).toMatchObject({ alive: [{ session_id: live }], ended: [] });
+});
+
+test("conversation snapshots select the latest start, then rowid, matching the exact ended conversation", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  try {
+    const snapshot = (id: string, started_at: number, session: string, names: string[], ended = true) => {
+      registerSession(db, { ...thisSession(id), started_at }, { harnessSession: session, localResume: true });
+      for (const [i, name] of names.entries()) holdAlias(db, name, id, 10 + i);
+      if (ended) endLocalSession(db, id);
+    };
+    const older = "id:0123456789abc", newer = "id:0123456789abd", tie = "id:0123456789abe";
+    snapshot(older, 100, "selected", ["old"]);
+    snapshot(newer, 200, "selected", ["zed", "alpha"]);
+    // Inserted later and ended later, but its start is earlier.
+    snapshot("id:0123456789abf", 150, "selected", ["late-end"]);
+    expect(conversationSnapshot(db, "selected")).toEqual({ session_id: newer, names: ["zed", "alpha"] });
+    snapshot(tie, 200, "selected", ["tie-winner"]);
+    expect(conversationSnapshot(db, "selected")).toEqual({ session_id: tie, names: ["tie-winner"] });
+    snapshot("id:0123456789ab0", 300, "selected", ["still-live"], false);
+    snapshot("id:0123456789ab1", 400, "selected-extra", ["other-conversation"]);
+    expect(conversationSnapshot(db, "selected")).toEqual({ session_id: tie, names: ["tie-winner"] });
+    expect(conversationSnapshot(db, "select")).toBeNull();
+    expect(conversationSnapshot(db, "missing")).toBeNull();
+  } finally { db.close(); }
+});
+
+test("an ended conversation's latest empty snapshot is authoritative, including a rowid tie", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  try {
+    const old = "id:0123456789abc", empty = "id:0123456789abd";
+    for (const id of [old, empty]) registerSession(db, { ...thisSession(id), started_at: 100 }, { harnessSession: "unbound", localResume: true });
+    holdAlias(db, "previous", old);
+    endLocalSession(db, old);
+    endLocalSession(db, empty);
+    expect(conversationSnapshot(db, "unbound")).toEqual({ session_id: empty, names: [] });
+  } finally { db.close(); }
+});
+
+test("local resume is explicit opt-in without changing harness-session discovery; ineligible facts are excluded", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  try {
+    const ordinary = "id:0123456789abc", discovery = "id:0123456789abd";
+    registerSession(db, { ...thisSession(ordinary), started_at: 1 }, { harnessSession: "conversation", localResume: true });
+    holdAlias(db, "ordinary", ordinary);
+    endLocalSession(db, ordinary);
+    registerSession(db, { ...thisSession(discovery), harness_pid: process.pid, started_at: 2 }, { harnessSession: "conversation" });
+    expect(db.prepare(`SELECT harness_session, local_resume FROM ids WHERE id = ?`).get(discovery)).toEqual({ harness_session: "conversation", local_resume: 0 });
+    expect(runnerRoot(db, "conversation", [process.pid])).toEqual({ root: discovery });
+    endLocalSession(db, discovery);
+    const excluded: [string, SessionKind][] = [
+      ["id:0123456789abe", { keyed: true, localResume: true }],
+      ["id:0123456789abf", { viewer: true, localResume: true }],
+      ["id:0123456789ab0", { writesAs: "tools", localResume: true }],
+      ["id:0123456789ab1", { localResume: false }],
+    ];
+    for (const [id, kind] of excluded) {
+      registerSession(db, { ...thisSession(id), started_at: 3 }, { ...kind, harnessSession: "conversation" });
+      endLocalSession(db, id);
+    }
+    const root = "id:0123456789ab2", child = "id:0123456789ab3";
+    registerSession(db, thisSession(root), { harnessSession: "root-conversation", localResume: true });
+    registerChild(db, root, child, "worker", 4, { harness: "runner", cwd: process.cwd(), harnessSession: "conversation" });
+    expect(db.prepare(`SELECT harness_session, local_resume FROM ids WHERE id = ?`).get(child)).toEqual({ harness_session: "conversation", local_resume: 0 });
+    // Root provenance independently excludes a malformed eligible push row.
+    db.prepare(`UPDATE ids SET local_resume = 1, delivery = 'push' WHERE id = ?`).run(child);
+    endLocalSession(db, root);
+    expect(conversationSnapshot(db, "conversation")).toEqual({ session_id: ordinary, names: ["ordinary"] });
+  } finally { db.close(); }
+});
+
+// #338: an open's probes of ids read only live rows, through the partial
+// index, not a scan of every ended session retention hasn't pruned yet.
+test("liveSessions probes ids through the live-row index", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const seen: string[] = [];
+  const prepare = db.prepare.bind(db);
+  const spy = spyOn(db, "prepare").mockImplementation(((sql: string) => {
+    seen.push(sql);
+    return prepare(sql);
+  }) as typeof db.prepare);
+  try {
+    liveSessions(db);
+  } finally {
+    spy.mockRestore();
+  }
+  const probes = seen.filter((sql) => /FROM ids WHERE/.test(sql) && sql.includes("ended_at IS NULL"));
+  expect(probes).toHaveLength(2);
+  for (const sql of probes) {
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map((r) => r.detail);
+    expect(plan[0], sql).toBe("SCAN ids USING INDEX idx_ids_live");
+  }
+});
+
+// #1381/#1401/#1463/#1464: a holder an adapter's child may displace, and an
+// adapter's child a sibling yields its name record to, are judged live and
+// the harness's child. This test process stands in for both, under its own
+// parent as the harness; the taker or writer is a row with a dead pid, which
+// neither judgement reads.
+const harness = process.ppid;
+function displacementBus(): { db: Database; holder: string; taker: string } {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const holder = "id:0123456789aba", taker = "id:0123456789abb";
+  const me = { ...thisSession(holder), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness_pid: harness, harness_rule: null };
+  registerSession(db, me);
+  holdAlias(db, "omp-local", holder);
+  registerSession(db, { ...thisSession(taker), pid: 999999, proc_start: null, harness_pid: harness, harness_rule: null }, { harnessSession: "conv-1" });
+  return { db, holder, taker };
+}
+function yieldBus(): { db: Database; writer: string } {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const writer = "id:0123456789abc";
+  registerSession(db, { ...thisSession("id:0123456789abd"), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness_pid: harness, harness_rule: null }, { harnessSession: "conv-1" });
+  registerSession(db, { ...thisSession(writer), pid: 999999, proc_start: null, harness_pid: harness, harness_rule: null });
+  return { db, writer };
+}
+// Every parentsOf call, and whether it ran inside a write transaction.
+function watchParents(db: Database, answer?: (pids: number[]) => Map<number, number | null>) {
+  const real = proc.parentsOf;
+  const calls: boolean[] = [];
+  const spy = spyOn(proc, "parentsOf").mockImplementation((pids: number[]) => {
+    calls.push(db.inTransaction);
+    return (answer ?? real)(pids);
+  });
+  return { calls, restore: () => spy.mockRestore() };
+}
+
+test("an adapter's child displaces its harness's sibling with the holder's parent read before the write lock (#1463)", async () => {
+  const { db, holder, taker } = displacementBus();
+  const w = watchParents(db);
+  try {
+    expect(await acquireName(db, taker, "omp-local", { create: true, displace: harness })).toMatchObject({ ok: true, ended: { wake: [holder] } });
+  } finally { w.restore(); }
+  expect(w.calls).toEqual([false]);
+});
+
+test("a holder that took the name after the pre-lock read is read inside the lock, and still displaced (#1463)", async () => {
+  const { db, taker } = displacementBus();
+  // The pre-lock read finds no holder; another sibling (this process again, a new session) takes the name before the lock.
+  db.prepare(`DELETE FROM alias_holds WHERE address = 'omp-local'`).run();
+  const late = "id:0123456789abe";
+  registerSession(db, { ...thisSession(late), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness_pid: harness, harness_rule: null });
+  const w = watchParents(db);
+  const txn = db.transaction.bind(db);
+  const gap = spyOn(db, "transaction").mockImplementation(((fn: Parameters<typeof db.transaction>[0]) => {
+    holdAlias(db, "omp-local", late);
+    return txn(fn);
+  }) as typeof db.transaction);
+  try {
+    expect(await acquireName(db, taker, "omp-local", { create: true, displace: harness })).toMatchObject({ ok: true, ended: { wake: [late] } });
+  } finally { w.restore(); gap.mockRestore(); }
+  expect(w.calls).toEqual([true]);
+});
+
+test("a holder whose parent can't be read isn't displaced (#1464)", async () => {
+  const { db, holder, taker } = displacementBus();
+  const w = watchParents(db, (pids) => new Map(pids.map((p) => [p, null])));
+  try {
+    expect(await acquireName(db, taker, "omp-local", { create: true, displace: harness })).toMatchObject({ ok: false, error: expect.stringContaining(holder) });
+  } finally { w.restore(); }
+  expect(w.calls.length).toBeGreaterThan(0);
+  expect(db.prepare(`SELECT id FROM alias_holds WHERE address = 'omp-local'`).all()).toEqual([{ id: holder }]);
+});
+
+test("a sibling yields its name record to its harness's adapter's child, with the process reads taken before the lock (#1463)", () => {
+  const { db, writer } = yieldBus();
+  const pre = recordYieldReads(db, writer, harness);
+  const w = watchParents(db);
+  try {
+    expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(true);
+  } finally { w.restore(); }
+  expect(w.calls).toEqual([]);
+  // A candidate the read didn't see (registered since) is read inside the lock.
+  const w2 = watchParents(db);
+  try {
+    expect(db.transaction(() => recordYields(db, writer, harness, new Map())).immediate()).toBe(true);
+  } finally { w2.restore(); }
+  expect(w2.calls).toEqual([true]);
+});
+
+test("a sibling doesn't yield its name record to an adapter's child whose parent can't be read (#1464)", () => {
+  const { db, writer } = yieldBus();
+  const w = watchParents(db, (pids) => new Map(pids.map((p) => [p, null])));
+  try {
+    const pre = recordYieldReads(db, writer, harness);
+    expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(false);
+    expect(db.transaction(() => recordYields(db, writer, harness)).immediate()).toBe(false);
+  } finally { w.restore(); }
+  expect(w.calls).toEqual([false, true]);
+});
+
+// #1463 audit L1: a pre-lock read answers only for the process it read, keyed
+// by session, pid and recorded start time. A row that changed since (a new
+// start time under the same pid, or a new session on the same process) is
+// read again inside the lock, and that read decides.
+const sibling = "id:0123456789abd";
+test("a pre-lock read isn't reused for a row whose start time changed since (#1463)", () => {
+  const { db, writer } = yieldBus();
+  const pre = recordYieldReads(db, writer, harness);
+  expect([...pre.values()]).toEqual([true]);
+  // The adapter's child is gone, and its row now names another process under the same pid.
+  db.prepare(`UPDATE bindings SET proc_start = ? WHERE session_id = ?`).run(`${procStart(process.pid)}x`, sibling);
+  expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(false);
+});
+
+test("a pre-lock read isn't reused for another session on the same process (#1463)", () => {
+  const { db, writer } = yieldBus();
+  const w = watchParents(db, (pids) => new Map(pids.map((p) => [p, null])));
+  let pre: Map<string, boolean>;
+  try {
+    pre = recordYieldReads(db, writer, harness);
+  } finally { w.restore(); }
+  expect([...pre.values()]).toEqual([false]);
+  // That session ends, and another registers on the same pid and start time; its parent reads as the harness.
+  db.prepare(`UPDATE ids SET ended_at = ? WHERE id = ?`).run(Date.now(), sibling);
+  registerSession(db, { ...thisSession("id:0123456789abf"), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness_pid: harness, harness_rule: null }, { harnessSession: "conv-2" });
+  expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(true);
+});
+
+// #1463 audit L2: readChildren's answer is "live and the harness's child".
+// A crashed adapter's child whose pid a live process reuses has a parent that
+// reads as the harness (the reuser's), and is still dead: no yield to it.
+test("readChildren counts a dead row as no child, though its pid's parent reads as the harness (#1463)", () => {
+  const { db, writer } = yieldBus();
+  const start = procStart(process.pid)!;
+  db.prepare(`UPDATE bindings SET proc_start = ? WHERE session_id = ?`).run(`${start}x`, sibling);
+  const crashed = { session_id: sibling, pid: process.pid, proc_start: `${start}x` };
+  const reuser = { session_id: "id:0123456789abf", pid: process.pid, proc_start: start };
+  const pre = readChildren([crashed, reuser], harness);
+  expect([...pre.values()]).toEqual([false, true]);
+  const w = watchParents(db);
+  try {
+    expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(false);
+  } finally { w.restore(); }
+  // Answered from the pre-lock read: no process read under the lock.
+  expect(w.calls).toEqual([]);
 });

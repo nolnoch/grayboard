@@ -1,11 +1,12 @@
 import { Database } from "bun:sqlite";
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   cleanPlace,
+  oneLine,
   parseAliasMeta,
   acknowledge,
   activeAnnouncements,
@@ -19,6 +20,7 @@ import {
   markDelivered,
   mentionTokens,
   openAccess,
+  DIGEST_SQL,
   pendingFor,
   post,
   prunePosts,
@@ -35,11 +37,14 @@ import {
   touchAlias,
   who,
   type Access,
+  type ReadResult,
 } from "./boards.ts";
 import { announcementsInstruction, callBoardTool, claimsInstruction, humanInstruction } from "./tools.ts";
-import { claim, claimExpiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
+import { claim, claimExpiryTimer, expiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 import { dropHold, holdAlias, logBinding } from "./bindings.ts";
+import { boardNotification } from "../shared/notifications.ts";
+import { until } from "../../tests/support/until.ts";
 
 let db: Database;
 
@@ -94,6 +99,51 @@ test("prunePosts reports only boards with committed deleted posts", () => {
   expect(snapshot(db, "be", "kept").posts.map(p => p.body)).toEqual(["new"]);
 });
 
+// #340: prunePosts reads before it writes. Deferred, a commit by another
+// connection between that read and its first write fails the prune with
+// SQLITE_BUSY; immediate, the other writer waits instead.
+test("prunePosts holds the write lock from its first read, so a concurrent writer can't fail it", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "gb-prune-")), "bus.db");
+  const a = new Database(path);
+  a.run("PRAGMA journal_mode = WAL");
+  initCoreSchema(a);
+  ensureAlias(a, "be", "test");
+  createBoard(a, "be", "e2e", "test");
+  post(a, "be", "e2e", "old");
+  a.run("UPDATE posts SET created_at = 0");
+  const b = new Database(path);
+  b.run("PRAGMA busy_timeout = 0");
+  let interleaved: string | undefined;
+  const prepare = a.prepare.bind(a);
+  const spy = spyOn(a, "prepare").mockImplementation(((sql: string) => {
+    const stmt = prepare(sql);
+    if (!sql.startsWith("SELECT DISTINCT board FROM posts")) return stmt;
+    const all = stmt.all.bind(stmt);
+    stmt.all = ((...args: unknown[]) => {
+      const rows = all(...(args as []));
+      // Another process writes between the prune's read and its first write.
+      try {
+        b.run("UPDATE boards SET purpose = 'moved on' WHERE name = 'e2e'");
+        interleaved = "wrote";
+      } catch (e) {
+        interleaved = String(e);
+      }
+      return rows;
+    }) as typeof stmt.all;
+    return stmt;
+  }) as typeof a.prepare);
+  try {
+    expect(prunePosts(a, 1)).toEqual(["e2e"]);
+  } finally {
+    spy.mockRestore();
+  }
+  // The other writer was held off, not let through to break the prune.
+  expect(interleaved).toMatch(/SQLITE_BUSY|database is locked/);
+  expect(b.prepare("SELECT COUNT(*) AS n FROM posts").get()).toEqual({ n: 0 });
+  a.close();
+  b.close();
+});
+
 test("snapshots page bounded history without touching cursor, notified_id, or outbox", () => {
   subscribe(db, "fe", "e2e", "push");
   subscribe(db, "sim", "e2e", "digest");
@@ -137,6 +187,22 @@ test("snapshot and catalog conceal private boards with bounded authorized catalo
   expect(last.boards.map(b => b.name)).not.toContain("private");
   expect(last.next_after).toBeNull();
   expect([...first.boards, ...last.boards]).toHaveLength(106);
+});
+
+test("a renewal can't move a claim onto a board its holder can't see, even when the caller can (#1269)", () => {
+  setAccess(db, { ...openAccess(db), canSee: (h, b) => !b.scope || h === "be" || h === "sim", checkCreate: () => null });
+  createBoard(db, "be", "private", "private", "team:private");
+  const row = () => listClaims(db, "lane:x")[0];
+  claim(db, "fe", "lane:x", { note: "start" });
+  // be holds fe too, so the renewal keeps fe as holder; fe can't see #private, so the move rolls back.
+  expect(() => claim(db, "be", "lane:x", { board: "private", note: "moved", addresses: ["be", "fe"] }))
+    .toThrow("fe, which holds lane:x, can't see #private; a claim can't move onto it");
+  expect(row()).toMatchObject({ holder: "fe", board: null, note: "start" });
+  // A holder that sees the board moves there, through another address or its own.
+  claim(db, "sim", "lane:y");
+  expect(claim(db, "be", "lane:y", { board: "private", addresses: ["be", "sim"] })).toMatchObject({ ok: true, renewed: true, claim: { holder: "sim", board: "private" } });
+  claim(db, "be", "lane:z");
+  expect(claim(db, "be", "lane:z", { board: "private" })).toMatchObject({ ok: true, renewed: true, claim: { holder: "be", board: "private" } });
 });
 
 test("a declared human handle persists across sessions; declaring another moves it", () => {
@@ -248,6 +314,23 @@ test("posting does not mark others' unread posts as read", () => {
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["one", "two"]);
 });
 
+test("a digest's latest is the newest post it counts, past newer own and pushed posts, and its statement walks the handle and board indexes (#900, #904)", () => {
+  subscribe(db, "sim", "e2e", "digest");
+  post(db, "be", "e2e", "read already");
+  read(db, "sim", "e2e");
+  post(db, "be", "e2e", "first unread");
+  post(db, "be", "e2e", "newest counted");
+  post(db, "be", "e2e", "@sim pushed instead");
+  post(db, "sim", "e2e", "own, newer still");
+  expect(drain("sim", true)).toMatchObject([{ kind: "push", reason: "mention" }, { kind: "digest", unread: 2, latest: { body: "newest counted" } }]);
+  // The statement pendingFor runs (#904): subscriptions by handle, and both the count and latest_id walk the board's
+  // (board, id) range rather than scanning or sorting posts.
+  const plan = (db.prepare("EXPLAIN QUERY PLAN " + DIGEST_SQL).all(...Array(9).fill("sim")) as { detail: string }[]).map((r) => r.detail);
+  expect(plan).toContain("SEARCH s USING INDEX idx_subscriptions_handle (handle=?)");
+  expect(plan.filter((d) => d === "SEARCH p USING INDEX idx_posts_board_id (board=? AND id>?)")).toHaveLength(2);
+  expect(plan.filter((d) => /SCAN p\b|TEMP B-TREE/.test(d))).toEqual([]);
+});
+
 test("a mention doesn't also count toward the mentioned subscriber's digest", () => {
   subscribe(db, "sim", "e2e", "digest");
   post(db, "be", "e2e", "@sim look at this");
@@ -256,6 +339,117 @@ test("a mention doesn't also count toward the mentioned subscriber's digest", ()
   post(db, "be", "e2e", "unrelated");
   expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 1, latest: { body: "unrelated" } }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["unrelated"]);
+});
+
+// #523: a child's post (a harness subagent writing under its root's address)
+// shows via wherever the post is read: the push, the digest's latest (meta and
+// prose), board_read and the snapshot; a root's post carries no via key at all.
+test("a child's post shows via in its push, the digest, reads and the snapshot; a root's post has no via key", () => {
+  const root = "id:0123456789abc", child = "id:0123456789abd";
+  registerId(db, { id: root, principal: null, launcher: false }, 1);
+  registerId(db, { id: child, principal: null, launcher: false, rootId: root }, 1);
+  holdAlias(db, "be", root, 1);
+  subscribe(db, "sim", "e2e", "push");
+  subscribe(db, "fe", "e2e", "digest");
+  const byChild = callBoardTool(db, "be", "board_post", { board: "e2e", body: "from the subagent" }, { session: child, via: child, addresses: ["be", root] });
+  expect(byChild.result).toMatchObject({ post_id: expect.any(Number) });
+  expect(db.prepare(`SELECT author, author_id, via FROM posts WHERE body = 'from the subagent'`).get()).toEqual({ author: "be", author_id: child, via: child });
+
+  const [push] = drain("sim");
+  expect(push).toMatchObject({ kind: "push", post: { author: "be", via: child } });
+  expect(boardNotification(push!).meta).toMatchObject({ from: "be", via: child });
+  const [digest] = drain("fe", true);
+  expect(digest).toMatchObject({ kind: "digest", latest: { author: "be", via: child } });
+  expect(boardNotification(digest!).content).toContain(`Latest from be (subagent ${child}, harness-asserted): "from the subagent"`);
+  expect(boardNotification(digest!).meta).not.toHaveProperty("via");
+  // Caught up, the digest re-arms for the next post.
+  read(db, "fe", "e2e");
+  post(db, "be", "e2e", "from the root", null, { author_id: root, addresses: ["be", root] });
+  const [rootPush] = drain("sim");
+  expect(rootPush).toMatchObject({ kind: "push", post: { body: "from the root" } });
+  expect(rootPush!.kind === "push" && rootPush!.post).not.toHaveProperty("via");
+  expect(boardNotification(rootPush!).meta).not.toHaveProperty("via");
+  const [rootDigest] = drain("fe", true);
+  expect(boardNotification(rootDigest!).content).toContain(`Latest from be: "from the root"`);
+
+  // A subscriber's read, an addressless reader's (a board predicate) and the snapshot.
+  for (const posts of [read(db, "sim", "e2e", { limit: 10 }).posts, read(db, () => true, "e2e", { limit: 10 }).posts, snapshot(db, "sim", "e2e").posts]) {
+    expect(posts.map((p) => [p.body, p.via])).toEqual([["from the subagent", child], ["from the root", undefined]]);
+    expect(posts[1]).not.toHaveProperty("via");
+  }
+  // Pushes and digests go to subscribers, never to the root's own addresses.
+  expect(pendingFor(db, root, { all: true })).toEqual([]);
+});
+
+// #523: a child's board_read is its root's board without its root's read state:
+// the latest page and no unread view, and the root's cursor, unread count and
+// pending pushes are left for the root. Thread and before_id reads as usual.
+test("a child's board_read peeks: the root's cursor, unread count and pending push are left for the root", () => {
+  const root = "id:0123456789abc", child = "id:0123456789abd";
+  registerId(db, { id: root, principal: null, launcher: false }, 1);
+  registerId(db, { id: child, principal: null, launcher: false, rootId: root }, 1);
+  holdAlias(db, "fe", root, 1);
+  subscribe(db, "fe", "e2e", "digest");
+  post(db, "be", "e2e", "unread one");
+  const mention = post(db, "be", "e2e", "@fe look").post;
+  const state = () => ({
+    cursor: db.prepare(`SELECT cursor, notified_id FROM subscriptions WHERE handle = 'fe' AND board = 'e2e'`).get(),
+    outbox: db.prepare(`SELECT post_id, delivered_at FROM outbox WHERE handle = 'fe'`).all(),
+  });
+  const before = state();
+  expect(before.outbox).toEqual([{ post_id: mention.id, delivered_at: null }]);
+  expect(listBoards(db, ["fe"])[0]!.unread).toBe(1);
+
+  const peek = (args: Record<string, unknown>) => callBoardTool(db, "fe", "board_read", { board: "e2e", ...args }, { session: child, via: child, addresses: ["fe", root] }).result as ReadResult;
+  const bodies = (r: ReadResult) => r.posts.map((p) => p.body);
+  expect(peek({})).toMatchObject({ unread_remaining: 0 });
+  expect(bodies(peek({}))).toEqual(["unread one", "@fe look"]);
+  expect(bodies(peek({ limit: 1 }))).toEqual(["@fe look"]);
+  expect(bodies(peek({ thread: mention.id }))).toEqual(["@fe look"]);
+  expect(bodies(peek({ before_id: mention.id }))).toEqual(["unread one"]);
+  expect(state()).toEqual(before);
+  expect(listBoards(db, ["fe"])[0]!.unread).toBe(1);
+
+  // The root's own read takes its unread post; its push is still waiting.
+  expect(bodies(read(db, "fe", "e2e"))).toEqual(["unread one"]);
+  expect(drain("fe")).toMatchObject([{ kind: "push", reason: "mention", post: { id: mention.id } }]);
+});
+
+// #523: a child's posts are its root's own, as the root's own posts are: none
+// of the root's addresses is pushed one or counts it unread, whichever of them
+// it wrote as, including a claim announcement (which passes no address set),
+// while other subscribers get it with via.
+test("a child's post and claim announcement are its root's own: none of the root's addresses is pushed one or shown it unread", () => {
+  const root = "id:0123456789abc", child = "id:0123456789abd";
+  registerId(db, { id: root, principal: null, launcher: false }, 1);
+  registerId(db, { id: child, principal: null, launcher: false, rootId: root }, 1);
+  holdAlias(db, "fe", root, 1);
+  holdAlias(db, "qa", root, 2);
+  seen("qa");
+  createBoard(db, "be", "ops", "digests");
+  subscribe(db, "fe", "e2e", "push");
+  subscribe(db, "fe", "ops", "digest");
+  subscribe(db, "sim", "e2e", "push");
+  const mine = ["fe", "qa", root];
+  const ctx = { session: child, via: child, addresses: mine };
+  // As the root's other alias, so the subscribed address isn't the author.
+  callBoardTool(db, "qa", "board_post", { board: "e2e", body: "subagent post" }, ctx);
+  callBoardTool(db, "qa", "board_post", { board: "ops", body: "subagent digest" }, ctx);
+  callBoardTool(db, "qa", "claim_take", { key: "ticket:ENG-7", board: "e2e" }, ctx);
+  // The root's own announcement, likewise.
+  callBoardTool(db, "qa", "claim_take", { key: "ticket:ENG-8", board: "e2e" }, { session: root, addresses: mine });
+
+  const outbox = db.prepare(`SELECT o.handle, p.body FROM outbox o JOIN posts p ON p.id = o.post_id ORDER BY o.post_id`).all() as { handle: string; body: string }[];
+  expect(outbox.filter((r) => mine.includes(r.handle))).toEqual([]);
+  expect(outbox.filter((r) => r.handle === "sim").map((r) => r.body)).toEqual(["subagent post", "[claim] ticket:ENG-7", "[claim] ticket:ENG-8"]);
+  expect(pendingFor(db, "sim")).toMatchObject([{ post: { body: "subagent post", via: child } }, { post: { body: "[claim] ticket:ENG-7", via: child } }, { post: { body: "[claim] ticket:ENG-8" } }]);
+  expect(listBoards(db, mine).map((b) => [b.name, b.unread])).toEqual([["e2e", 0], ["ops", 0]]);
+  for (const a of mine) expect(pendingFor(db, a, { all: true })).toEqual([]);
+  expect(read(db, "fe", "ops").unread_remaining).toBe(0);
+  // Another session's post is still the root's to read.
+  post(db, "be", "ops", "from be");
+  expect(listBoards(db, ["fe"]).find((b) => b.name === "ops")!.unread).toBe(1);
+  expect(pendingFor(db, "fe", { all: true })).toMatchObject([{ kind: "digest", board: "ops", unread: 1, latest: { body: "from be" } }]);
 });
 
 test("quiet subscribers are never pushed but see unread counts", () => {
@@ -293,6 +487,16 @@ test("a reply wakes the post's author and the thread's starter; other participan
   ]);
   expect(drain("be")).toEqual([]);
   expect(read(db, "fe", "e2e", { thread: reply.post.id }).posts).toHaveLength(4);
+});
+
+test("a reply's thread participants are listed by their first post in the thread, not by depth", () => {
+  subscribe(db, "be", "e2e", "off"); // be created the board, so it's push-subscribed
+  const root = post(db, "sim", "e2e", "question").post;
+  const fe = post(db, "fe", "e2e", "me too", root.id).post;
+  post(db, "be", "e2e", "under fe", fe.id);
+  post(db, "qa", "e2e", "under the root", root.id);
+  // A walk by depth would list qa before be; by first post, be (post 3) comes before qa (post 4).
+  expect(post(db, "sim", "e2e", "answer", root.id).deferred).toEqual(["fe", "be", "qa"]);
 });
 
 test("a deferred push shows as unread, and reading the board delivers it", () => {
@@ -390,6 +594,13 @@ test("claims are exclusive, renewable, and expire", () => {
   expect(claim(db, "sim", "ticket:ENG-142")).toMatchObject({ ok: true, renewed: false });
 });
 
+// #81: an unknown board refuses with post's wording and writes nothing.
+test("claim_take on a board that doesn't exist is refused by name, not by a foreign key", () => {
+  expect(() => claim(db, "be", "ticket:ENG-142", { board: "e2ee" })).toThrow("no such board #e2ee; see board_list");
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claims`).get()).toEqual({ n: 0 });
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_events`).get()).toEqual({ n: 0 });
+});
+
 test("claim_events keeps each claim's history after the row is gone", () => {
   claim(db, "be", "ticket:ENG-142", { note: "signature work", board: "e2e" });
   claim(db, "sim", "ticket:ENG-142", { note: "me too" });
@@ -482,6 +693,25 @@ test("a lapsed claim is announced on its board once, by the first sweep or takeo
   expect(bodies().slice(-1)).toEqual(["[expired] dev:freeze: not released by be; check with them before relying on it"]);
 });
 
+// #807 P3 C5a F1: a claim key or note written before they refused NUL still announces, its NUL as U+FFFD; a sweep
+// that refused the body would refuse every later take, on any key.
+test("a lapsed claim whose key or note holds a NUL doesn't block a take: the sweep announces it with U+FFFD", () => {
+  subscribe(db, "sim", "e2e", "push");
+  db.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, 'be', ?, 'e2e', 1, 2)`).run("dev:a\0b", "n\0te");
+  expect(() => claim(db, "fe", "dev:a\0b")).toThrow("claim key contains a NUL character");
+  expect(() => claim(db, "fe", "other", { note: "x\0y" })).toThrow("claim note contains a NUL character");
+  const taken = claim(db, "fe", "unrelated");
+  expect(taken.ok).toBe(true);
+  expect(taken.wake).toContain("sim");
+  const bodies = () => read(db, "sim", "e2e", { before_id: 999 }).posts.map((p) => p.body);
+  expect(bodies().at(-1)).toBe("[expired] dev:a�b: not released by be; check with them before relying on it");
+  // The timer's sweep too.
+  db.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, 'be', ?, 'e2e', 1, 2)`).run("dev:c\0d", null);
+  expect(sweepExpired(db).wake).toEqual(["sim"]);
+  expect(bodies().at(-1)).toBe("[expired] dev:c�d: not released by be; check with them before relying on it");
+  expect(listClaims(db).map((c) => c.key)).toEqual(["unrelated"]);
+});
+
 test("a claim's watchers are mentioned on its release or expiry, in any mode, once", () => {
   subscribe(db, "sim", "e2e", "quiet"); // fe has no subscription at all
   claim(db, "be", "dev:env", { board: "e2e" });
@@ -494,7 +724,8 @@ test("a claim's watchers are mentioned on its release or expiry, in any mode, on
   expect(() => watch(db, "sim", "boardless")).toThrow(/renew it with board=/);
 
   expect(release(db, "be", "dev:env", "done, reset complete").wake.sort()).toEqual(["fe", "sim"]);
-  expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention", post: { body: "[release] dev:env — done, reset complete cc @sim @fe" } }]);
+  // Watchers are cc'd by handle, not in watch order: one order for every cc, and one a store with no row order can give (#807 B5b3a).
+  expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention", post: { body: "[release] dev:env — done, reset complete cc @fe @sim" } }]);
   expect(drain("fe")).toMatchObject([{ kind: "push", reason: "mention" }]);
 
   // Watches end with the claim; a later one on the key starts without them.
@@ -545,6 +776,107 @@ test("the expiry timer fires at the next lapse without anyone asking", async () 
   timer.stop();
   expect(woken).toEqual([["sim"]]);
   expect(listClaims(db)).toEqual([]);
+});
+
+// #807 P3 B2: a server's expiry source reads asynchronously. Its read arms the timer when it resolves; a stop while it
+// waits arms nothing; a failed read is logged, not thrown at the arm's caller.
+test("#807 P3 B2: an asynchronous expiry read arms when it resolves, and a stop while it waits arms nothing", async () => {
+  let sweeps = 0;
+  const reads: ((next: number | null) => void)[] = [];
+  const timer = expiryTimer({
+    next: () => new Promise<number | null>(resolve => { reads.push(resolve); }),
+    sweep: async () => { sweeps++; return { wake: [], boards: [] }; },
+  }, () => {});
+  try {
+    expect(reads).toHaveLength(1);
+    reads.shift()!(Date.now());
+    // The sweep re-arms: its read is the next one.
+    for (let i = 0; i < 100 && reads.length === 0; i++) await Bun.sleep(10);
+    expect(sweeps).toBe(1);
+    expect(reads).toHaveLength(1);
+    timer.stop();
+    reads.shift()!(Date.now());
+    await Bun.sleep(50);
+    expect(sweeps).toBe(1);
+  } finally { timer.stop(); }
+});
+
+// #1489: a server closes its store once stop() settles, so stop() waits out a sweep or a read already running.
+test("#1489: the expiry timer's stop resolves only once its running sweep and read have settled", async () => {
+  let finishSweep!: () => void, finishRead!: (next: number | null) => void;
+  let sweeping = false;
+  const timer = expiryTimer({
+    next: () => new Promise<number | null>(resolve => { finishRead = resolve; }),
+    sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
+  }, () => {});
+  // The first arm's read is running: stop waits for it.
+  let stopped = false;
+  void timer.stop().then(() => { stopped = true; });
+  await Bun.sleep(20);
+  expect(stopped).toBe(false);
+  finishRead(null);
+  await until(() => stopped, 1000, "stop settles once the read has");
+
+  // A sweep already running when stop lands: stop waits for it too.
+  const second = expiryTimer({
+    next: () => Date.now(),
+    sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
+  }, () => {});
+  await until(() => sweeping, 1000, "the sweep starts");
+  let secondStopped = false;
+  void second.stop().then(() => { secondStopped = true; });
+  await Bun.sleep(20);
+  expect(secondStopped).toBe(false);
+  finishSweep();
+  await until(() => secondStopped, 1000, "stop settles once the sweep has");
+});
+
+// #1390: the timer measures its delay on the source's clock, the one its sweep reads: a server on a test clock behind
+// wall time would otherwise fire at once, find nothing lapsed at its own clock, and re-arm in a loop.
+test("#1390: the expiry timer's delay is measured on the source's clock", () => {
+  const T0 = 1_000_000;
+  const delays: number[] = [];
+  const real = globalThis.setTimeout;
+  const spied = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+    delays.push(ms ?? 0);
+    return real(fn, 3_600_000);
+  }) as typeof setTimeout);
+  const timer = expiryTimer({ next: () => T0 + 600_000, sweep: () => ({ wake: [], boards: [] }), now: () => T0 }, () => {});
+  try {
+    expect(delays).toEqual([600_000]);
+  } finally { timer.stop(); spied.mockRestore(); }
+});
+
+test("#807 P3 B2: a failed asynchronous expiry read is logged", async () => {
+  const reported = spyOn(console, "error").mockImplementation(() => {});
+  const timer = expiryTimer({
+    next: () => Promise.reject(new Error("read failed")),
+    sweep: async () => ({ wake: [], boards: [] }),
+  }, () => {});
+  try {
+    expect(() => timer.arm()).not.toThrow();
+    for (let i = 0; i < 100 && reported.mock.calls.length < 2; i++) await Bun.sleep(10);
+    expect(reported.mock.calls).toEqual([
+      ["[grayboard] claim expiry arm failed:", new Error("read failed")],
+      ["[grayboard] claim expiry arm failed:", new Error("read failed")],
+    ]);
+  } finally { timer.stop(); reported.mockRestore(); }
+});
+
+// #807 P3 B2 audit: a failed read retries, so a transient store error doesn't leave the timer idle.
+test("#807 P3 B2: a failed asynchronous expiry read retries the arm", async () => {
+  const reported = spyOn(console, "error").mockImplementation(() => {});
+  let sweeps = 0, reads = 0;
+  const timer = expiryTimer({
+    next: () => ++reads === 1 ? Promise.reject(new Error("read failed")) : Promise.resolve(null),
+    sweep: async () => { sweeps++; return { wake: [], boards: [] }; },
+  }, () => {}, undefined, 10);
+  try {
+    for (let i = 0; i < 100 && reads < 2; i++) await Bun.sleep(10);
+    expect(sweeps).toBe(1);
+    expect(reads).toBe(2);
+    expect(reported.mock.calls).toEqual([["[grayboard] claim expiry arm failed:", new Error("read failed")]]);
+  } finally { timer.stop(); reported.mockRestore(); }
 });
 
 test("expiry board callbacks observe commits and failures cannot poison wake or rearming", async () => {
@@ -604,13 +936,16 @@ for (const fail of [false, true]) {
       timer.arm();
       if (fail) throw new Error("stopped wake callback");
     }, () => { changed++; });
+    // The throwing case's sweep failure is the product's own report: assert it rather than let it reach the log.
+    const reported = spyOn(console, "error").mockImplementation(() => {});
     try {
       await Bun.sleep(fail ? 5_400 : 400);
+      expect(reported.mock.calls).toEqual(fail ? [["[grayboard] claim expiry sweep failed:", new Error("stopped wake callback")]] : []);
       expect(changed).toBe(1);
       expect(woken).toBe(1);
       expect(db.query("SELECT key FROM claims").all()).toEqual([{ key: "second" }]);
       expect(snapshot(db, "sim", "e2e").posts.filter(p => p.body.startsWith("[expired]"))).toHaveLength(1);
-    } finally { timer.stop(); }
+    } finally { timer.stop(); reported.mockRestore(); }
   }, 8_000);
 }
 
@@ -814,7 +1149,7 @@ describe("with a scoped access policy", () => {
   });
 
   // #284 S13: an alias's labels reach only a principal that may act in its
-  // scope, and match runs after that cut. ID facts follow the row.
+  // scope, and match runs after that cut; so do its session's facts (F-12).
   test("a team alias's labels are hidden from a non-member's peer_list and its match", () => {
     db.prepare(
       `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen, task, source_board) VALUES ('eng/x', 'team', 'eng', 'x', 1, 1, 'ENG-142', 'eng')`,
@@ -827,10 +1162,24 @@ describe("with a scoped access policy", () => {
     expect(row("be", "id:00000000000be", { task: "eng-142" })).toBeDefined();
     expect(row("be", "id:00000000000be", { scope: "eng" })).toBeDefined();
     const outsider = row("fe", "id:00000000000fe")!;
-    expect(outsider).toMatchObject({ handle: "eng/x", model: "opus" });
+    expect(outsider).toMatchObject({ handle: "eng/x" });
+    expect(outsider.model).toBeUndefined();
+    expect(row("fe", "id:00000000000fe", { model: "opus" })).toBeUndefined();
     expect(outsider.task).toBeUndefined();
     expect(outsider.source_board).toBeUndefined();
     expect(row("fe", "id:00000000000fe", { task: "ENG-142" })).toBeUndefined();
+  });
+
+  // #373 (S10): one scope check per alias scope in a roster, not one per row.
+  test("peer_list checks each alias scope once per call", () => {
+    for (const n of ["x", "y", "z"]) {
+      db.prepare(`INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen, task) VALUES (?, 'team', 'eng', ?, 1, 1, 'ENG-142')`).run(`eng/${n}`, n);
+    }
+    const checks: string[] = [];
+    setAccess(db, { ...policy, seesAliasMeta: (h, scope) => { checks.push(`${scope.scope_kind}:${scope.scope_ref}`); return policy.seesAliasMeta(h, scope); } });
+    const peers = who(db, "be", { include_offline: true }, () => true, { session: "id:00000000000be" }).peers.filter((p) => p.handle.startsWith("eng/"));
+    expect(peers.map((p) => [p.handle, p.task])).toEqual([["eng/x", "ENG-142"], ["eng/y", "ENG-142"], ["eng/z", "ENG-142"]]);
+    expect(checks.filter((c) => c === "team:eng")).toHaveLength(1);
   });
 
   test("claims hide a board the viewer can't see", () => {
@@ -887,6 +1236,8 @@ test("peer_status queue param is the explicit rotation opt-out; status text neve
   callBoardTool(db, "fe", "peer_status", { text: "", queue: "on" });
   expect(who(db, "be", {}, () => true).peers.find((p) => p.handle === "fe")?.queue_off).toBeUndefined();
   expect(() => callBoardTool(db, "fe", "peer_status", { text: "", queue: "busy" })).toThrow(/queue/);
+  // An ID has no opt-out flag (#284 S13); the refusal names the way out of the rotation it does have (#340 2).
+  expect(() => callBoardTool(db, "id:00000000000fe", "peer_status", { text: "", queue: "off" })).toThrow(`board_subscribe(board, "quiet") to leave that board's rotation`);
 });
 
 // #284 decision 11: a session's facts sit on its ID, an alias's on the alias.
@@ -1048,6 +1399,20 @@ test("a place and an unknown meta key are single bounded lines", () => {
   expect(() => parseAliasMeta({ [key]: "v" })).toThrow(`unknown meta key "k ${"x".repeat(38)}"; known:`);
 });
 
+// #372: bidi controls and zero-width characters go; ZWJ and ZWNJ stay.
+test("oneLine drops bidi controls and zero-width characters but keeps ZWJ and ZWNJ", () => {
+  for (const c of ["\u061c", "\u200e", "\u200f"]) expect(oneLine(`a${c}b`), "bidi mark").toBe("ab");
+  for (const c of ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e"]) expect(oneLine(`a${c}b`), "embedding/override").toBe("ab");
+  for (const c of ["\u2066", "\u2067", "\u2068", "\u2069"]) expect(oneLine(`a${c}b`), "isolate").toBe("ab");
+  for (const c of ["\u200b", "\u2060", "\ufeff"]) expect(oneLine(`a${c}b`), "zero-width").toBe("ab");
+  expect(oneLine("evil\u202eexe.txt")).toBe("evilexe.txt");
+  expect(oneLine(" \u200b a \u200b  b \u2066")).toBe("a b");
+  const family = "\u{1f468}\u200d\u{1f469}\u200d\u{1f467}";
+  expect(oneLine(`team ${family}`)).toBe(`team ${family}`);
+  expect(oneLine("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645")).toBe("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645");
+  expect(cleanPlace("\u202e\u200b")).toBeNull();
+});
+
 // #284 S5 (audit P2): a session's own post is not unread on any of its
 // addresses, whichever one it wrote as.
 test("a post written as one alias is not unread, digested or read back on the session's others", () => {
@@ -1068,4 +1433,15 @@ test("a post written as one alias is not unread, digested or read back on the se
   post(db, "sim", "e2e", "theirs");
   expect(listBoards(db, ["a"])[0]!.unread).toBe(1);
   expect(pendingFor(db, S, { all: true })).toMatchObject([{ kind: "digest", board: "e2e", unread: 1 }]);
+});
+
+// #76: a board purpose and a claim note are one line of status, not storage.
+test("board purpose and claim notes are capped", () => {
+  expect(() => createBoard(db, "be", "long", "p".repeat(501))).toThrow("purpose must be at most 500 chars");
+  createBoard(db, "be", "long", "p".repeat(500));
+  expect(() => claim(db, "be", "ticket:ENG-1", { note: "n".repeat(1001) })).toThrow("note must be at most 1000 chars");
+  expect(claim(db, "be", "ticket:ENG-1", { note: "n".repeat(1000) }).ok).toBe(true);
+  expect(() => release(db, "be", "ticket:ENG-1", "n".repeat(1001))).toThrow("note must be at most 1000 chars");
+  expect(listClaims(db).map((c) => c.key)).toContain("ticket:ENG-1");
+  release(db, "be", "ticket:ENG-1", "done");
 });

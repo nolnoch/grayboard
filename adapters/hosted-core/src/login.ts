@@ -6,7 +6,7 @@
 // rotateRefresh), so a refresh whose outcome is unknown is never retried:
 // its token is revoked and a new sign-in is required.
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -14,15 +14,16 @@ import type { RecordStatus } from "./diagnostics.js";
 import { acquire, LockTimeout, tryAcquire, type Lock } from "./lock.js";
 import { AccessExpired, Refusal, RefreshInProgress, ServerOutdated, type AccessReason } from "./model.js";
 import type { Configuration, CredentialPort, Enrollment } from "./port.js";
-import { readJson, sha256, writeJsonAtomic } from "./storage.js";
+import { FileRefused, readJson, readSmallJson, sha256, writeJsonAtomic } from "./storage.js";
 import { ServerUnreachable } from "./wire.js";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
+import { SIGN_IN_FLOW_MS as FLOW_MS, signInUrl } from "../../../src/shared/signin.ts";
 
 export const SCOPES = "grayboard:tools grayboard:delivery";
-const FLOW_MS = 10 * 60_000;       // the browser round trip's bound
 const REFRESH_MARGIN_MS = 60_000;  // refresh once the access token has less left
 const REFRESH_LOCK_MS = 15_000;    // waiters never take over; they give up
 const WATCH_MS = 2_000;
+const LINK_BYTES = 8_192;          // a link file's cap: an authorization URL is at most 2048
 
 export type LoginConfig = {
   resource: string;   // the hosted MCP URL
@@ -30,9 +31,19 @@ export type LoginConfig = {
   stateDir: string;
   harness: string;    // "pi" | "omp" | "Claude Code", in messages
   loginAction: string; // how this harness signs in, e.g. "run /grayboard login", in AccessExpired
-  present(url: string): void | Promise<void>; // open or show the authorization URL
+  // Open or show the authorization URL. The flow takes the browser's answer
+  // whether or not this has settled; a rejection before that answer ends it.
+  // A session waiting on another's flow gets each distinct URL that flow
+  // shows; a rejection ends its wait the same way. `answered` (own flows
+  // only) aborts once the browser's answer is in, before the code exchange:
+  // a prompt sent after that names a used callback (#506).
+  present(url: string, answered?: AbortSignal): void | Promise<void>;
   notify(message: string): void;              // a sign-in already running in another session of this harness
+  // Operation "login_link": the shared sign-in link file (#581), the user's
+  // concern only; the others may need the model to relay a sign-in.
   diagnostic(record: Omit<RecordStatus, "time">): void;
+  // Test seam: called after each poll of another session's sign-in link.
+  polled?(): void;
 };
 
 // The browser round trip ended without a grant: denied, timed out, a
@@ -121,11 +132,49 @@ const printable = (text: string) => /^[\x20-\x7e]{1,128}$/.test(text) ? text : "
 const escapeHTML = (text: string) => text.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const form = (fields: Record<string, string>) => ({ method: "POST", redirect: "error" as const, headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }, body: new URLSearchParams(fields) });
 
-export class Login {
+// A metadata GET, never carrying a token or following a redirect: an
+// outage (unreachable, timeout, 5xx) is ServerUnreachable, any other non-200 a plain Error.
+async function getJson(url: string, timeoutMs: number): Promise<unknown> {
+  let response: Response;
+  try { response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) }); }
+  catch (error) { throw new ServerUnreachable(error); }
+  // A 429 is the server shedding load (its auth gate answers one to every request from a drained address): an outage, not an answer.
+  if (response.status >= 500 || response.status === 429) { await response.body?.cancel(); throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`)); }
+  if (response.status !== 200) { await response.body?.cancel(); throw new Error(`${url} answered HTTP ${response.status}`); }
+  return response.json();
+}
+// RFC 9728 protected-resource metadata for `resource` (canonical), which must
+// name it exactly. Shared by Login's discovery and static mode's issuer pin.
+export async function resourceMetadata(resource: string, timeoutMs: number): Promise<z.infer<typeof ResourceMetadata>> {
+  const r = new URL(resource);
+  const prm = ResourceMetadata.parse(await getJson(`${r.origin}/.well-known/oauth-protected-resource${r.pathname === "/" ? "" : r.pathname}`, timeoutMs));
+  if (prm.resource !== resource) throw new Error(`Protected resource metadata names ${prm.resource}, expected ${resource}`);
+  return prm;
+}
+
+// What HostedClient, RootDelivery and the hosts use of a sign-in: Login (the
+// browser grant) or static.ts's StaticLogin (a launcher-set run token, #1243).
+// `static` is set only on StaticLogin. `stateKey` keys the local delivery
+// lock and session file in place of the built-in client ID.
+export interface SignIn {
+  readonly resource: string;
+  readonly stateKey: string;
+  readonly static?: { issuer?: string; principal?: string; refused?: string };
+  token(): Promise<string>;
+  unauthorized(token: string): Promise<void>;
+  read(): Promise<{ epoch: string } | undefined>;
+  watch(changed: () => void, intervalMs?: number): { dispose(): void };
+  credential(): CredentialPort<Enrollment>;
+  login(signal?: AbortSignal, ifSignedOut?: boolean): Promise<"signed in" | "current">;
+  logout(): Promise<void>;
+}
+
+export class Login implements SignIn {
   readonly resource: string;
   readonly path: string; // <stateDir>/grants/<sha256(resource + "\n" + clientId)>.json
+  get stateKey(): string { return this.config.clientId; }
   private refreshing?: Promise<string>;
-  private signingIn?: Promise<void>;
+  private signingIn?: Promise<"signed in" | "current">;
   constructor(readonly config: LoginConfig) {
     const resource = canonicalEndpoint(config.resource);
     if (!resource) throw new Error("Grayboard resource must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
@@ -133,6 +182,10 @@ export class Login {
     this.path = join(config.stateDir, "grants", `${sha256(`${this.resource}\n${config.clientId}`)}.json`);
   }
   private get refreshLock() { return `${this.path}.refresh.lock`; }
+  // The lock holder's authorization URL, `{ url, at }`, for the sessions
+  // waiting on its flow to show (#581). It lives only while the login lock is
+  // held: the holder removes it after taking the lock and before releasing it.
+  private get linkPath() { return `${this.path}.login.url`; }
   private expired(reason: AccessReason = "login_required") { return new AccessExpired(this.config.harness, this.config.loginAction, reason); }
 
   // The store as it is now; undefined before the first login. An unreadable
@@ -161,8 +214,17 @@ export class Login {
   // throws AccessExpired when only a new sign-in helps.
   async token(): Promise<string> {
     const s = await this.live();
-    if (s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS) return s.access;
-    return this.refresh();
+    return this.serve(s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS ? s.access : await this.refresh());
+  }
+  // The access token token() last served, and who hears when it changes (#1379): a refresh in this process or
+  // another, or a 401's forced one. The first token served is no change.
+  private served?: string;
+  private readonly rotations = new Set<() => void>();
+  private serve(access: string): string {
+    const was = this.served;
+    this.served = access;
+    if (was !== undefined && was !== access) for (const changed of [...this.rotations]) changed();
+    return access;
   }
   // A 401 for `token`: one forced refresh unless another call already rotated
   // it. Returns when the next token() may succeed, else throws.
@@ -287,21 +349,13 @@ export class Login {
 
   // ---- discovery ----
 
-  private async getJson(url: string, timeoutMs: number): Promise<unknown> {
-    let response: Response;
-    try { response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) }); }
-    catch (error) { throw new ServerUnreachable(error); }
-    if (response.status >= 500) { await response.body?.cancel(); throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`)); }
-    if (response.status !== 200) { await response.body?.cancel(); throw new Error(`${url} answered HTTP ${response.status}`); }
-    return response.json();
-  }
   // RFC 8414 metadata for `issuer`, from the resource's origin like every
   // grayboard endpoint (a resource never sends its tokens elsewhere).
   private async serverMetadata(issuer: string, timeoutMs: number): Promise<ServerMetadata> {
     const at = canonicalEndpoint(issuer), origin = new URL(this.resource).origin;
     if (!at) throw new Error("OAuth issuer must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     if (at.origin !== origin) throw new Error(`OAuth issuer ${issuer} is not on ${origin}`);
-    const meta = ServerMetadata.parse(await this.getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
+    const meta = ServerMetadata.parse(await getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
     if (meta.issuer !== issuer) throw new Error(`OAuth metadata names issuer ${meta.issuer}, expected ${issuer}`);
     for (const endpoint of [meta.authorization_endpoint, meta.token_endpoint, meta.revocation_endpoint]) {
       if (new URL(endpoint).origin !== origin) throw new Error(`OAuth endpoint ${endpoint} is not on ${origin}`);
@@ -311,9 +365,7 @@ export class Login {
   // RFC 9728 protected-resource metadata, then the first authorization
   // server's metadata; refuses a server that lacks this harness's client.
   private async discover(): Promise<ServerMetadata> {
-    const r = new URL(this.resource);
-    const prm = ResourceMetadata.parse(await this.getJson(`${r.origin}/.well-known/oauth-protected-resource${r.pathname === "/" ? "" : r.pathname}`, 10_000));
-    if (prm.resource !== this.resource) throw new Error(`Protected resource metadata names ${prm.resource}, expected ${this.resource}`);
+    const prm = await resourceMetadata(this.resource, 10_000);
     const meta = await this.serverMetadata(prm.authorization_servers[0]!, 10_000);
     if (!meta.code_challenge_methods_supported.includes("S256")) throw new Error("OAuth server does not support PKCE S256");
     if (!meta.grayboard_builtin_clients?.includes(this.config.clientId)) throw new ServerOutdated(this.config.harness);
@@ -328,11 +380,13 @@ export class Login {
   // started; an automatic one (ifSignedOut: it started because a token
   // request found no grant) also returns once the store holds a live grant,
   // however long ago it landed, so two processes signed out together prompt once.
-  login(signal?: AbortSignal, ifSignedOut = false): Promise<void> {
+  // "current" when it found that grant without running or waiting on a flow:
+  // nothing happened here to report.
+  login(signal?: AbortSignal, ifSignedOut = false): Promise<"signed in" | "current"> {
     this.signingIn ??= this.signIn(signal, ifSignedOut).finally(() => { this.signingIn = undefined; });
     return this.signingIn;
   }
-  private async signIn(signal: AbortSignal | undefined, ifSignedOut: boolean): Promise<void> {
+  private async signIn(signal: AbortSignal | undefined, ifSignedOut: boolean): Promise<"signed in" | "current"> {
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const before = (await this.read())?.epoch;
     const lockPath = `${this.path}.login.lock`;
@@ -340,18 +394,82 @@ export class Login {
     const waited = !lock;
     if (!lock) {
       this.config.notify(`sign-in in progress in another ${this.config.harness} session`);
-      lock = await acquire(lockPath, { deadlineMs: FLOW_MS + 60_000, ...(signal ? { signal } : {}) });
+      lock = await this.waitFor(lockPath, signal);
     }
     try {
+      // A link a crashed holder left names a closed callback.
+      await this.unlink();
       const now = await this.read();
       // A waiter shares whatever grant the store holds once it gets the lock.
       if (waited) {
-        if (live(now)) return;
+        if (live(now)) return "signed in";
         throw new LoginFailed(`sign-in in another ${this.config.harness} session ended without signing in`);
       }
-      if (live(now) && (ifSignedOut || now.epoch !== before)) return;
+      if (live(now) && ifSignedOut) return "current";
+      if (live(now) && now.epoch !== before) return "signed in";
       await this.flow(signal);
+      return "signed in";
     } finally { lock.release(); }
+  }
+  // Waits for the login lock, presenting each distinct URL the holder shows
+  // that has an authorization URL's shape on this resource's origin. Read only
+  // while the lock is held, so a crashed holder's leftover can show only in
+  // the instant before the next holder removes it, and that holder's own URL
+  // then supersedes it. A presentation is started, never awaited: a prompt
+  // still open must not stall the retry; one that rejects ends the wait.
+  private async waitFor(lockPath: string, signal: AbortSignal | undefined): Promise<Lock> {
+    const origin = new URL(this.resource).origin;
+    const seen = new Set<string>();
+    let refused = false, failure: { error: unknown } | undefined;
+    const stop = new AbortController();
+    // Said once per flow, naming the failed check, never the file's text.
+    const refuse = (why: string) => {
+      if (!refused) this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login_link", code: "refused" });
+      refused = true;
+    };
+    const onBusy = async () => {
+      try { await this.poll(seen, origin, refuse, error => { failure ??= { error }; stop.abort(); }); }
+      finally { this.config.polled?.(); }
+    };
+    try {
+      return await acquire(lockPath, { deadlineMs: FLOW_MS + 60_000, signal: signal ? AbortSignal.any([signal, stop.signal]) : stop.signal, onBusy });
+    } catch (error) {
+      if (failure) throw failure.error;
+      throw error;
+    }
+  }
+  // One poll: reads the link file, bounded (it is in a dir only this user
+  // writes, but a FIFO or a huge file there must not stall the wait), and
+  // presents a URL not seen before.
+  private async poll(seen: Set<string>, origin: string, refuse: (why: string) => void, failed: (error: unknown) => void): Promise<void> {
+    let raw: unknown;
+    // A parse error's message may quote the file, so only its kind is said.
+    try { raw = await readSmallJson(this.linkPath, LINK_BYTES); }
+    catch (error) {
+      refuse(error instanceof SyntaxError ? "the link file isn't JSON" : error instanceof FileRefused ? `the link file ${error.message}` : `the link file is unreadable (${String((error as { code?: unknown }).code ?? "error")})`);
+      return;
+    }
+    // No file: the holder hasn't reached its URL yet.
+    if (raw === undefined) return;
+    const text = raw && typeof raw === "object" && "url" in raw && typeof raw.url === "string" ? raw.url : undefined;
+    if (text === undefined) { refuse("the link file holds no URL"); return; }
+    if (seen.has(text)) return;
+    seen.add(text);
+    const checked = signInUrl(text);
+    const why = "failed" in checked ? checked.failed : checked.url.origin !== origin ? "not on this server's origin" : undefined;
+    if (why || !("url" in checked)) { refuse(why ?? "not a sign-in link"); return; }
+    const presented = Promise.resolve().then(() => this.config.present(checked.url.href));
+    presented.catch(failed);
+  }
+  // Writes this flow's URL for the waiters; a write that fails is said and
+  // the flow goes on: waiters then say only that a sign-in is in progress.
+  private async share(url: string): Promise<void> {
+    try { await writeJsonAtomic(this.linkPath, { url, at: Date.now() }); }
+    catch (error) { this.config.diagnostic({ state: "degraded", message: `Couldn't share the sign-in link with other ${this.config.harness} sessions (${failureCause(error, 0)}); they say only that a sign-in is in progress`, operation: "login_link", code: "operation_failed" }); }
+  }
+  private async unlink(): Promise<void> {
+    try { await rm(this.linkPath, { force: true }); }
+    catch (error) { this.config.diagnostic({ state: "degraded", message: `Couldn't remove the shared sign-in link (${failureCause(error, 0)}); other ${this.config.harness} sessions may show a link whose sign-in ended`, operation: "login_link", code: "operation_failed" }); }
   }
   private async flow(outer: AbortSignal | undefined): Promise<void> {
     const meta = await this.discover();
@@ -359,14 +477,25 @@ export class Login {
     const signal = AbortSignal.any([AbortSignal.timeout(FLOW_MS), ...(outer ? [outer] : [])]);
     const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url");
     const callback = await this.callback(state, signal);
+    const answered = new AbortController();
     let params: URLSearchParams;
     try {
       const url = new URL(meta.authorization_endpoint);
       url.search = new URLSearchParams({ response_type: "code", client_id: this.config.clientId, redirect_uri: callback.redirectUri, scope: SCOPES, resource: this.resource, state,
         code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }).toString();
-      await this.config.present(url.href);
-      params = await callback.result;
-    } finally { callback.close(); }
+      await this.share(url.href);
+      // A prompt the user never answers (or a host that shows it late) must
+      // not hold a browser answer that already came back (#497).
+      const presented = Promise.resolve().then(() => this.config.present(url.href, answered.signal));
+      presented.catch(() => {});
+      params = await Promise.race([presented.then(() => callback.result), callback.result]);
+    } finally {
+      answered.abort();
+      // Before the callback closes: only a waiter's read already in flight
+      // can still show a link whose callback is gone.
+      await this.unlink();
+      callback.close();
+    }
     // RFC 9207: the response names its issuer, so a mix-up can't land here.
     const iss = params.get("iss");
     if ((meta.authorization_response_iss_parameter_supported || iss !== null) && iss !== meta.issuer) throw new LoginFailed("sign-in response came from an unexpected issuer");
@@ -500,6 +629,11 @@ export class Login {
       },
       token: async e => { await check(e); return this.token(); },
       unauthorized: async (e, token) => { await check(e); await this.unauthorized(token); },
+      rotated: (_e, changed) => {
+        const listener = () => changed();
+        this.rotations.add(listener);
+        return { dispose: () => { this.rotations.delete(listener); } };
+      },
     };
   }
 }

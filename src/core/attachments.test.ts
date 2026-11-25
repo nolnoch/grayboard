@@ -21,7 +21,7 @@ import {
   type BlobStore,
   type Uploader,
 } from "./attachments.ts";
-import { SqliteBlobs } from "../local/blobs.ts";
+import { ATTACHMENT_BYTES_SQL, SqliteBlobs } from "../local/blobs.ts";
 import { createBoard, pendingFor, post, prunePosts, read, subscribe } from "./boards.ts";
 import { TooLargeError } from "./errors.ts";
 import { callBoardTool } from "./tools.ts";
@@ -280,6 +280,7 @@ describe("reading files to attach", () => {
     await expect(saveTarget(join(root, ".claude/rules"), [root], "b")).rejects.toThrow("dot directories");
     expect(() => checkSaveDir(join(root, ".claude"), [root], root)).toThrow("dot directories");
     expect(checkSaveDir("docs", [root], root)).toBe(join(root, "docs"));
+    expect(await saveTarget("docs", [root], "b", {}, root)).toBe(join(root, "docs"));
     expect(readdirSync(join(root, ".claude", "rules"))).toEqual([]);
   });
 
@@ -319,6 +320,7 @@ describe("concurrent writers", () => {
     db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     db.exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, recipient TEXT)`);
     initCoreSchema(db);
+    db.exec(ATTACHMENT_BYTES_SQL);
     const holder = Bun.spawn(
       [
         process.execPath,
@@ -353,6 +355,7 @@ describe("storage", () => {
     // Each mode brings its own messages table; this is the shape the store needs.
     db.exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, recipient TEXT)`);
     initCoreSchema(db);
+    db.exec(ATTACHMENT_BYTES_SQL);
     blobs = new SqliteBlobs(db);
     createBoard(db, "be", "e2e", "fixtures");
   });

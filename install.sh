@@ -13,20 +13,22 @@
 # Server install (one-deployment-per-org):
 #   curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh \
 #     | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
-#   → also installs `grayboard-server`, the release's deploy files (the systemd unit,
+#   → also installs `grayboard-server` and `grayboard-inspect` (the read-only database
+#     viewer, kept in step with the server's schema), the release's deploy files (the systemd unit,
 #     the Caddyfile, and `grayboard-backup` beside the binaries; each verified against
 #     the signed SHA256SUMS like the binaries), then, if the grayboard systemd unit
 #     runs that binary, restarts it and waits for /healthz to report the installed release
 #
 # Overrides:
 #   GRAYBOARD_VERSION=v2.0.0   pin a release (default: latest); a release
-#                              published before signing has no SHA256SUMS and
-#                              needs its own install.sh
+#                              published before signing has no SHA256SUMS, and a
+#                              server install of one older than grayboard-inspect
+#                              (#608) finds no line for it; each needs its own install.sh
 #   INSTALL_DIR=/some/path     install dir   (default: ~/.local/bin)
 #   GRAYBOARD_REPO=fork/repo   alternate repo
 #   GRAYBOARD_RELEASES_URL=https://mirror.example.com
 #                              serves github.com's release paths instead of github.com
-#   INSTALL_SERVER=1           also fetch grayboard-server and the deploy files
+#   INSTALL_SERVER=1           also fetch grayboard-server, grayboard-inspect and the deploy files
 #   GRAYBOARD_NO_DEPLOY=1      with INSTALL_SERVER=1, skip the deploy files
 #   GRAYBOARD_DEPLOY_REPLACE=1 replace a unit or Caddyfile that differs from the release's
 #                              (default: keep it and say so); the old one is kept as <file>.prev.
@@ -119,16 +121,13 @@ binary_sum() {
   esac
 }
 
-# The digest the release's API response lists for asset $2 ($1 = the release's
-# API URL). GitHub's JSON is line-oriented, so split objects onto lines and
+# The digest the release's API response lists for asset $2 ($1 = the saved
+# response). GitHub's JSON is line-oriented, so split objects onto lines and
 # take the digest that follows the asset's name. api.github.com pretty-prints
 # ("name": "x"), mirrors may serve compact ("name":"x"): the patterns allow
 # either. Validated against the live API before use (#173).
 asset_digest() {
-  # awk reads to EOF: an early exit would SIGPIPE curl or tr on a large
-  # response, and pipefail would turn that into a missing digest.
-  curl "${CURL_LIMITS[@]}" -fsSL -H "Accept: application/vnd.github+json" "$1" \
-    | tr ',{}' '\n' \
+  tr ',{}' '\n' < "$1" \
     | awk -v name="$2" '
         /"name":/ { seen = ($0 ~ "\"name\": ?\"" name "\"") }
         seen && !found && /"digest":/ { sub(/.*"digest": ?"/, ""); sub(/".*/, ""); print; found = 1 }
@@ -160,7 +159,7 @@ deploy=0
 deploy_skip=""
 deploy_assets=(deploy-grayboard.service deploy-Caddyfile deploy-backup.sh)
 if [ "$INSTALL_SERVER" = "1" ]; then
-  bins+=(grayboard-server)
+  bins+=(grayboard-server grayboard-inspect)
   if [ "${GRAYBOARD_NO_DEPLOY:-0}" = "1" ]; then
     deploy_skip="GRAYBOARD_NO_DEPLOY=1 was set"
   elif ! command -v systemctl >/dev/null 2>&1; then
@@ -172,6 +171,12 @@ fi
 
 # Inside INSTALL_DIR, so each final mv is a rename on one filesystem.
 mkdir -p "$INSTALL_DIR"
+# A killed install skips its EXIT trap and leaves its staging dir (#317).
+# Remove ones untouched for an hour, so an install running alongside keeps its own.
+find "$INSTALL_DIR" -maxdepth 1 -type d -name '.grayboard-install.*' -user "$(id -u)" -mmin +60 2>/dev/null |
+  while IFS= read -r stale; do
+    rm -rf -- "$stale" && echo "grayboard: removed ${stale}, left by an interrupted install"
+  done || true
 tmp="$(mktemp -d "${INSTALL_DIR}/.grayboard-install.XXXXXX")"
 # Deploy files are staged beside their destinations (see plan); a refusal or a
 # crash before the commit leaves those staged copies for this trap to remove.
@@ -186,15 +191,26 @@ trap cleanup EXIT
 
 refuse() { echo "grayboard: $*; not installing." >&2; exit 1; }
 
-# fetch <asset> <file in tmp>
+# What an origin may send, so a broken or hostile one is refused by name
+# rather than filling memory or INSTALL_DIR's disk (#316). The same bounds as
+# src/cli/update.ts.
+MAX_SUMS=65536
+MAX_API=4194304
+MAX_ASSET=536870912
+
+# fetch <asset> <file in tmp> <max bytes>
 fetch() {
   echo "grayboard: downloading ${base_url}/$1"
-  curl "${CURL_LIMITS[@]}" -fsSL -o "${tmp}/$2" "${base_url}/$1" || refuse "couldn't download ${base_url}/$1"
+  local rc=0
+  curl "${CURL_LIMITS[@]}" --max-filesize "$3" -fsSL -o "${tmp}/$2" "${base_url}/$1" || rc=$?
+  # 63: curl's "maximum file size exceeded", stated or as it streamed.
+  [ "$rc" -ne 63 ] || refuse "$1 from ${base_url} is larger than $3 bytes"
+  [ "$rc" -eq 0 ] || refuse "couldn't download ${base_url}/$1"
 }
 
 # SHA256SUMS.sig is one line: the signing key's id and the base64 DER signature.
-fetch SHA256SUMS SHA256SUMS
-fetch SHA256SUMS.sig SHA256SUMS.sig
+fetch SHA256SUMS SHA256SUMS "$MAX_SUMS"
+fetch SHA256SUMS.sig SHA256SUMS.sig "$MAX_SUMS"
 # Parsed as strictly as src/shared/release_verify.ts: exactly that line, at
 # most one trailing newline.
 sigline="$(cat "${tmp}/SHA256SUMS.sig")"
@@ -222,18 +238,26 @@ sums_bad="$(awk '
 tagline="$(head -n 1 "${tmp}/SHA256SUMS")"
 [ "$tagline" = "# grayboard ${VERSION}" ] || refuse "SHA256SUMS is signed for ${tagline#\# grayboard }, not ${VERSION}"
 
+# The release API response, read once for every asset's digest. A failed
+# fetch leaves it empty, so each asset is then refused for want of a digest.
+api_rc=0
+curl "${CURL_LIMITS[@]}" --max-filesize "$MAX_API" -fsSL -H "Accept: application/vnd.github+json" "$release_api" \
+  > "${tmp}/release.json" || api_rc=$?
+[ "$api_rc" -ne 63 ] || refuse "the release API response from ${release_api} is larger than ${MAX_API} bytes"
+[ "$api_rc" -eq 0 ] || : > "${tmp}/release.json"
+
 # verified <asset> <file in tmp>: download $1 only once SHA256SUMS and the
 # release API both list a sha256 for it, then require the file to match both.
 verified() {
   local asset="$1" want_sum want_api got
   want_sum="$(awk -v n="$asset" 'NR > 1 && $2 == n { print $1 }' "${tmp}/SHA256SUMS")"
   [[ "$want_sum" =~ ^[0-9a-f]{64}$ ]] || refuse "${asset}: SHA256SUMS lists no sha256"
-  want_api="$(asset_digest "$release_api" "$asset")" || want_api=""
+  want_api="$(asset_digest "${tmp}/release.json" "$asset")" || want_api=""
   case "$want_api" in
     sha256:????????????????????????????????????????????????????????????????) ;;
     *) refuse "${asset}: the release API lists no sha256 digest" ;;
   esac
-  fetch "$asset" "$2"
+  fetch "$asset" "$2" "$MAX_ASSET"
   got="$(binary_sum "${tmp}/$2")"
   [ "$got" = "$want_sum" ] || refuse "${asset}: sha256 ${got}, but SHA256SUMS lists ${want_sum}"
   [ "$got" = "${want_api#sha256:}" ] || refuse "${asset}: sha256 ${got}, but the release API lists ${want_api}"
@@ -280,6 +304,13 @@ plan() {
   if [ -L "$dest" ]; then
     outcome=kept
     echo "grayboard: kept ${dest}: it is a symlink (a masked or linked file); replace it by hand to take the release's ${what}"
+    return 0
+  fi
+  # A directory there isn't a file this install placed: renaming the staged
+  # file onto it would land inside it (#396).
+  if [ -d "$dest" ]; then
+    outcome=kept
+    echo "grayboard: kept ${dest}: it is a directory, not a ${what}; move it aside and rerun to take the release's"
     return 0
   fi
   if [ -e "$dest" ]; then
@@ -362,6 +393,12 @@ if [ "$unit_out" = "installed" ] || [ "$unit_out" = "replaced" ]; then
 elif [ -n "$unit_out" ] && [ "$(systemctl show -p NeedDaemonReload --value grayboard 2>/dev/null)" = "yes" ]; then
   need_reload=1
 fi
+# systemctl with no systemd running (a container): it reports "offline", and
+# a reload could only fail after the files were placed (#396).
+if [ "$need_reload" = "1" ] && [ "$(systemctl is-system-running 2>/dev/null)" = "offline" ]; then
+  need_reload=0
+  echo "grayboard: systemd isn't running here, so ${unit_dest} was written without a daemon-reload"
+fi
 if [ "$need_reload" = "1" ]; then
   systemctl daemon-reload || {
     echo "grayboard: systemctl daemon-reload failed after writing ${unit_dest} (run as root?)." >&2
@@ -434,9 +471,9 @@ elif [ "$unit_new" = "1" ]; then
     kept) echo "Your ${caddy_dest} was kept, not the release's. To take the release's: rerun with GRAYBOARD_DEPLOY_REPLACE=1 (the old one is kept as .prev), set your hostname in it, and reload Caddy." ;;
     *) echo "Set your hostname in ${caddy_dest}." ;;
   esac
-  echo "Create /etc/grayboard/env (GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL, GRAYBOARD_ORG_DOMAIN,"
-  echo "GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET), then \`systemctl enable --now grayboard\`."
-  echo "For nightly backups, schedule ${backup_dest} (README §7, Backups)."
+  echo "Create /etc/grayboard/env (GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL, and the sign-in provider's"
+  echo "variables: Google's, Okta's or OIDC's, docs/guide/server.md §3), then \`systemctl enable --now grayboard\`."
+  echo "For nightly backups, schedule ${backup_dest} (docs/guide/server.md §6, Backups)."
 elif [ "$INSTALL_SERVER" = "1" ]; then
   echo "Server binary installed; systemd runs no grayboard unit from it. A server already running"
   echo "from this binary keeps the old version until you restart it."
@@ -444,7 +481,7 @@ elif [ "$INSTALL_SERVER" = "1" ]; then
     echo "The unit, Caddyfile and backup script were not installed: ${deploy_skip}. For a new server,"
     echo "install them on a systemd host (rerun without GRAYBOARD_NO_DEPLOY=1, or take the deploy-*"
     echo "assets from the release), then create /etc/grayboard/env with GRAYBOARD_DB_PATH,"
-    echo "GRAYBOARD_PUBLIC_URL, GRAYBOARD_ORG_DOMAIN, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET."
+    echo "GRAYBOARD_PUBLIC_URL and the sign-in provider's variables (docs/guide/server.md §3)."
   fi
 elif [ "${GRAYBOARD_NO_SETUP:-0}" != "1" ] && [ -t 1 ] && (: < /dev/tty) 2>/dev/null; then
   # Under `curl | bash`, stdin is this script; setup asks its questions on the terminal.

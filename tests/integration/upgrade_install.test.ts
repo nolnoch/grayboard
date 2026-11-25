@@ -16,12 +16,13 @@ import { buildCli } from "../support/build.ts";
 import { runCli, type CliResult } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { sign, signSums, testInstallSh, testKey, testKeys } from "../support/release_keys.ts";
-import { ReleaseServer, type SignedOverride } from "../support/release_server.ts";
+import { ReleaseServer } from "../support/release_server.ts";
 import { previousRelease, releaseBinaries, signedRelease } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { TestServer } from "../support/server.ts";
 import { copyFileSync } from "node:fs";
 import { RELEASE_KEYS } from "../../src/shared/release_keys.ts";
+import { claudeHooks } from "../../src/cli/claude_hooks.ts";
 
 const ASSET = `grayboard-${TARGET}`;
 const TAG = `v${pkg.version}`;
@@ -116,18 +117,16 @@ function expectRegistered(server?: string): void {
     expect(existsSync(join(home, ".claude", "settings.json"))).toBe(false);
   } else {
     expect(argv).toEqual(["claude mcp remove --scope user grayboard", `claude mcp add --scope user grayboard -- ${exe} mcp`]);
-    expect(json(".claude", "settings.json").hooks.SessionStart).toEqual([
-      { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
-    ]);
+    expect(json(".claude", "settings.json").hooks).toEqual(claudeHooks([exe]));
   }
   if (server) {
     // opencode reaches a server only through its hosted entry (setup-opencode), which setup doesn't write (#282).
     expect(existsSync(join(home, ".config", "opencode", "opencode.json"))).toBe(false);
     expect(existsSync(join(home, ...ADAPTERS.opencode))).toBe(false);
   } else {
-    // Disabled: the opencode and local pi adapters serve the tools and read their command here.
+    // Disabled: the opencode and local omp and pi adapters serve the tools and read their command here.
     expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
-    for (const harness of ["omp", "opencode", "pi"] as const) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(adapterSource(harness));
+    for (const harness of ["omp", "opencode", "pi"] as const) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(harness === "omp" ? adapterBundle("omp", "local") : adapterSource(harness));
   }
   if (server) {
     for (const [harness, dot] of [["omp", ".omp"], ["pi", ".pi"]] as const) {
@@ -138,8 +137,7 @@ function expectRegistered(server?: string): void {
       expect(json(dot, "agent", "grayboard", "config.json"), harness).toEqual({ url: `${server}/mcp` });
     }
   } else {
-    expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"] });
-    expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
+    for (const dot of [".omp", ".pi"]) expect(json(dot, "agent", "mcp.json").mcpServers.grayboard, dot).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
     for (const dot of [".omp", ".pi"]) expect(existsSync(join(home, dot, "agent", "extensions", "grayboard.js")), dot).toBe(false);
   }
 }
@@ -154,6 +152,7 @@ test("install.sh installs the latest release; setup --local registers it with ev
   writeOldEntries(realpathSync(join(bin, "grayboard")), { GRAYBOARD_X: "1" });
   const out = await expectOk(grayboard("setup", "-y", "--local"));
   expect(out).toContain("Using local mode.");
+  expect(out).toContain(`The repo's name (in ~/code/api, "api") is suggested first. To bind a name at start, set BUS_IDENTITY in the launch command.`);
   expect(out).toContain(`Registered in ${join(home, ".config", "opencode", "opencode.json")} (disabled: the plugin serves the tools)`);
   expect(out).toContain(`Registered in ${join(home, ".pi", "agent", "mcp.json")} (disabled: the extension serves the tools)`);
   expectRegistered();
@@ -162,7 +161,7 @@ test("install.sh installs the latest release; setup --local registers it with ev
 
 test("setup --server keeps the sign-in at mode 600; logout truncates it; setup --local removes it", async () => {
   label = "setup-server-logout";
-  srv = new TestServer();
+  srv = await TestServer.open();
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
   await expectOk(install({ GRAYBOARD_VERSION: TAG }));
   await expectOk(grayboard("login", "--dev", "you@example.com", "--server", srv.base));
@@ -171,6 +170,9 @@ test("setup --server keeps the sign-in at mode 600; logout truncates it; setup -
   const setup = await expectOk(grayboard("setup", "-y", "--server", srv.base));
   expect(setup).toContain(`Signed in to ${srv.base} as you@example.com.`);
   expect(setup).toContain(`grayboard setup-opencode --url ${srv.base}/mcp`);
+  // The closing tip (#544 item 5): no repo-name suggestion on a server, and OpenCode's start name is setup-opencode's.
+  expect(setup).toContain("To bind a name at start, set BUS_IDENTITY in the launch command (OpenCode: grayboard setup-opencode --name).");
+  expect(setup).not.toContain("is suggested first");
   expectRegistered(srv.base);
 
   await expectOk(grayboard("logout"));
@@ -197,7 +199,7 @@ test("update verifies the signed SHA256SUMS and the API digest before replacing 
     copyFileSync(v0, join(bin, "grayboard"));
     chmodSync(join(bin, "grayboard"), 0o755);
   };
-  const serve = (asset: string, opts: { digests?: Record<string, Record<string, string>>; signed?: Record<string, SignedOverride> } = {}) => {
+  const serve = (asset: string, opts: ConstructorParameters<typeof ReleaseServer>[3] = {}) => {
     releases?.stop();
     releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: asset } }, opts);
   };
@@ -214,6 +216,10 @@ test("update verifies the signed SHA256SUMS and the API digest before replacing 
     ["a binary that doesn't match SHA256SUMS", () => serve(v0, { signed: { [TAG]: good } }), "but SHA256SUMS lists"],
     ["an API digest that doesn't match", () => serve(built, { digests: { [TAG]: { [ASSET]: `sha256:${"0".repeat(64)}` } } }), `but the release API lists sha256:${"0".repeat(64)}`],
     ["a signed binary that doesn't report the tag", () => serve(v0), `reports '0.0.0', not ${TAG}`],
+    // #316: a broken or hostile origin is refused by name before it fills memory.
+    ["an oversized SHA256SUMS", () => serve(built, { signed: { [TAG]: { sums: "x".repeat(64 * 1024 + 1) } } }), "is larger than 65536 bytes"],
+    ["a binary larger than the API lists", () => serve(built, { sizes: { [TAG]: { [ASSET]: 1024 } } }), "is larger than 1024 bytes"],
+    ["an API size over the binary cap", () => serve(built, { sizes: { [TAG]: { [ASSET]: 512 * 1024 * 1024 + 1 } } }), `the release API lists ${ASSET} at ${512 * 1024 * 1024 + 1} bytes, over ${512 * 1024 * 1024}`],
     // Checked before the tag reaches a URL or the temp file's name.
     ["a latest tag that isn't a release tag", () => {
       releases?.stop();
@@ -289,20 +295,75 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   writeFileSync(join(dir, "checkout.ts"), "// mine");
   symlinkSync(join(dir, "checkout.ts"), opencode);
   // Their entries stay as they are: the checkout's adapter, or none, is what reads them.
-  writeOldEntries(realpathSync(join(bin, "grayboard")));
+  const exe = realpathSync(join(bin, "grayboard"));
+  writeOldEntries(exe);
   const entries = [json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")];
+  // omp's enabled entry from before #523, when omp's client served its tools: its adapter now reads it, disabled.
+  const ompMcp = join(home, ".omp", "agent", "mcp.json");
+  writeFileSync(ompMcp, JSON.stringify({ mcpServers: { grayboard: { command: exe, args: ["mcp"] } } }));
+  // Claude Code set up before #551: the user-scope entry and the title hook alone, beside a hook of the user's.
+  const own = { matcher: "Bash", hooks: [{ type: "command", command: "~/.claude/hooks/bash.sh" }] };
+  writeFileSync(join(home, ".claude.json"), JSON.stringify({ mcpServers: { grayboard: { type: "stdio", command: exe, args: ["mcp"] } } }));
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ hooks: { SessionStart: [{ matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] }], PreToolUse: [own] } }));
 
   const out = await expectOk(grayboard("update"));
   expect(out).toContain(`Updated grayboard ${old.tag.slice(1)} → ${TAG} from ${releases.url}`);
   expect(out).toContain(`Refreshed ${omp}`);
   expect(releases.requests).toEqual(expect.arrayContaining([`GET /repos/${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
   expect((await expectOk(grayboard("--version"))).trim()).toBe(pkg.version);
-  expect(readFileSync(omp, "utf8")).toBe(adapterSource("omp"));
+  expect(readFileSync(omp, "utf8")).toBe(adapterBundle("omp", "local"));
   expect(lstatSync(opencode).isSymbolicLink()).toBe(true);
   expect(readlinkSync(opencode)).toBe(join(dir, "checkout.ts"));
   expect(existsSync(join(home, ...ADAPTERS.pi))).toBe(false);
   expect([json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")]).toEqual(entries);
-  expect(out).not.toContain("Disabled the grayboard entry");
+  expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
+  expect(out.match(/Disabled the grayboard entry in .*/g)).toEqual([`Disabled the grayboard entry in ${ompMcp} (the adapter serves the tools)`]);
+  expect(out).toContain(`Installed grayboard's hooks in ${join(home, ".claude", "settings.json")}`);
+  const hooks = claudeHooks([exe]);
+  expect(json(".claude", "settings.json").hooks).toEqual({ ...hooks, PreToolUse: [own, ...hooks.PreToolUse!] });
+}, 60_000);
+
+// The plugin's pin merges after the release, so an update that finds the CLI
+// current still updates the plugin, and compares the marketplace's pin, the
+// installed plugin and the CLI (#511).
+test("update with the CLI already current still updates an enabled Claude Code plugin, and says when its pin hasn't merged", async () => {
+  label = "update-current-plugin";
+  releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
+  await expectOk(install({ GRAYBOARD_VERSION: TAG }));
+  mkdirSync(join(home, ".grayboard"), { recursive: true });
+  writeFileSync(CREDENTIALS(), JSON.stringify({ server: "http://127.0.0.1:9", session_token: "t", user_email: "you@example.com" }), { mode: 0o600 });
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "grayboard@grayboard": true } }));
+  // The marketplace's checkout holds the catalog; the stub lists it and reports the installed version from a file.
+  const market = join(dir, "marketplace");
+  const pin = (ref: string, installed: string) => {
+    mkdirSync(join(market, ".claude-plugin"), { recursive: true });
+    writeFileSync(join(market, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "grayboard", plugins: [{ name: "grayboard", source: { source: "git-subdir", ref } }] }));
+    writeFileSync(join(dir, "installed"), installed);
+  };
+  writeFileSync(join(dir, "stubs", "claude"), `#!/bin/sh\necho "claude $*" >> "${join(dir, "argv.log")}"\n` +
+    `[ "$*" = "plugin marketplace list --json" ] && echo '[{"name":"grayboard","source":"github","installLocation":"${market}"}]'\n` +
+    `[ "$*" = "plugin list --json" ] && echo "[{\\"id\\":\\"grayboard@grayboard\\",\\"version\\":\\"$(cat "${join(dir, "installed")}")\\",\\"scope\\":\\"user\\"}]"\nexit 0\n`);
+  const argv = () => {
+    const lines = readFileSync(join(dir, "argv.log"), "utf8").trim().split("\n");
+    rmSync(join(dir, "argv.log"));
+    return lines;
+  };
+  const steps = ["claude plugin marketplace update grayboard", "claude plugin update grayboard@grayboard", "claude plugin marketplace list --json", "claude plugin list --json"];
+
+  // The release published; its pin hasn't merged, so the plugin stays a release behind.
+  pin("v0.0.1", "0.0.1");
+  const before = await expectOk(grayboard("update"));
+  expect(before).toContain(`grayboard ${pkg.version} is the latest release (${releases.url})`);
+  expect(argv()).toEqual(steps);
+  expect(before).toContain(`The marketplace pins the plugin at 0.0.1, older than this grayboard (${pkg.version}): the plugin pin for ${TAG} hasn't merged into the marketplace yet.`);
+  // The pin merged: the next update, with the CLI still current, brings the plugin to it.
+  pin(TAG, pkg.version);
+  const after = await expectOk(grayboard("update"));
+  expect(after).toContain(`grayboard ${pkg.version} is the latest release`);
+  expect(argv()).toEqual(steps);
+  expect(after).not.toContain("The marketplace pins");
 }, 60_000);
 
 test("refresh-adapters disables the grayboard entry of each adapter it rewrites, once", async () => {

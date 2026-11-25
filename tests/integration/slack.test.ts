@@ -82,6 +82,19 @@ test("an agent's DM becomes a Slack thread; the reply reaches only that agent, m
   expect(follow.thread_ts).toBe(threadTs);
 }, 30_000);
 
+// #428: the thread maps to a session ID with no alias; once that session ends, a reply in its thread is told so in plain
+// words, not in the bus's ID-and-alias refusal.
+test("a reply in the thread of a session that ended with no alias says the reply wasn't sent, in plain words", async () => {
+  const anon = await localSession(dir, undefined, { extra: slackVars() });
+  await startBridge();
+  await call(anon.c, "dm_send", { to: "alex", body: "anyone?" });
+  const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("anyone?")));
+  await stopSession(anon.c);
+  slack.say("still there?", { thread_ts: slackTsOf(top) });
+  const bounce = await until(() => slack.posts().find((p) => p.thread_ts === slackTsOf(top) && p.markdown_text?.startsWith("⚠️")));
+  expect(bounce.markdown_text).toMatch(/^⚠️ Your reply wasn't sent: the agent session this thread was with has ended \(\d{4}-\d\d-\d\dT[\d:.]+Z\), so replies here reach nobody\. Start a new message to a named agent instead\.$/);
+}, 30_000);
+
 test("two agents asking at once get separate threads that don't cross", async () => {
   const be = await agent("be");
   const fe = await agent("fe");
@@ -159,6 +172,35 @@ test("top-level @handle and #board start conversations; mistakes get an answer",
   const stray = slack.say("in a thread nobody knows", { thread_ts: "1.000000" });
   expect((await until(() => slack.posts().find((p) => p.thread_ts === "1.000000"))).markdown_text).toContain("isn't connected");
   await until(() => slack.acks.includes(stray.envelope));
+}, 30_000);
+
+// #332: a post whose @id: names a session that can't receive is refused whole (#284 S9); the human sees why in the
+// Slack thread, both for a new #board post and for a reply in a mapped board thread.
+test("a post mentioning an ended @id: is refused, and the refusal reaches the Slack thread", async () => {
+  const be = await agent("be");
+  const sim = await agent("sim");
+  const { id } = await call(sim.c, "whoami");
+  await stopSession(sim.c);
+  await startBridge();
+  await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
+  const ended = new RegExp(`^⚠️ not posted: ${id} ended at \\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z; it held \`sim\`$`);
+
+  const top = slack.say(`#e2e ping @${id}`);
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === top.ts))).markdown_text).toMatch(ended);
+  await until(() => slack.acks.includes(top.envelope));
+  // An id that never existed reads as the org bridge words it (#779): the detail, no bus code.
+  const unknown = slack.say("#e2e ping @id:0123456789abz");
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === unknown.ts))).markdown_text).toBe("⚠️ not posted: no session id:0123456789abz");
+
+  const root = await call(be.c, "board_post", { board: "e2e", body: "@alex who owns the soak?" });
+  const p1 = await until(() => slack.posts().find((p) => p.markdown_text?.includes("who owns the soak")));
+  slack.say(`ask @${id}`, { thread_ts: slackTsOf(p1) });
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === slackTsOf(p1) && p.markdown_text?.startsWith("⚠️")))).markdown_text).toMatch(ended);
+
+  // Nothing reached the board.
+  const thread = await call(be.c, "board_read", { board: "e2e", thread: root.post_id });
+  expect(thread.posts.map((p: any) => p.body)).toEqual(["@alex who owns the soak?"]);
+  expect((await call(be.c, "board_read", { board: "e2e" })).posts.some((p: any) => p.body.includes("@id:"))).toBe(false);
 }, 30_000);
 
 test("only the owner's new messages are relayed; duplicates once; every envelope acked", async () => {
@@ -274,8 +316,9 @@ test("a Slack file that can't come along refuses the whole message, in its threa
     "⚠️ not sent: file blob.bin: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text",
   );
   expect(await answer("@be big", [slack.host("big.png", PNG, { size: 11 * 1024 * 1024 })])).toBe("⚠️ not sent: file big.png: 11MB exceeds the 10MB limit per file");
-  // What Slack serves an app without files:read is its sign-in page, not the file.
+  // An app without files:read gets 403 from Slack, or (as Slack once did) its sign-in page, not the file (#626).
   expect(await answer("@be scoped", [slack.host("x.png", PNG, { size: 5 })])).toMatch(/^⚠️ not sent: file x\.png: Slack didn't serve it \(does the app have files:read/);
+  expect(await answer("@be denied", [slack.host("y.png", PNG, { forbidden: true })])).toMatch(/^⚠️ not sent: file y\.png: Slack didn't serve it \(does the app have files:read/);
   expect(await answer("@be many", Array.from({ length: 6 }, (_, i) => slack.host(`${i}.md`, "x")))).toBe("⚠️ not sent: at most 5 attachments per message");
   expect(await answer("new #docs specs", [slack.host("a.md", "x")])).toBe('⚠️ not created: files don\'t come along when making a board; make #docs first, then post them with "#docs …"');
   expect(be.pushes).toEqual([]);

@@ -3,7 +3,8 @@
 // fragment, and nothing a parser could read two ways (controls, spaces, a
 // backslash, percent-encoding). Callers add their own path rules. Runs under
 // Node too: the pi and omp bundles import it through hosted-core.
-const LOOPBACK = new Set(["127.0.0.1", "[::1]", "localhost"]);
+/** The hosts HTTP is allowed on: loopback. */
+export const LOOPBACK: ReadonlySet<string> = new Set(["127.0.0.1", "[::1]", "localhost"]);
 
 export function canonicalEndpoint(raw: string): URL | undefined {
   if (typeof raw !== "string" || raw.length > 2048 || /[\x00-\x20\x7f\\%?#]/.test(raw)) return undefined;
@@ -12,4 +13,21 @@ export function canonicalEndpoint(raw: string): URL | undefined {
   if (u.protocol !== "https:" && !(u.protocol === "http:" && LOOPBACK.has(u.hostname))) return undefined;
   if (u.username || u.password || u.search || u.hash) return undefined;
   return u;
+}
+
+// An issuer pin, compared verbatim with the server's protected-resource
+// metadata (static mode, #1326): the endpoint rule, and only a string the
+// server's own issuer rule (`oauthPublicUrl`, src/server/oauth-config.ts) can
+// advertise, so a launcher's typo is refused at launch, not at enrollment as a
+// pin mismatch. That is exactly `new URL`'s own serialisation of it, with an
+// explicit default port (`:443`, or `:80` on loopback HTTP), which the server
+// keeps in its issuer; no trailing `/` (the server strips it, so `https://host`
+// is the bare host's pin) and no `//` in the path. Anything `new URL` rewrites
+// (case, `https:host`, `https:///host`, empty userinfo, a numeric or IDN host,
+// dot segments) is refused.
+export function issuerEndpoint(raw: string): URL | undefined {
+  const u = canonicalEndpoint(raw);
+  if (!u || raw.endsWith("/") || u.pathname.includes("//")) return undefined;
+  const portless = raw.replace(/^(https:\/\/[^/]+):443(?=\/|$)/, "$1").replace(/^(http:\/\/[^/]+):80(?=\/|$)/, "$1");
+  return u.href === portless || (u.pathname === "/" && u.href === `${portless}/`) ? u : undefined;
 }

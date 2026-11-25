@@ -1,105 +1,302 @@
 // Board access for the distributed server, evaluated for the acting address
-// through the Resolver (#284 S12). Open boards (scope null) are visible to
+// through the Resolver (#284 S12), every read on the caller's handle (boardAccess). Open boards (scope null) are visible to
 // any address with a principal; "team:<name>" boards to that team's own
-// aliases and to its members' addresses. A session bound to `eng/x` acts as
-// eng: it sees eng's boards, not its binder's other teams'. Installed on the
-// database by openDatabase, so every core call is checked.
-import { addressParts, type ScopeKind } from "../core/addresses.ts";
-import type { Access, Board, CoreDb } from "../core/boards.ts";
+// aliases and to its members' addresses; "service:<name>" boards (#270 D5) to
+// the service and the principals holding service_invoke on it, directly or
+// through a team. A session bound to `eng/x` acts as eng: it sees eng's boards,
+// not its binder's other teams', and a service's only by eng's own binding.
+// The server installs no synchronous core Access (#807 P3 C10d2-a): its session end is composed over the Repo's
+// groups (session_end.ts), so no server path runs core's synchronous checks.
+import { addressParts, type AliasScope } from "../core/addresses.ts";
+import type { Board } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
-import { ownScope, type Principal } from "../core/resolver.ts";
-import { undeliverableId } from "../core/session_end.ts";
+import type { Principal } from "../core/resolver.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
-import { reachesHuman, type HumanReach } from "./can_send.ts";
+import { authorize, serviceOfScope, type ActScope, type HumanReach } from "./policy.ts";
 import type { Repo } from "./db.ts";
+import type { Read, Tx } from "./store/tx.ts";
 
-function teamOf(scope: string | null): string | null {
+export function teamOf(scope: string | null): string | null {
   return scope?.startsWith("team:") ? scope.slice(5) : null;
 }
 
-// Whether principal p may act in a scope: bind an alias there, or write as
-// one (#284 S9). Null when it may; else why not. Keyed by principal, not by
-// email: a user acts in its own person scope and in the teams it belongs to.
-// Service scopes, and service principals acting anywhere, wait for #270's
-// grants.
-export function mayActIn(repo: Repo, p: Principal, scope: { scope_kind: ScopeKind; scope_ref: string }): string | null {
-  const ref = scope.scope_ref;
-  if (scope.scope_kind === "service" || p.kind === "service") return "service principals arrive with #270";
-  if (p.kind !== "user") return `${p.name} is a ${p.kind}, not a user`;
-  if (scope.scope_kind === "person") return ref === p.name ? null : `${ref}'s scope isn't ${p.name}'s`;
-  const userId = repo.principals.findByName(p.name)?.user_id;
-  const team = repo.teams.findByName(ref);
-  return userId != null && team && repo.teams.isMember(team.id, userId) ? null : `${p.name} isn't a member of team ${ref}`;
+// Whether principal p may be a lane on `board` (#270 D5): on a service's board only the service's own addresses
+// consume, so an invoker subscribed in push mode never takes work meant for the service; any board else, anyone who
+// may see it.
+export function laneOf(p: Principal | null, board: Board): boolean {
+  const service = serviceOfScope(board.scope);
+  return service === null || (p?.kind === "service" && p.name === service);
 }
 
-// Board visibility is the principal's: an org board is everyone's, a team
-// board its team's and members'. canSee resolves an address to this.
-export function principalCanSee(repo: Repo, p: Principal, board: Board): boolean {
-  if (board.scope === null) return true;
-  const team = teamOf(board.scope);
-  if (team === null) return false;
-  return p.kind === "team" ? p.name === team : mayActIn(repo, p, { scope_kind: "team", scope_ref: team }) === null;
+// The scope a board the actor creates gets (#270 D5): a team's when named; else a queue board a service's address
+// creates is the service's, implicitly, with no tool argument (principle 2: every session would pay for one); any
+// other board is org-open.
+export function createScope(p: Principal | null, team: string | undefined, kind: string | undefined): string | null {
+  if (team) return `team:${team.toLowerCase()}`;
+  return p?.kind === "service" && kind === "queue" ? `service:${p.name}` : null;
 }
 
-export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "team"): Access {
-  // Whether p acts inside team `teamName`: the team itself, or a member.
-  const inTeam = (p: Principal, teamName: string): boolean =>
-    p.kind === "team" ? p.name === teamName : mayActIn(repo, p, { scope_kind: "team", scope_ref: teamName }) === null;
+// checkCreate's ruling on a service scope: only that service may create in it. Never a read: a scope that names no
+// service is refused the same way, without saying whether one exists.
+export function serviceCreate(p: Principal | null, scope: string): string | null | undefined {
+  const service = serviceOfScope(scope);
+  if (service === null) return undefined;
+  return p?.kind === "service" && p.name === service ? null : `invalid board scope "${scope}"`;
+}
 
-  const canSee = (handle: string, board: Board): boolean => {
-    const p = repo.resolver.principalOf(handle);
-    return !!p && principalCanSee(repo, p, board);
+// ── async board access (#807 P3 B5a0) ────────────────────────────────────────
+// The server's one board access (board-access-parity.test.ts holds it equal to the synchronous oracle the server
+// installed until #807 P3 C10d2-a, now tests/support/sync_access.ts) with every read on the caller's handle: a
+// write body's `Tx` sees the body's own rows (a member just added, D2), `repo.read` committed state. The board and
+// claim ports and the session end (server/session_end.ts) take it. The batch forms answer what core asks once per recipient
+// or scope (post's subscribers, who's rows): canSeeMany, visibleTo and the scope tables with one decision per distinct
+// principal or scope, mayReachMany per distinct address; resolveMentions still decides per token.
+
+// An alias scope as a map key: seesAliasScopes' and seesAliasMetaScopes' answers are keyed by it.
+export type AliasScopeOf = Omit<AliasScope, "name">;
+export const scopeKey = (s: AliasScopeOf): string => JSON.stringify([s.scope_kind, s.scope_ref]);
+
+// core's ownScope on the caller's handle: an alias's own scope, or the principal an ID acts for; null for anything
+// else. A bare name means this scope's alias of that name.
+// The address a session's ID acts as on a scoped board (#270 D6, #1255) and for a service's names: its session's
+// primary, the oldest hold, else a tools-only session's writes_as name, else the ID itself (its user). A session bound
+// only to `eng/w-1` then sees eng's boards, not its binder's other teams', and holds a service's right only by eng's
+// binding, on every route (MCP, HTTP), as its ID or as its name alike, and for seeing a board as for posting on it
+// (D5: one right). An org board is everyone's; a team's or person's names are judged for the ID's user (#348).
+export async function idActsAs(repo: Repo, r: Read, id: string): Promise<string> {
+  const holds = await repo.bindings.holdsOf(r, id);
+  return holds[0] ?? (await repo.bindings.idRow(r, id))?.writes_as ?? id;
+}
+
+// The principal `handle` is judged as on `board`: an ID on a scoped board as idActsAs's address, else its own.
+// Not async itself: an org board costs the one read it always did, with no added tick.
+function seerOn(repo: Repo, r: Read, handle: string, board: Board): Promise<Principal | null> {
+  return seerIn(repo, r, handle, board.scope !== null);
+}
+
+// The principal `handle` is judged as for a scoped board or a service's names (`scoped`: an ID as idActsAs's address,
+// #1255), or for anything else (its own). A service's names are seen as its board is (alias.see_service): one right.
+export function seerIn(repo: Repo, r: Read, handle: string, scoped: boolean): Promise<Principal | null> {
+  if (!scoped || addressParts(handle)?.kind !== "id") return repo.principals.of(r, handle);
+  return idActsAs(repo, r, handle).then((a) => repo.principals.of(r, a));
+}
+
+export async function ownScopeOn(repo: Repo, r: Read, address: string): Promise<string | null> {
+  const a = addressParts(address);
+  if (a?.kind === "alias") return a.scope;
+  return a?.kind === "id" ? (await repo.principals.of(r, address))?.name ?? null : null;
+}
+
+export interface BoardAccess {
+  canSee(r: Read, handle: string, board: Board): Promise<boolean>;
+  // Of `handles`, those that may see `board`: one decision per distinct principal.
+  canSeeMany(r: Read, handles: string[], board: Board): Promise<Set<string>>;
+  // Of `boards`, the names a viewer (an address, or a principal already read) may see; none for an address with no
+  // principal.
+  visibleTo(r: Read, viewer: string | Principal, boards: Board[]): Promise<Set<string>>;
+  checkCreate(r: Read, handle: string, scope: string | null): Promise<string | null>;
+  // Of `handles`, those that may be a lane on `board` (#270 D5): on a service's board, the service's own addresses.
+  lanesAmong(r: Read, handles: string[], board: Board): Promise<Set<string>>;
+  // The scope a board `handle` creates gets (createScope).
+  createScope(r: Read, handle: string, team: string | undefined, kind: string | undefined): Promise<string | null>;
+  // Takes a Tx: an @id: is judged by repo.sessionEnd.refusal, the send side of an end's race (D3).
+  resolveMention(tx: Tx, token: string, author: string, board: Board, strict: boolean, viewer?: string): Promise<string | null>;
+  // core's resolveMentions over tokens already parsed (mentionTokens): a token resolves when its handle may see the board.
+  resolveMentions(tx: Tx, tokens: string[], author: string, board: Board, strict: boolean, viewer: string): Promise<{ handles: string[]; unresolved: string[] }>;
+  mayReach(r: Read, from: string, to: string): Promise<boolean>;
+  mayReachMany(r: Read, from: string, tos: string[]): Promise<Set<string>>;
+  seesAlias(r: Read, handle: string, scope: AliasScopeOf): Promise<boolean>;
+  // Per scopeKey: one decision per distinct scope, the viewer's principal read once.
+  seesAliasScopes(r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>>;
+  seesAliasMeta(r: Read, handle: string, scope: AliasScopeOf): Promise<boolean>;
+  seesAliasMetaScopes(r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>>;
+  sameUser(r: Read, human: string, address: string): Promise<boolean>;
+  ownerOf(r: Read, address: string): Promise<string | null>;
+  // core Access.userSees: whether a claimant's user, by its principal's name, may see `board` itself (#1286).
+  userSees(r: Read, user: string, board: Board): Promise<boolean>;
+}
+
+export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardAccess {
+  const actsIn = async (r: Read, p: Principal, scope: ActScope) => (await authorize(repo, r, {}, { verb: "scope.act", principal: p, scope })).allow;
+  const reaches = async (r: Read, from: string, to: string) => (await authorize(repo, r, { humanReach }, { verb: "human.reach", from, to })).allow;
+  // A principal viewer's rule: an unscoped board, a service board it may invoke, or a team board it acts in.
+  const principalSees = async (r: Read, p: Principal, board: Board): Promise<boolean> => {
+    if (board.scope === null) return true;
+    const service = serviceOfScope(board.scope);
+    if (service !== null) return (await authorize(repo, r, {}, { verb: "service.invoke", principal: p, service, board: board.name })).allow;
+    const team = teamOf(board.scope);
+    if (team === null) return false;
+    return p.kind === "team" ? p.name === team : actsIn(r, p, { scope_kind: "team", scope_ref: team });
+  };
+  const canSeeMany = async (r: Read, handles: string[], board: Board): Promise<Set<string>> => {
+    const out = new Set<string>();
+    const byPrincipal = new Map<string, boolean>();
+    for (const h of new Set(handles)) {
+      const p = await seerOn(repo, r, h, board);
+      if (p === null) continue;
+      const k = `${p.kind}\0${p.name}`;
+      let v = byPrincipal.get(k);
+      if (v === undefined) byPrincipal.set(k, v = await principalSees(r, p, board));
+      if (v) out.add(h);
+    }
+    return out;
+  };
+  const canSee = async (r: Read, handle: string, board: Board) => (await canSeeMany(r, [handle], board)).has(handle);
+  // seesAlias's rule for a principal already read: a person's names are the open directory.
+  const seesAliasOf = async (r: Read, p: Principal | null, scope: AliasScopeOf): Promise<boolean> => {
+    if (scope.scope_kind === "person") return true;
+    if (p === null || scope.scope_ref === null) return false;
+    return (await authorize(repo, r, {}, { verb: "alias.see", principal: p, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
+  };
+  // A team principal acts in its own team's scope and no other (scope.act is a user's verb), as principalSees rules.
+  const seesMetaOf = async (r: Read, p: Principal | null, scope: AliasScopeOf): Promise<boolean> => {
+    if (p === null || scope.scope_ref === null) return false;
+    if (p.kind === "team") return scope.scope_kind === "team" && p.name === scope.scope_ref;
+    return actsIn(r, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
+  };
+  // `primary`: which scope kinds judge an ID as its session's primary (seerIn) rather than its user.
+  const byScope = (rule: (r: Read, p: Principal | null, s: AliasScopeOf) => Promise<boolean>, primary: (kind: AliasScopeOf["scope_kind"]) => boolean) =>
+    async (r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>> => {
+      const out = new Map<string, boolean>();
+      if (!scopes.length) return out;
+      const p = await repo.principals.of(r, viewer);
+      // The ID's primary, read once and only when a scope asks for it.
+      let onPrimary: Principal | null | undefined;
+      for (const s of scopes) {
+        const k = scopeKey(s);
+        if (out.has(k)) continue;
+        const q = primary(s.scope_kind) ? (onPrimary === undefined ? (onPrimary = await seerIn(repo, r, viewer, true)) : onPrimary) : p;
+        out.set(k, await rule(r, q, s));
+      }
+      return out;
+    };
+
+  // A service's names, to an ID, are judged as its board is (#270 D4); a team's names for the ID's user, as #348
+  // decided (name sight is the user's). A scoped alias's labels (task, source_board, description, status) are judged
+  // as its scope's boards are (#1255): they can name a board, so a session bound to `eng/x` sees qa's names but not
+  // their labels.
+  const namesAsPrimary = (kind: AliasScopeOf["scope_kind"]) => kind === "service";
+  const metaAsPrimary = (kind: AliasScopeOf["scope_kind"]) => kind !== "person";
+  const resolveMention = async (tx: Tx, token: string, author: string, board: Board, strict: boolean, viewer: string = author): Promise<string | null> => {
+    const t = addressParts(token);
+    if (!t || t.kind === "team") return null;
+    if (t.kind === "id") {
+      const why = await repo.sessionEnd.refusal(tx, t.address);
+      if (why && strict) throw why;
+      return why ? null : t.address;
+    }
+    const reach = async (h: string) => (await canSee(tx, h, board)) && reaches(tx, author, h);
+    if (t.kind === "alias") return (await repo.aliases.find(tx, t.address)) && (await reach(t.address)) ? t.address : null;
+    const scope = await ownScopeOn(repo, tx, author);
+    const own = scope ? `${scope}/${t.name}` : null;
+    if (own && (await repo.aliases.find(tx, own))) return own;
+    if (t.name === HUMAN_NAME) return null;
+    if (!strict) return null;
+    // Only names the posting session may see exist (#348).
+    const named = await repo.aliases.findAllByName(tx, t.name);
+    const seen = await byScope(seesAliasOf, namesAsPrimary)(tx, viewer, named);
+    const roster: string[] = [];
+    for (const a of named) if (seen.get(scopeKey(a)) && (await reach(a.address))) roster.push(a.address);
+    if (roster.length) throw new CoreError(`@${t.name} isn't in your scope; name it in full: ${roster.join(", ")}`);
+    return null;
   };
 
   return {
     canSee,
+    canSeeMany,
 
-    // An alias's labels reach only a principal that may act in its scope
-    // (#284 S13): a team's task or private board name stays inside the team.
-    seesAliasMeta(handle, scope) {
-      const p = repo.resolver.principalOf(handle);
-      return p !== null && scope.scope_ref !== null && mayActIn(repo, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref }) === null;
+    async visibleTo(r, viewer, boards) {
+      const p = typeof viewer === "string" ? await repo.principals.of(r, viewer) : viewer;
+      const out = new Set<string>();
+      if (p === null) return out;
+      // An ID's principal on a scoped board (seerOn), read once and only when one is among `boards`.
+      let scoped: Principal | null | undefined;
+      const byScope = new Map<string | null, boolean>();
+      for (const b of boards) {
+        let v = byScope.get(b.scope);
+        if (v === undefined) {
+          let q: Principal | null = p;
+          if (typeof viewer === "string" && b.scope !== null) q = scoped === undefined ? (scoped = await seerOn(repo, r, viewer, b)) : scoped;
+          byScope.set(b.scope, v = q !== null && (await principalSees(r, q, b)));
+        }
+        if (v) out.add(b.name);
+      }
+      return out;
     },
 
-    // No server #announce yet (#24): a team board named announce stays ordinary.
-    announceBoard: null,
+    async lanesAmong(r, handles, board) {
+      if (serviceOfScope(board.scope) === null) return new Set(handles);
+      const out = new Set<string>();
+      for (const h of new Set(handles)) if (laneOf(await repo.principals.of(r, h), board)) out.add(h);
+      return out;
+    },
 
-    checkCreate(handle, scope) {
+    async createScope(r, handle, team, kind) {
+      return createScope(team ? null : await repo.principals.of(r, handle), team, kind);
+    },
+
+    async checkCreate(r, handle, scope) {
       if (scope === null) return null;
+      const svc = serviceCreate(await repo.principals.of(r, handle), scope);
+      if (svc !== undefined) return svc;
       const team = teamOf(scope);
       if (team === null) return `invalid board scope "${scope}"`;
-      if (!repo.teams.findByName(team)) return `no such team "${team}"`;
-      const p = repo.resolver.principalOf(handle);
-      return p && inTeam(p, team) ? null : `you're not a member of team "${team}"`;
+      // A team reads as missing to a non-member (#1020): one refusal for both.
+      const missing = `no such team "${team}"`;
+      if (!(await repo.teams.findByName(r, team))) return missing;
+      const p = await repo.principals.of(r, handle);
+      if (p === null) return missing;
+      const inTeam = p.kind === "team" ? p.name === team : await actsIn(r, p, { scope_kind: "team", scope_ref: team });
+      return inTeam ? null : missing;
     },
 
-    // The grammar of #284 decision 16 (S13): @id:… is the session itself (a
-    // strict post refuses one that can't receive); @scope/name is that alias
-    // exactly; a bare @name is the author's own scope's first, then the one
-    // alias of that name on the board's roster. A strict post refuses an
-    // ambiguous bare name, naming the candidates; a system post leaves it
-    // unresolved. A bare @human is only ever your own.
-    resolveMention(token, author, board, strict) {
-      const t = addressParts(token);
-      if (!t || t.kind === "team") return null;
-      if (t.kind === "id") {
-        const why = undeliverableId(db, t.address);
-        if (why && strict) throw why;
-        return why ? null : t.address;
+    resolveMention,
+
+    async resolveMentions(tx, tokens, author, board, strict, viewer) {
+      const handles = new Set<string>();
+      const unresolved: string[] = [];
+      for (const t of tokens) {
+        const h = await resolveMention(tx, t, author, board, strict, viewer);
+        if (h && (await canSee(tx, h, board))) handles.add(h);
+        else unresolved.push(t);
       }
-      const reach = (h: string) => canSee(h, board) && reachesHuman(repo, humanReach, author, h);
-      if (t.kind === "alias") return repo.aliases.find(t.address) && reach(t.address) ? t.address : null;
-      const scope = ownScope(repo.resolver, author);
-      const own = scope ? `${scope}/${t.name}` : null;
-      if (own && repo.aliases.find(own)) return own;
-      if (t.name === HUMAN_NAME) return null;
-      const roster = repo.aliases.findAllByName(t.name).map((i) => i.address).filter(reach);
-      if (roster.length === 1) return roster[0]!;
-      if (roster.length > 1 && strict) throw new CoreError(`@${t.name} matches ${roster.join(", ")}; name one`);
-      return null;
+      return { handles: [...handles], unresolved };
     },
 
-    // A thread reply reaches a human only as far as a DM could.
-    mayReach: (from, to) => reachesHuman(repo, humanReach, from, to),
+    mayReach: reaches,
+
+    async mayReachMany(r, from, tos) {
+      const out = new Set<string>();
+      for (const to of new Set(tos)) if (await reaches(r, from, to)) out.add(to);
+      return out;
+    },
+
+    seesAlias: async (r, handle, scope) => seesAliasOf(r, scope.scope_kind === "person" ? null : await seerIn(repo, r, handle, scope.scope_kind === "service"), scope),
+    seesAliasScopes: byScope(seesAliasOf, namesAsPrimary),
+    seesAliasMeta: async (r, handle, scope) => seesMetaOf(r, await seerIn(repo, r, handle, metaAsPrimary(scope.scope_kind)), scope),
+    seesAliasMetaScopes: byScope(seesMetaOf, metaAsPrimary),
+
+    // A human archives only boards its own user's addresses created (#848).
+    async sameUser(r, human, address) {
+      const h = await repo.principals.of(r, human), a = await repo.principals.of(r, address);
+      return h?.kind === "user" && a?.kind === "user" && h.name === a.name;
+    },
+
+    async ownerOf(r, address) {
+      const p = await repo.principals.of(r, address);
+      return p?.kind === "user" ? p.name : null;
+    },
+
+    async userSees(r, user, board) {
+      const p = await userPrincipal(repo, r, user);
+      return p !== null && (await principalSees(r, p, board));
+    },
   };
+}
+
+// A claimant's user (#855) as its own principal, by name, for userSees and the gate of its end post (#1286); null
+// for a name no principal has.
+export async function userPrincipal(repo: Repo, r: Read, user: string): Promise<Principal | null> {
+  const row = await repo.principals.findByName(r, user);
+  return row ? { kind: row.kind, name: row.name } : null;
 }

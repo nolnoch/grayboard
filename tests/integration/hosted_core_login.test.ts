@@ -21,8 +21,10 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { accessAudits } from "../support/audit.ts";
 import { browse as browseConsent } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
+import { stubProvider } from "../support/stub_provider.ts";
 
 const CLIENT = "grayboard-pi";
 const FIXTURE = join(import.meta.dir, "../../adapters/hosted-core/tests/fixtures/login-client.ts");
@@ -35,7 +37,7 @@ let onRefresh: Hook | undefined;
 async function forward(req: IncomingMessage, body: Buffer): Promise<Response> {
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string" && !["host", "connection", "content-length"].includes(k)) headers.set(k, v);
-  return fetch(new URL(req.url!, target), { method: req.method, headers, body: body.length ? body : undefined, redirect: "manual" });
+  return fetch(new URL(req.url!, target), { method: req.method, headers, body: body.length ? new Uint8Array(body) : undefined, redirect: "manual" });
 }
 async function relay(upstream: Response, res: ServerResponse) {
   const headers: Record<string, string | string[]> = {};
@@ -74,10 +76,10 @@ beforeEach(async () => {
   stateDir = join(dir, "state");
   refreshes = 0; onRefresh = undefined;
   await startProxy();
-  app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
+  app = startServer({ store: { kind: "sqlite" as const, path: join(dir, "db.sqlite") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
-    hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [],
-  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice" }) } });
+    hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, hostedSubscriberLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [],
+  }, { hostname: "127.0.0.1", background: false, oauth: { providers: [stubProvider(async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }))] } });
   target = `http://127.0.0.1:${app.server.port}`;
   resource = app.oauth.resource;
 });
@@ -102,21 +104,22 @@ function login(overrides: Partial<LoginConfig> = {}): Login & { seen: Recorder }
 // A store holding a real grant, its access token already expired locally so
 // the next token() refreshes.
 async function seed(options: { scopes?: string[]; access?: string; expiresIn?: number; clientId?: string; refresh?: string } = {}) {
-  const issued = issueOAuth(app.repo, resource, "alice@example.com", options.scopes ?? ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
+  const issued = await issueOAuth(app.repo, resource, "alice@example.com", options.scopes ?? ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
   const store: GrantStore = { version: 1, resource, clientId: options.clientId ?? CLIENT, epoch: "seeded", issuer, scope: (options.scopes ?? ["grayboard:delivery", "grayboard:tools"]).join(" "),
     access: options.access ?? issued.token, accessExpiresAt: Date.now() + (options.expiresIn ?? -1_000), refresh: options.refresh ?? issued.refreshToken };
   await writeJsonAtomic(login({ clientId: store.clientId }).path, store);
   return { ...issued, store };
 }
-const audits = (action: string) => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM access_log WHERE action = ?").get(action)!.n;
+const audits = (action: string) => accessAudits(app.db, action).length;
 const grants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ?").get(CLIENT)!.n;
 const liveGrants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ? AND revoked_at IS NULL").get(CLIENT)!.n;
 // The client's fetch, with the requests `answer` picks answered here: a
 // Response to return or an Error to throw; undefined sends the request.
-async function withFetch<T>(answer: (url: string, form: URLSearchParams | undefined) => Response | Error | undefined, run: () => Promise<T>): Promise<T> {
+type Answer = Response | Error | undefined;
+async function withFetch<T>(answer: (url: string, form: URLSearchParams | undefined) => Answer | Promise<Answer>, run: () => Promise<T>): Promise<T> {
   const fetch0 = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const outcome = answer(input instanceof Request ? input.url : String(input), init?.body instanceof URLSearchParams ? init.body : undefined);
+    const outcome = await answer(input instanceof Request ? input.url : String(input), init?.body instanceof URLSearchParams ? init.body : undefined);
     if (outcome instanceof Error) throw outcome;
     return outcome ?? fetch0(input, init);
   }) as typeof fetch;
@@ -177,19 +180,193 @@ test("a denied consent fails the login and writes nothing", async () => {
   expect(grants()).toBe(0);
 });
 
-test("two concurrent login() calls in two processes create one grant", async () => {
+test("the browser's answer ends the flow while present() is still pending; a present() that rejects first ends it (#497)", async () => {
+  // A prompt the user never answers, with the link opened from elsewhere.
+  const l = login({ present: url => { void browse(url); return new Promise<void>(() => {}); } });
+  await l.login();
+  expect(await l.token()).toBe((await l.read())!.access!);
+  // A declined prompt, with no browser.
+  const declined = login({ present: async () => { throw new LoginFailed("sign-in declined"); } });
+  await expect(declined.login()).rejects.toThrow("sign-in declined");
+});
+
+test("two concurrent login() calls in two processes create one grant; the waiter shows the holder's link (#581)", async () => {
   const a = spawn("login"), b = spawn("login");
-  const presented = await Promise.race([a.next(l => !!l.present), b.next(l => !!l.present)]);
-  const waiter = a.lines.some(l => l.present) ? b : a;
+  // The waiter is the one that found the lock held.
+  const waiter = await Promise.race([a.next(l => !!l.notify).then(() => a), b.next(l => !!l.notify).then(() => b)]);
+  const holder = waiter === a ? b : a;
   expect((await waiter.next(l => !!l.notify)).notify).toBe("sign-in in progress in another pi session");
-  await browse(presented.present!);
+  const url = (await holder.next(l => !!l.present)).present!;
+  expect((await waiter.next(l => !!l.present)).present).toBe(url);
+  const shared = `${login().path}.login.url`;
+  expect((await Bun.file(shared).stat()).mode & 0o777).toBe(0o600);
+  // Opened from the waiter's line: the holder's callback completes it.
+  await browse(url);
   const [ra, rb] = [outcomes(await a.finished()), outcomes(await b.finished())];
   expect(ra).toHaveLength(1); expect(rb).toHaveLength(1);
   expect(ra[0]!.ok).toBeString();
   expect(rb[0]!.ok).toBe(ra[0]!.ok!);
-  expect([...a.lines, ...b.lines].filter(l => l.present)).toHaveLength(1);
+  expect([...a.lines, ...b.lines].filter(l => l.present).map(l => l.present)).toEqual([url, url]);
+  expect(await Bun.file(shared).exists()).toBe(false);
   expect(grants()).toBe(1);
 }, 30_000);
+
+// ---- a waiter shows the holder's link (#581) ----
+
+// An authorization URL on the resource's origin that no flow made.
+const planted = (tag: string) => `${new URL(resource).origin}/oauth/authorize?state=${tag}`;
+const plant = (l: Login, url: string) => writeJsonAtomic(`${l.path}.login.url`, { url, at: Date.now() });
+
+test("in one process: a waiter presents the holder's link, and the link is gone once the flow ends", async () => {
+  let link: string | undefined;
+  const holder = login({ present: url => { link = url; return new Promise<void>(() => {}); } });
+  const waiter = login();
+  const held = holder.login();
+  await until(() => !!link, 10_000, "holder's link");
+  const waited = waiter.login();
+  await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+  expect(waiter.seen.presented).toEqual([link!]);
+  expect(waiter.seen.notices).toEqual(["sign-in in progress in another pi session"]);
+  await browse(waiter.seen.presented[0]!);
+  await held; await waited;
+  expect(await Bun.file(`${holder.path}.login.url`).exists()).toBe(false);
+  expect(waiter.seen.presented).toEqual([link!]);
+  expect(grants()).toBe(1);
+});
+
+test("the link file is gone once the browser answers, before the code exchange (#592)", async () => {
+  const l = login({ present: async url => { await browse(url); } });
+  let linked: boolean | undefined;
+  await withFetch(async (_url, form) => {
+    if (form?.get("grant_type") === "authorization_code") linked = await Bun.file(`${l.path}.login.url`).exists();
+    return undefined;
+  }, () => l.login());
+  expect(linked).toBe(false);
+  expect(grants()).toBe(1);
+});
+
+test("present's answered signal aborts once the browser answers, before the code exchange (#506)", async () => {
+  let answered: AbortSignal | undefined;
+  const l = login({ present: async (url, signal) => { answered = signal; expect(signal?.aborted).toBe(false); await browse(url); } });
+  let atExchange: boolean | undefined;
+  await withFetch(async (_url, form) => {
+    if (form?.get("grant_type") === "authorization_code") atExchange = answered?.aborted;
+    return undefined;
+  }, () => l.login());
+  expect(atExchange).toBe(true);
+  expect(grants()).toBe(1);
+});
+
+test("a leftover link from a crashed holder is removed by the next holder before its discovery, so a waiter polling then never presents it", async () => {
+  let link: string | undefined;
+  const holder = login({ present: url => { link = url; return new Promise<void>(() => {}); } });
+  await plant(holder, planted("leftover"));
+  // The holder's discovery waits until released: it holds the lock with no URL of its own yet.
+  const { promise: discovered, resolve: discover } = Promise.withResolvers<void>();
+  await withFetch(async url => { if (url.includes("/.well-known/oauth-protected-resource")) await discovered; return undefined; }, async () => {
+    const held = holder.login();
+    await until(async () => !(await Bun.file(`${holder.path}.login.url`).exists()), 10_000, "the leftover removed under the lock");
+    const waiter = login();
+    const waited = waiter.login();
+    await until(() => waiter.seen.notices.length === 1, 10_000, "waiter notice");
+    discover();
+    await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+    expect(waiter.seen.presented).toEqual([link!]);
+    await browse(link!);
+    await held; await waited;
+    expect(waiter.seen.presented).toEqual([link!]);
+  });
+});
+
+test("a link file that isn't JSON is said once as such, never quoted, and a later valid link is still presented", async () => {
+  const waiter = login();
+  await Bun.write(`${waiter.path}.login.url`, "{not json state=secret");
+  const held = tryAcquire(`${waiter.path}.login.lock`)!;
+  const waited = waiter.login();
+  await until(() => waiter.seen.diagnostics.some(d => d.code === "refused"), 10_000, "the refusal");
+  const refusals = waiter.seen.diagnostics.filter(d => d.code === "refused");
+  expect(refusals).toHaveLength(1);
+  expect(refusals[0]!.message).toContain("the link file isn't JSON");
+  expect(refusals[0]!.message).not.toContain("secret");
+  await plant(waiter, planted("valid"));
+  await until(() => waiter.seen.presented.length === 1, 10_000, "the valid link presented");
+  expect(waiter.seen.presented).toEqual([planted("valid")]);
+  expect(waiter.seen.diagnostics.filter(d => d.code === "refused")).toHaveLength(1);
+  held.release();
+  await expect(waited).rejects.toBeInstanceOf(LoginFailed);
+});
+
+test("threat boundary: a same-user writer of the 0700 store dir can show a same-origin link to a waiter while a holder is in discovery", async () => {
+  const waiter = login();
+  await plant(waiter, planted("same-user"));
+  const held = tryAcquire(`${waiter.path}.login.lock`)!;
+  const waited = waiter.login();
+  await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+  expect(waiter.seen.presented).toEqual([planted("same-user")]);
+  held.release();
+  await expect(waited).rejects.toBeInstanceOf(LoginFailed);
+});
+
+test("a link of another origin, with credentials or over 2048 is never presented; each flow says the first refusal once, without the link", async () => {
+  const cases = [
+    { url: "https://elsewhere.example/oauth/authorize?state=x", check: "not on this server's origin" },
+    { url: `${new URL(resource).protocol}//user:pw@${new URL(resource).host}/oauth/authorize?state=x`, check: "carries credentials" },
+    { url: `${planted("long")}${"x".repeat(2048)}`, check: "longer than 2048" },
+  ];
+  for (const { url, check } of cases) {
+    let polls = 0;
+    const waiter = login({ polled: () => { polls++; } });
+    await plant(waiter, url);
+    const held = tryAcquire(`${waiter.path}.login.lock`)!;
+    const waited = waiter.login();
+    await until(() => waiter.seen.diagnostics.length === 1, 10_000, "refusal said");
+    // A second refusal in the same flow isn't said again: two more polls
+    // finish after the plant, so at least one read it.
+    await plant(waiter, `${url}&again=1`);
+    const planted = polls;
+    await until(() => polls >= planted + 2, 10_000, "a poll of the second link");
+    held.release();
+    await expect(waited).rejects.toBeInstanceOf(LoginFailed);
+    expect(waiter.seen.presented).toEqual([]);
+    expect(waiter.seen.diagnostics).toHaveLength(1);
+    const said = waiter.seen.diagnostics[0]!;
+    expect(said).toMatchObject({ state: "degraded", operation: "login_link", code: "refused" });
+    expect(said.message).toContain(check);
+    expect(said.message).toContain(new URL(resource).origin);
+    expect(said.message).not.toContain("state=x");
+    expect(said.message).not.toContain("user:pw");
+  }
+});
+
+test("a waiter whose present rejects ends with that error, not at the lock deadline", async () => {
+  const waiter = login({ present: async () => { throw new LoginFailed("sign-in declined"); } });
+  await plant(waiter, planted("declined"));
+  const held = tryAcquire(`${waiter.path}.login.lock`)!;
+  try {
+    const at = Date.now();
+    await expect(waiter.login()).rejects.toThrow("sign-in declined");
+    expect(Date.now() - at).toBeLessThan(5_000);
+  } finally { held.release(); }
+});
+
+test("a waiter whose present resolves keeps waiting; once it holds the lock, its own flow presents its own link", async () => {
+  const waiter = login();
+  await plant(waiter, planted("first"));
+  const held = tryAcquire(`${waiter.path}.login.lock`)!;
+  const waited = waiter.login();
+  await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+  held.release();
+  await expect(waited).rejects.toThrow("sign-in in another pi session ended without signing in");
+  expect(await Bun.file(`${waiter.path}.login.url`).exists()).toBe(false);
+  const own = waiter.login();
+  await until(() => waiter.seen.presented.length === 2, 10_000, "own link");
+  const link = waiter.seen.presented[1]!;
+  expect(link).not.toBe(planted("first"));
+  expect(new URL(link).searchParams.get("code_challenge_method")).toBe("S256");
+  await browse(link);
+  await own;
+  expect(grants()).toBe(1);
+});
 
 test("a server without the harness's built-in client is ServerOutdated, before any browser", async () => {
   const l = login({ clientId: "grayboard-future" });
@@ -208,7 +385,7 @@ test("a sign-in waiter succeeds whenever the store is live once it holds the loc
   const shared = l.login();
   await until(() => l.seen.notices.length === 1, 10_000, "waiter notice");
   held.release();
-  await shared;
+  expect(await shared).toBe("signed in");
   expect((await l.read())!.epoch).toBe(store.epoch);
   await writeJsonAtomic(l.path, { version: 1, resource, clientId: CLIENT, epoch: store.epoch, loginRequired: { reason: "logged_out" } } satisfies GrantStore);
   held = tryAcquire(`${l.path}.login.lock`)!;
@@ -227,11 +404,11 @@ test("an automatic sign-in that finds a live grant under the lock runs no flow; 
   const { store } = await seed({ expiresIn: 3_600_000 });
   let flows = 0;
   const l = login({ present: async url => { flows++; await browse(url); } });
-  await l.login(undefined, true);
+  expect(await l.login(undefined, true)).toBe("current");
   expect(flows).toBe(0);
   expect((await l.read())!.epoch).toBe(store.epoch);
   expect(grants()).toBe(1);
-  await l.login();
+  expect(await l.login()).toBe("signed in");
   expect(flows).toBe(1);
   expect(grants()).toBe(2);
 });
@@ -344,10 +521,43 @@ test("while another process refreshes, a token that is still valid serves at onc
   const { store } = await seed({ expiresIn: 30_000 }); // inside the refresh margin, not expired
   const l = login();
   const held = tryAcquire(`${l.path}.refresh.lock`)!;
-  try { expect(await l.token()).toBe(store.access); } finally { held.release(); }
+  try { expect(await l.token()).toBe(store.access!); } finally { held.release(); }
   expect(refreshes).toBe(0);
   expect(await l.read()).toEqual(store);
 }, 10_000);
+
+// #1379: the credential port reports each change of the access token token() serves, so the run loop can replace
+// its listen before the old token's expiry closes it: its own refresh, another process's, never the first token or
+// an unchanged one, and not after dispose.
+test("rotated hears this process's refresh and another process's, not the first or an unchanged token, and not once disposed", async () => {
+  const { store } = await seed({ expiresIn: 3_600_000 });
+  const l = login();
+  const port = l.credential();
+  const e = await port.capture("R");
+  let heard = 0;
+  const watching = port.rotated!(e, () => { heard++; });
+  expect(await port.token(e)).toBe(store.access!);
+  expect(await port.token(e)).toBe(store.access!);
+  expect(heard).toBe(0);
+  // Inside the refresh margin: this process refreshes.
+  await writeJsonAtomic(l.path, { ...(await l.read())!, accessExpiresAt: Date.now() + 30_000 });
+  const own = await port.token(e);
+  expect(own).not.toBe(store.access!);
+  expect(refreshes).toBe(1);
+  expect(heard).toBe(1);
+  expect(await port.token(e)).toBe(own);
+  expect(heard).toBe(1);
+  // Another process's refresh: the store already holds a new token.
+  const other = await issueOAuth(app.repo, resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
+  await writeJsonAtomic(l.path, { ...(await l.read())!, access: other.token, accessExpiresAt: Date.now() + 3_600_000 });
+  expect(await port.token(e)).toBe(other.token);
+  expect(refreshes).toBe(1);
+  expect(heard).toBe(2);
+  watching.dispose();
+  await writeJsonAtomic(l.path, { ...(await l.read())!, access: store.access!, accessExpiresAt: Date.now() + 3_600_000 });
+  expect(await port.token(e)).toBe(store.access!);
+  expect(heard).toBe(2);
+}, 30_000);
 
 test("a TLS failure once the refresh request may have gone out is an unknown outcome; a refused connection spends nothing", async () => {
   const { store } = await seed();
@@ -366,7 +576,7 @@ test("a TLS failure once the refresh request may have gone out is an unknown out
 });
 
 test("a successful refresh sends the revokes still queued; one the server doesn't confirm stays queued and is recorded", async () => {
-  const other = issueOAuth(app.repo, resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
+  const other = await issueOAuth(app.repo, resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
   const { store } = await seed();
   const l = login();
   await writeJsonAtomic(l.path, { ...store, revoke: [other.refreshToken] } satisfies GrantStore);
@@ -417,6 +627,27 @@ test("a 401 runs one forced refresh, then the retried request succeeds", async (
   await wire.close();
   expect(refreshes).toBe(1);
   expect(current).toBe((await l.read())!.access!);
+});
+
+// #1379 audit L4: a 401's forced refresh is a token change too. The port's token() served the rejected token first, so
+// the retry's token() serves the new one and fires `rotated` once.
+test("a 401's forced refresh fires rotated once, when the retried request is served the new token", async () => {
+  await seed({ access: "unknown-access-token-0123456789abcdefghijklmnopqr", expiresIn: 3_600_000 });
+  const l = login();
+  const port = l.credential();
+  const e = await port.capture("raw-root");
+  let heard = 0, current = "";
+  const watching = port.rotated!(e, () => { heard++; });
+  const wire = new NativeWire({ url: resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT, version: "1.0.0" } },
+    { token: async () => (current = await port.token(e)), onUnauthorized: async () => port.unauthorized(e, current) }, new AbortController().signal, "raw-root");
+  try {
+    await wire.connect();
+    expect((await wire.callTool("whoami", {}, "raw-root")).isError).toBeFalsy();
+  } finally { await wire.close(); watching.dispose(); }
+  expect(refreshes).toBe(1);
+  expect(current).toBe((await l.read())!.access!);
+  expect(current).not.toBe("unknown-access-token-0123456789abcdefghijklmnopqr");
+  expect(heard).toBe(1);
 });
 
 // ---- the credential port and logout ----

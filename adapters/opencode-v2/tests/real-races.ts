@@ -9,6 +9,8 @@ import type { NativeInput, NativeAdmission } from "./effect-instrument.js";
 import type { startServer } from "../../../src/server/app.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
+import { audits, hostedRow } from "./server-db.ts";
+import { until } from "./until.ts";
 
 type Input = NativeInput;
 export type AdmissionGate = {
@@ -16,10 +18,6 @@ export type AdmissionGate = {
   accepted: NativeAdmission[];
   models: string[]; entered(): void; released: Promise<void>;
 };
-async function until(read: () => boolean | Promise<boolean>, label: string) {
-  for (let n = 0; n < 240; n++) { if (await read()) return; await Bun.sleep(50); }
-  throw new Error("Real race wait expired: " + label);
-}
 export async function realRace(f: {
   scenario: string; gate: AdmissionGate; host: FixtureHost;
   ctx: Context; app: ReturnType<typeof startServer>; location: { directory: string };
@@ -34,15 +32,15 @@ export async function realRace(f: {
     await host.session.switchModel({ sessionID: s.id, model: { providerID: "fixture", id: "fixture" } }); return s.id;
   };
   const root = await create("Real race root"), other = await create("Untouched root"), child = await create("Untouched child", root);
-  await f.enroll(root, "race"); await until(() => app.mcp.activeLeases === 1, "approved lease");
+  await f.enroll(root, "race"); await until(() => app.mcp.activeLeases === 1, 12_000, "approved lease");
   if (scenario === "outage") {
     const owner = () => app.db.prepare("SELECT ownership_id FROM hosted_sessions WHERE source_session_id = ?").get(root) as { ownership_id: number } | null;
     const old = owner()!.ownership_id; f.outage(true);
-    const message = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/race", "Real network outage recovery", null, false); app.application.wake(["you@example.com/race"]);
-    await Bun.sleep(31_000); app.mcp.sessions.sweep();
-    assert.equal(owner(), null); assert.equal(app.repo.cursors.directFor("you@example.com/race"), 0); assert.equal(g.inputs.length, 0);
+    const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/race", "Real network outage recovery", null, false)); app.application.wake(["you@example.com/race"]);
+    await Bun.sleep(31_000); await app.mcp.sessions.sweep();
+    assert.equal(owner(), null); assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), 0); assert.equal(g.inputs.length, 0);
     f.outage(false);
-    await until(() => app.repo.cursors.directFor("you@example.com/race") === message.id, "automatic rightful ownership after actual expired outage");
+    await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, 12_000, "automatic rightful ownership after actual expired outage");
     assert.notEqual(owner()!.ownership_id, old); assert.equal(g.inputs.length, 1); assert.equal(g.inputs[0]!.sessionID, root);
     await host.session.wait({ sessionID: root }); assert(g.models.includes(root)); assert(!g.models.includes(other)); assert(!g.models.includes(child));
     console.log("REAL_NETWORK_OUTAGE_RECOVERY_OK", { oldOwnership: old, recoveredOwnership: owner()!.ownership_id, cursor: message.id }); return;
@@ -50,13 +48,13 @@ export async function realRace(f: {
   let release!: () => void;
   const entered = new Promise<void>(r => { g.entered = r; });
   g.released = new Promise<void>(r => { release = r; }); g.holding = true;
-  const beforeCursor = app.repo.cursors.directFor("you@example.com/race"), beforeReceipts = f.receipts();
-  const message = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/race", "IMMUTABLE REAL " + scenario, null, false);
+  const beforeCursor = await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeReceipts = f.receipts();
+  const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/race", "IMMUTABLE REAL " + scenario, null, false));
   app.application.wake(["you@example.com/race"]);
   try {
     await Promise.race([entered, Bun.sleep(15_000).then(() => { throw new Error("No real issued batch"); })]);
     const original = structuredClone(g.inputs[0]!); assert.equal(original.sessionID, root); assert(original.text.includes(message.body));
-    assert.equal(app.repo.cursors.directFor("you@example.com/race"), beforeCursor);
+    assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeCursor);
     if (g.boundary === "after") { await host.session.wait({ sessionID: root }); assert(g.models.includes(root)); }
     else assert.equal(g.accepted.length, 0);
     const retiredSubscriber = f.subscriberWork.current(root);
@@ -82,25 +80,25 @@ export async function realRace(f: {
         const integrationID = (await ctx.mcp.list()).data.find(c => c.name === "grayboard")!.integrationID!;
         const connection = await ctx.integration.connection.active(integrationID); assert(connection);
         const grant = await ctx.integration.connection.resolve(connection); assert(grant?.type === "oauth");
-        const principal = app.oauth.authenticate(new Request("https://grayboard.example.com/hosted/mcp", { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
+        const principal = await app.oauth.authenticate(new Request("https://grayboard.example.com/hosted/mcp", { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
         await app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": root }), { name: "replacement", create: true });
         break;
       }
       case "expiry": {
         f.expiryContinuation.arm();
-        f.outage(true); await Bun.sleep(31_000); app.mcp.sessions.sweep();
+        f.outage(true); await Bun.sleep(31_000); await app.mcp.sessions.sweep();
         assert.equal(app.db.prepare("SELECT 1 FROM hosted_sessions WHERE source_session_id = ?").get(root), null, "Real wall-clock sticky deadline releases ownership");
         break;
       }
       case "revocation": {
         const row = app.db.prepare("SELECT grant_id FROM hosted_sessions WHERE source_session_id = ?").get(root) as { grant_id: string };
         const token = app.db.prepare("SELECT hash FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' LIMIT 1").get(row.grant_id) as { hash: string };
-        app.repo.oauth.revokeToken(token.hash, OPENCODE_CLIENT, Date.now());
+        await app.repo.write(tx => app.repo.oauth.revokeToken(tx, token.hash, OPENCODE_CLIENT, Date.now()));
         break;
       }
       default: throw new Error("Unknown real race " + scenario);
     }
-    if (["account", "account-away-back", "config", "away-back"].includes(scenario)) await until(async () => (await f.status()).state === "paused", "observed drift before releasing original write");
+    if (["account", "account-away-back", "config", "away-back"].includes(scenario)) await until(async () => (await f.status()).state === "paused", 12_000, "observed drift before releasing original write");
     g.holding = false; release(); await transition;
     if (scenario === "expiry") await bounded(f.expiryContinuation.failed.promise, 12_000, "Real forwarding returned and its failed post-admission transport completion is held before retry");
     else await bounded(retiredSubscriber, 12_000, "Original issued subscriber generation must finish, including its post-admission continuation");
@@ -110,11 +108,12 @@ export async function realRace(f: {
     if (scenario === "enrollment") assert(g.inputs.every(i => i.id === original.id), "Only the original message is admitted again, never a distinct one"); else assert.equal(g.inputs.length, 1, "No subsequent admission after original subscriber completion");
     if (scenario === "enrollment") {
       // The replayed item is acknowledged once by the new lease; the original lease never receipts.
-      await until(() => app.repo.cursors.directFor("you@example.com/race") === message.id, "replayed original acknowledged under the new lease");
+      await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, 12_000, "replayed original acknowledged under the new lease");
       assert.equal(f.receipts(), beforeReceipts + 1, "Exactly one receipt, from the replay");
     } else {
-      assert.equal(f.receipts(), beforeReceipts, "No stale receipt attempt");
-      assert.equal(app.repo.cursors.directFor("you@example.com/race"), beforeCursor, "Actual backend cursor unchanged");
+      // A server-side end the client can't see (a rebind, a revoke) surfaces at the receipt, which the server refuses (#845).
+      assert(f.receipts() - beforeReceipts <= 1, "At most one stale receipt attempt, refused");
+      assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeCursor, "Actual backend cursor unchanged");
     }
     assert.deepEqual(await host.session.inbox.list({ sessionID: other }), []);
     assert.equal((await host.session.context({ sessionID: other })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 0);
@@ -131,6 +130,15 @@ export async function realRace(f: {
       assert(g.models.includes(root), "Accepted old actionable write may wake only exact approved root");
     }
     for (const a of g.accepted) { assert.equal(a.sessionID, original.sessionID); assert.equal(a.id, original.id); assert.equal(a.payload.text, original.text); assert.deepEqual(a.payload.metadata, original.metadata); }
-    console.log("REAL_ISSUED_RACE_OK", JSON.stringify({ scenario, boundary: g.boundary, original, accepted: g.accepted.map(a => ({ id: a.id, sessionID: a.sessionID, payload: a.payload })), message: message.id, cursorBefore: beforeCursor, cursorAfter: app.repo.cursors.directFor("you@example.com/race"), staleReceipts: f.receipts() - beforeReceipts, models: g.models }));
+    if (scenario === "rebind") {
+      // The plugin's late delivery call with the retired lease's capability is refused not_found and audited as
+      // hosted.stale_capability, naming the session and never the capability (#226 §7, #383).
+      const session = hostedRow(app.db, root)!.session_id;
+      const rebound = audits(app.db, "hosted.lease_closed").find(r => r.target === session && r.detail.reason === "rebound"); assert(rebound, "The out-of-band rebind closed the old lease");
+      await until(() => audits(app.db, "hosted.stale_capability").length > 0, 12_000, "late old-capability call audited");
+      for (const r of audits(app.db, "hosted.stale_capability")) assert.deepEqual(r, { id: r.id, actor: "you@example.com", target: session, detail: { client_id: OPENCODE_CLIENT } });
+      assert(audits(app.db, "hosted.stale_capability")[0]!.id > rebound.id, "Refused only after the rebind closed the lease");
+    }
+    console.log("REAL_ISSUED_RACE_OK", JSON.stringify({ scenario, boundary: g.boundary, original, accepted: g.accepted.map(a => ({ id: a.id, sessionID: a.sessionID, payload: a.payload })), message: message.id, cursorBefore: beforeCursor, cursorAfter: await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), staleReceipts: f.receipts() - beforeReceipts, models: g.models }));
   } finally { g.holding = false; release(); f.expiryContinuation.release(); }
 }

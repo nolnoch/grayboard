@@ -1,19 +1,22 @@
 // A server whose public URL is the address it listens on, so a hosted
 // extension's Login (discovery, authorize, token, refresh) runs against it
-// unchanged; a scripted browser through its real consent page (only the
-// upstream Google exchange is stubbed); and a grant store seeded with a
-// grant the server issued.
+// unchanged; a scripted browser through its real consent page and upstream
+// leg (a stubbed Google's exchange, or a real IdP's authorize endpoint
+// followed); and a grant store seeded with a grant the server issued.
 import { expect } from "bun:test";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import type { Config } from "../../src/server/config.ts";
+import type { IdentityProvider } from "../../src/server/idp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { Browser, consentForm, submitConsent } from "./oauth_browser.ts";
 import { TestServer } from "./server.ts";
+import { stubProvider } from "./stub_provider.ts";
 
 const SCOPES = ["grayboard:delivery", "grayboard:tools"];
 
 // A port nothing listens on: the server's public URL must name its port before it starts.
-function freePort(): number {
+export function freePort(): number {
   const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
   const port = probe.port!;
   probe.stop(true);
@@ -22,49 +25,95 @@ function freePort(): number {
 
 export type HostedServer = TestServer & { issuer: string; resource: string };
 
-// `email` is who the stubbed upstream sign-in says the browser is.
-export function hostedServer(overrides: Partial<Config> = {}, email = "alice@example.com"): HostedServer {
-  const port = freePort();
-  const issuer = `http://127.0.0.1:${port}`;
-  const srv = new TestServer({ httpPort: port, publicUrl: issuer, hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [], ...overrides },
-    { hostname: "127.0.0.1", oauth: { exchangeGoogle: async () => ({ email, displayName: email.split("@")[0]! }) } });
-  return Object.assign(srv, { issuer, resource: srv.app.oauth.resource });
+// `email` is who the stubbed upstream sign-in says the browser is; `providers` replaces that stub (#928: a real OIDC
+// provider aimed at startFakeOidc(), or several, for the chooser).
+// The free port can be taken between its probe and the server's bind, by another test file's server under the root
+// suite's --parallel (#1050): a bind that loses that race retries on a fresh port.
+export async function hostedServer(overrides: Partial<Config> = {}, email = "alice@example.com", providers?: IdentityProvider[]): Promise<HostedServer> {
+  for (let attempt = 1; ; attempt++) {
+    const port = freePort();
+    const issuer = `http://127.0.0.1:${port}`;
+    let srv: TestServer;
+    try {
+      srv = await TestServer.open({ httpPort: port, publicUrl: issuer, hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [], ...overrides },
+        { hostname: "127.0.0.1", oauth: { providers: providers ?? [stubProvider(async () => ({ email, displayName: email.split("@")[0]!, subject: "google-" + email }))] } });
+    } catch (error) {
+      if (attempt < 5 && /EADDRINUSE|in use/i.test(`${(error as { code?: string }).code ?? ""} ${error}`)) continue;
+      throw error;
+    }
+    return Object.assign(srv, { issuer, resource: srv.app.oauth.resource });
+  }
 }
 
-// Walks authorize → (stubbed upstream) → consent → the client's loopback
-// callback, and returns the callback page's text.
-export async function browse(issuer: string, authorizeUrl: string, harness: string, decision: "approve" | "deny" = "approve"): Promise<string> {
-  const cookies = new Map<string, string>();
-  const request = async (url: string, init: RequestInit = {}) => {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(url, { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) { const [k, v] = cookie.split(";")[0]!.split("="); cookies.set(k!, v!); }
-    return res;
+// Every request that reaches `srv`'s token endpoint from now on, as its
+// grant_type in arrival order (#439 item 2: a count of refresh requests, not of
+// rotations). The HTTP router calls oauth.fetch through the object, so the
+// wrapper sees each request the auth gate passes on, a refused or failed one
+// included.
+export function tokenRequests(srv: TestServer): () => string[] {
+  const seen: string[] = [];
+  const oauth = srv.app.oauth, inner = oauth.fetch.bind(oauth);
+  oauth.fetch = async (req, context) => {
+    if (req.method === "POST" && new URL(req.url).pathname === "/oauth/token") seen.push(new URLSearchParams(await req.clone().text()).get("grant_type") ?? "");
+    return inner(req, context);
   };
-  const begin = await request(authorizeUrl);
-  expect(begin.status).toBe(303);
-  const google = new URL(begin.headers.get("Location")!);
-  expect(google.host).toBe("accounts.google.com");
-  const callback = await request(`${issuer}/oauth/google/callback?` + new URLSearchParams({ code: "upstream-code", state: google.searchParams.get("state")!, iss: "https://accounts.google.com" }));
+  return () => [...seen];
+}
+
+// The chooser page's links, provider ID to URL, in page order (#928 D7).
+export function chooserLinks(page: string): [string, string][] {
+  return [...page.matchAll(/href="([^"]+)"/g)].map(m => {
+    const url = m[1]!.replace(/&amp;/g, "&");
+    return [new URL(url).searchParams.get("provider") ?? "", url];
+  });
+}
+
+// Takes /oauth/authorize's answer through the upstream leg and returns the AS callback's answer: through the chooser
+// when it answered one (`provider` picks the link), then a stubbed Google (its callback called directly, as Google
+// would redirect) or a real IdP (its authorize endpoint followed, as a browser would).
+export async function upstreamLeg(browser: Browser, issuer: string, begin: Response, provider?: string): Promise<Response> {
+  let upstream = begin;
+  if (begin.status === 200) {
+    const page = await begin.text();
+    const link = chooserLinks(page).find(([id]) => id === provider)?.[1];
+    if (!link) throw new Error(`the chooser has no link for ${provider}: ${page}`);
+    upstream = await browser.request(link);
+  }
+  expect(upstream.status).toBe(303);
+  const location = new URL(upstream.headers.get("Location")!);
+  if (location.host === "accounts.google.com")
+    return browser.request(`${issuer}/oauth/google/callback?` + new URLSearchParams({ code: "upstream-code", state: location.searchParams.get("state")!, iss: "https://accounts.google.com" }));
+  const idp = await fetch(location, { redirect: "manual" });
+  expect(idp.status).toBe(302);
+  return browser.request(idp.headers.get("Location")!);
+}
+
+// Walks authorize → (the upstream leg) → consent → the client's loopback
+// callback, and returns the callback page's text.
+export async function browse(issuer: string, authorizeUrl: string, harness: string, decision: "approve" | "deny" = "approve", provider?: string): Promise<string> {
+  const browser = new Browser(), request = browser.request.bind(browser);
+  const callback = await upstreamLeg(browser, issuer, await request(authorizeUrl), provider);
   expect(callback.status).toBe(303);
   const page = await (await request(callback.headers.get("Location")!)).text();
   expect(page).toContain(`Authorize Grayboard for ${harness}`);
-  const id = /name="request" value="([^"]+)"/.exec(page)![1]!, csrf = /name="csrf" value="([^"]+)"/.exec(page)![1]!;
-  const decided = await request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: issuer }, body: new URLSearchParams({ request: id, csrf, decision }) });
+  const decided = await submitConsent(browser, `${issuer}/oauth/consent`, consentForm(page), decision);
   expect(decided.status).toBe(303);
   const loopback = decided.headers.get("Location")!;
   expect(loopback).toStartWith("http://127.0.0.1:");
   return (await fetch(loopback)).text();
 }
 
+// `stateDir`'s grant store for `clientId`, as another process on that
+// state dir holds it (a sign-out elsewhere is `storeLogin(…).logout()`).
+export const storeLogin = (srv: { resource: string }, stateDir: string, clientId: string, harness = "test", loginAction = "log in") =>
+  new Login({ resource: srv.resource, clientId, stateDir, harness, loginAction, present: () => {}, notify: () => {}, diagnostic: () => {} });
+
 // Writes `stateDir`'s grant store for `clientId` with a grant the server
 // issued to `email`, as a finished login would. `expiresIn` < 0 makes the
-// next token() refresh.
-export async function seedGrant(srv: HostedServer, stateDir: string, clientId: string, email = "alice@example.com", expiresIn = 3_600_000) {
-  const issued = issueOAuth(srv.app.repo, srv.resource, email, SCOPES, Date.now(), clientId);
-  const login = new Login({ resource: srv.resource, clientId, stateDir, harness: "test", loginAction: "log in", present: () => {}, notify: () => {}, diagnostic: () => {} });
-  await writeJsonAtomic(login.path, { version: 1, resource: srv.resource, clientId, epoch: "seeded", issuer: srv.issuer, scope: SCOPES.join(" "),
+// next token() refresh. A new `epoch` is a sign-in in another process.
+export async function seedGrant(srv: HostedServer, stateDir: string, clientId: string, email = "alice@example.com", expiresIn = 3_600_000, epoch = "seeded") {
+  const issued = await issueOAuth(srv.app.repo, srv.resource, email, SCOPES, Date.now(), clientId);
+  await writeJsonAtomic(storeLogin(srv, stateDir, clientId).path, { version: 1, resource: srv.resource, clientId, epoch, issuer: srv.issuer, scope: SCOPES.join(" "),
     access: issued.token, accessExpiresAt: Date.now() + expiresIn, refresh: issued.refreshToken });
   return issued;
 }

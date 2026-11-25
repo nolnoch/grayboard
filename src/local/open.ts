@@ -1,18 +1,52 @@
 // Opens (and creates or upgrades) a local-mode bus database. Separate from
 // db.ts, which opens this process's bus on import, so the Slack bridge can open
 // the bus its child will use.
-import type { Database } from "bun:sqlite";
-import { existsSync, mkdirSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
+import { delimiter, dirname, resolve } from "node:path";
 
 import { ANNOUNCE_BOARD, ensureBoard } from "../core/boards.ts";
+import { holdsOf } from "../core/bindings.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { openSqlite } from "../core/sqlite.ts";
-import { liveSessions, type Ended, type SessionRow } from "./binding.ts";
+import { conversationSnapshot, liveSessions, type Ended, type SessionRow } from "./binding.ts";
+import { ATTACHMENT_BYTES_SQL } from "./blobs.ts";
+import { privateDbFiles, privateDir } from "./perms.ts";
+import { lowercaseLegacyHandles, takeCaseWakes } from "./handle_case.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
-  return env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`;
+  return refuseForbiddenBus(env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`);
+}
+
+// GRAYBOARD_TEST_FORBID_BUS: the live buses a test run must never open
+// (tests/support/preload.ts). Unset outside tests.
+export function refuseForbiddenBus(path: string): string {
+  const forbidden = process.env.GRAYBOARD_TEST_FORBID_BUS;
+  if (forbidden && forbidden.split(delimiter).some((p) => resolve(p) === resolve(path))) {
+    throw new Error(`a test run tried to open the live bus ${path}; give it its own BUS_DB_PATH (tests/support/env.ts)`);
+  }
+  return path;
+}
+
+/** Title-only lookup: undefined means absent, null suppresses an unacknowledged/empty selection. */
+export function readConversationTitle(session: string, env: Record<string, string | undefined> = process.env): string | null | undefined {
+  const path = localDbPath(env);
+  if (!existsSync(path)) return undefined;
+  const db = new Database(path, { readonly: true });
+  try {
+    // A read transaction makes snapshot precedence and acquired holds one view;
+    // never create, migrate or reap a bus just to name a transcript.
+    return db.transaction(() => {
+      if (conversationSnapshot(db, session) !== null) return null;
+      const rows = db.prepare(`SELECT id FROM ids
+        WHERE harness_session = ? AND ended_at IS NULL AND root_id IS NULL
+          AND local_resume = 1 AND keyed = 0 AND viewer = 0 AND delivery = 'push'
+        LIMIT 2`).all(session) as { id: string }[];
+      if (!rows.length) return undefined;
+      return rows.length === 1 ? holdsOf(db, rows[0]!.id)[0] ?? null : null;
+    })();
+  } finally { db.close(); }
 }
 
 /**
@@ -22,14 +56,31 @@ export function localDbPath(env: Record<string, string | undefined> = process.en
  * `ended` to deliverEnded (wakeup.ts) once it can await.
  */
 export function openLocalDb(path = localDbPath()): { db: Database; ended: Ended; live: SessionRow[] } {
-  const dir = dirname(path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const db = openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
+  refuseForbiddenBus(path);
+  privateDir(dirname(path));
+  privateDbFiles(path);
+  // auto_vacuum must precede the first page write, so it takes only on a new bus (#148).
+  const db = openSqlite(path, "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
   const { alive, ...ended } = liveSessions(db);
+  ended.wake.push(...takeCaseWakes(db));
   return { db, ended, live: alive };
 }
 
+// The bus's own retention setting (`grayboard retention`; retention.ts). No row:
+// BUS_RETENTION_DAYS or the default decides. days NULL: off. A new table, not a
+// retention_runs column: every release since v1.10.0 rewrites that row with
+// INSERT OR REPLACE, which would clear a column it doesn't know.
+export const RETENTION_SETTING_SQL = `
+  CREATE TABLE IF NOT EXISTS retention_setting (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    days    INTEGER CHECK (days IS NULL OR (typeof(days) = 'integer' AND days > 0)),
+    set_at  INTEGER NOT NULL
+  );
+`;
+
 function initLocalSchema(db: Database): void {
+  db.exec(RETENTION_SETTING_SQL);
+  db.exec(ATTACHMENT_BYTES_SQL);
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +91,8 @@ function initLocalSchema(db: Database): void {
       created_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_messages_recipient_id ON messages(recipient, id);
+    -- undeliveredFrom and sentPending select by sender (#859).
+    CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender, id);
     CREATE TABLE IF NOT EXISTS cursors (
       reader        TEXT PRIMARY KEY,
       last_seen_id  INTEGER NOT NULL
@@ -83,12 +136,21 @@ function initLocalSchema(db: Database): void {
   // kind: 'bounce' for a message returned by an ended ID (#284 decision 10);
   // null for an ordinary message.
   if (!msgCols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE messages ADD COLUMN kind TEXT`);
+  // delivered_at: when the message was handed to its recipient's harness (#470).
+  if (!msgCols.some((c) => c.name === "delivered_at")) db.exec(`ALTER TABLE messages ADD COLUMN delivered_at INTEGER`);
+  // via: the child session (a harness subagent, #523) that wrote it, acting
+  // under its root's addresses; null for a root's own message.
+  if (!msgCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE messages ADD COLUMN via TEXT`);
+  // human: whether the DM bears the human mark (#1364), judged when it's written: 1 when its sender was the declared
+  // human then (a dm_send or delegate, the sender's own words), 0 for every other DM (a bounce among them); null for
+  // DMs from before it, and from a process still running an older binary, which bear no mark (dmHuman, db.ts).
+  if (!msgCols.some((c) => c.name === "human")) db.exec(`ALTER TABLE messages ADD COLUMN human INTEGER`);
   // The attachment model (#284 PR 2, S2). For a keyed session (BUS_SESSION_KEY)
   // pid + proc_start are its harness's, whose exit ends the session, and
   // attached_pid + attached_start are the grayboard mcp child serving it (null
   // while detached, after the child exited and before a restart re-attaches).
   // harness_rule: how the harness pid was found ('env': BUS_HARNESS_PID;
-  // 'ancestor': the first non-launcher ancestor). All null for an unkeyed
+  // 'ancestor': the first non-wrapper ancestor). All null for an unkeyed
   // session, whose own process is pid.
   const bindingCols = new Set((db.prepare(`PRAGMA table_info(bindings)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["attached_pid", "INTEGER"], ["attached_start", "TEXT"], ["detached_at", "INTEGER"], ["harness_rule", "TEXT"]] as const) {
@@ -97,10 +159,12 @@ function initLocalSchema(db: Database): void {
   initCoreSchema(db);
   // Every 1.x handle is an alias (#284), with its durable facts. Seeded on
   // every open, not once: a 1.x grayboard sharing this file may still add
-  // handles, and local mode never deletes an alias, so none comes back.
+  // handles. Local mode deletes an alias only where #216's case move merges
+  // a 1.x `Gray` into `gray`, and that step runs right after this one.
   db.exec(`
     INSERT OR IGNORE INTO aliases (address, scope_kind, scope_ref, name, human, queue_off, created_at, last_seen)
     SELECT name, 'person', NULL, name, human, queue_off, first_seen, last_seen FROM handles WHERE name NOT LIKE '~%';
   `);
+  lowercaseLegacyHandles(db);
   ensureBoard(db, ANNOUNCE_BOARD, "Your user's announcements to every live session. Only a human starts posts here; reply in the thread to acknowledge.", null, "grayboard");
 }

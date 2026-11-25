@@ -16,17 +16,18 @@ import { HostedClient, type Level } from "../../adapters/hosted-core/src/client.
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { DeliveryHeldElsewhere, Refusal, type Item } from "../../adapters/hosted-core/src/model.ts";
-import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
+import { failure, ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { RootDelivery, type RootOptions } from "../../adapters/hosted-core/src/root.ts";
-import { deliveryPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
+import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
-import { issueOAuth } from "../helpers/oauth.ts";
-import { hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
+import { hostedServer, seedGrant, storeLogin as sharedStore, type HostedServer } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
+import { hostedRowCount } from "../support/hosted_rows.ts";
+import { end, register } from "../../adapters/hosted-core/src/children.ts";
+import { row as sqlRow, rows as sqlRows } from "../support/repo_sql.ts";
 
 const CLIENT = "grayboard-pi";
 const EMAIL = "alice@example.com";
-const SCOPES = ["grayboard:delivery", "grayboard:tools"];
 const HELD = new DeliveryHeldElsewhere("pi").message;
 const SIGNED_OUT = "Signed out of grayboard in pi; run /grayboard login";
 
@@ -34,7 +35,7 @@ let srv: HostedServer, stateDir: string, user: number;
 const rigs: Rig[] = [];
 
 beforeEach(async () => {
-  srv = hostedServer();
+  srv = await hostedServer();
   stateDir = realpathSync(mkdtempSync(join(tmpdir(), "gb-hosted-root-")));
   mkdirSync(stateDir, { recursive: true });
   user = (await seedGrant(srv, stateDir, CLIENT, EMAIL)).authed.user_id;
@@ -45,24 +46,25 @@ afterEach(async () => {
   rmSync(stateDir, { recursive: true, force: true });
 });
 
-const storeLogin = () => new Login({ resource: srv.resource, clientId: CLIENT, stateDir, harness: "pi", loginAction: "run /grayboard login", present: () => {}, notify: () => {}, diagnostic: () => {} });
+const storeLogin = () => sharedStore(srv, stateDir, CLIENT, "pi", "run /grayboard login");
 
 // One hosted session's client as pi builds it, logging what it would say.
-function client(logs: { message: string; level: Level }[]) {
+function client(logs: { message: string; level: Level }[], launcher = false) {
   return new HostedClient({
-    harness: "pi", clientId: CLIENT, version: "1.0.0", login: storeLogin(), source: "grayboard",
+    harness: "pi", clientId: CLIENT, version: "1.0.0", login: storeLogin(), source: "grayboard", launcher,
     loginAction: "run /grayboard login", resumeHint: "run /grayboard resume", retryHint: "call the tool again",
     log: (message, level) => { logs.push({ message, level }); },
   });
 }
 
 type Rig = { id: string; client: HostedClient; root: RootDelivery; logs: { message: string; level: Level }[]; admitted: Item[] };
-function rig(id: string, o: Partial<Pick<RootOptions, "carried" | "admit">> = {}): Rig {
+function rig(id: string, o: Partial<Pick<RootOptions, "carried" | "admit" | "configured" | "push">> = {}): Rig {
   const logs: Rig["logs"] = [], admitted: Item[] = [];
   const c = client(logs);
   const root = new RootDelivery(c, {
-    sessionID: id, stateDir, place: () => "hosted-core-root test", push: true,
+    sessionID: id, stateDir, place: () => "hosted-core-root test", push: o.push ?? true,
     ...(o.carried ? { carried: o.carried } : {}),
+    ...(o.configured ? { configured: o.configured } : {}),
     admit: o.admit ?? (async item => { admitted.push(item); }),
     onTools: () => {},
   });
@@ -85,20 +87,18 @@ async function live(id: string, name: string) {
 
 type Row = { name: string | null; lease_deadline: number | null };
 // A hosted root's holds are alias_holds rows (#451); `name` is its primary (oldest) hold.
-const row = (raw: string): Row | null => {
+const row = async (raw: string): Promise<Row | null> => {
   const id = hostedSessionId(user, CLIENT, raw);
-  const r = srv.app.db.query<{ lease_deadline: number | null }, [string]>("SELECT lease_deadline FROM hosted_sessions WHERE session_id = ?").get(id);
-  const hold = srv.app.db.query<{ address: string }, [string]>("SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address").get(id);
+  const r = await sqlRow<{ lease_deadline: number | null }>(srv, "SELECT lease_deadline FROM hosted_sessions WHERE session_id = ?", id);
+  // Oldest first, ties by address in byte order (SQLite's BINARY collation; sorted here so Postgres's text collation doesn't decide).
+  const holds = await sqlRows<{ address: string; bound_at: number }>(srv, "SELECT address, bound_at FROM alias_holds WHERE id = ?", id);
+  const hold = holds.sort((x, y) => Number(x.bound_at) - Number(y.bound_at) || (x.address < y.address ? -1 : x.address > y.address ? 1 : 0))[0];
   return r && { lease_deadline: r.lease_deadline, name: hold ? hold.address.slice(hold.address.lastIndexOf("/") + 1) : null };
 };
 
 // Another pi process on this state dir: a sign-in writes a new epoch and
 // grant to the shared store; a sign-out revokes and logs the store out.
-async function loginElsewhere(epoch: string) {
-  const issued = issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
-  await writeJsonAtomic(storeLogin().path, { version: 1, resource: srv.resource, clientId: CLIENT, epoch, issuer: srv.issuer, scope: SCOPES.join(" "),
-    access: issued.token, accessExpiresAt: Date.now() + 3_600_000, refresh: issued.refreshToken });
-}
+const loginElsewhere = (epoch: string) => seedGrant(srv, stateDir, CLIENT, EMAIL, undefined, epoch);
 
 test("a credential drift's pause is the sign-out's to say: one line, no pause notice in it or the next tool result; a sign-in elsewhere restarts the root once", async () => {
   const a = await live("drift-1", "drifter");
@@ -107,7 +107,7 @@ test("a credential drift's pause is the sign-out's to say: one line, no pause no
     await storeLogin().logout();
     await until(() => record(a)?.state === "paused", 10_000, "paused by the drift");
     await until(() => a.logs.length > 0, 10_000, "the sign-out said");
-    const result = await a.root.call("whoami");
+    const result = await a.root.call("whoami", {});
     expect(result.isError).toBe(true);
     expect(texts(result).join("\n")).not.toContain("delivery paused");
     expect(a.logs).toEqual([{ level: "warning", message: SIGNED_OUT }]);
@@ -135,9 +135,9 @@ test("a root whose delivery another holder has runs tools-only, refuses bind, an
   await until(() => record(b)?.state === "active", 15_000, "the waiter's takeover");
   await active(b, "holder");
   expect(b.root.status().held).toBeUndefined();
-  const result = await b.root.call("whoami");
+  const result = await b.root.call("whoami", {});
   expect(texts(result).filter(t => t.startsWith("grayboard: "))).toEqual([]);
-  expect(row("wait-1")).toMatchObject({ name: "holder" });
+  expect(await row("wait-1")).toMatchObject({ name: "holder" });
 }, 30_000);
 
 test("a root in lock error whose resume finds delivery held elsewhere is held, not in error: the error's unseen notice is dropped for the held one", async () => {
@@ -152,7 +152,7 @@ test("a root in lock error whose resume finds delivery held elsewhere is held, n
   await live("relock-1", "holder");
   await a.root.resume();
   expect(a.root.status()).toEqual({ held: HELD });
-  const result = await a.root.call("whoami");
+  const result = await a.root.call("whoami", {});
   expect(texts(result).filter(t => t.startsWith("grayboard: "))).toEqual([`grayboard: ${HELD}`]);
 }, 30_000);
 
@@ -167,7 +167,7 @@ test("a bind whose `before` retries a lock error and finds delivery held elsewhe
   // The plugin's before(): unpause retries the lock error.
   const result = await b.root.call("bind", { name: "intruder", create: true }, async () => { await b.root.resume(); return undefined; });
   expect(texts(result)).toEqual([`error: ${HELD}; bind and unbind work from the process that holds delivery`]);
-  expect(row("bindrace-1")).toMatchObject({ name: "holder" });
+  expect(await row("bindrace-1")).toMatchObject({ name: "holder" });
 }, 30_000);
 
 test("a held root shut down while its tools-only connect is in flight doesn't say it couldn't reach the server, and a sign-in racing a shutdown never reopens the closed connection", async () => {
@@ -180,7 +180,7 @@ test("a held root shut down while its tools-only connect is in flight doesn't sa
   await a.root.shutdown("release");
   await changing;
   expect([...a.logs, ...b.logs].filter(l => l.message.startsWith("couldn't reach the server"))).toEqual([]);
-  expect(row("earlyquit-1")).toBeNull();
+  expect(await row("earlyquit-1")).toBeNull();
 }, 30_000);
 
 test("a carried name a start takes is said nowhere; one the server refuses is said once and in the next tool result only", async () => {
@@ -191,30 +191,164 @@ test("a carried name a start takes is said nowhere; one the server refuses is sa
   await taker.root.start();
   await active(taker, "carrier");
   expect(taker.logs).toEqual([]);
-  expect(texts(await taker.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
-  expect(row("carry-2")).toMatchObject({ name: "carrier" });
+  expect(texts(await taker.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(await row("carry-2")).toMatchObject({ name: "carrier" });
 
   await live("taken-1", "taken");
   const refused = rig("taken-2", { carried: [`${EMAIL}/taken`] });
   await refused.root.start();
   const said = /^this session couldn't take the name alice@example\.com\/taken it carried over \(.*alias_held.*\); it is unbound$/;
   expect(refused.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
-  const next = texts(await refused.root.call("whoami"));
+  const next = texts(await refused.root.call("whoami", {}));
   expect(next[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
-  expect(texts(await refused.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(texts(await refused.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+});
+
+// An explicit BUS_IDENTITY (#443): a session with nothing to take back binds it at its first start, creating it.
+test("a configured name binds at a fresh root's first start, created and said nowhere; a remembered or carried name comes first", async () => {
+  const fresh = rig("conf-1", { configured: "conf-new" });
+  await fresh.root.start();
+  await active(fresh, "conf-new");
+  expect(fresh.logs).toEqual([]);
+  expect(texts(await fresh.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(await row("conf-1")).toMatchObject({ name: "conf-new" });
+
+  // A resumed session takes back what it held, not the configured name.
+  const before = await live("conf-2", "remembered");
+  await before.root.shutdown("detach");
+  const resumed = rig("conf-2", { configured: "conf-other" });
+  await resumed.root.start();
+  await active(resumed, "remembered");
+  expect(await row("conf-2")).toMatchObject({ name: "remembered" });
+
+  // A /new's carried name, likewise.
+  const carrier = await live("conf-3", "carried-name");
+  const carried = await carrier.root.shutdown("release", { carry: true });
+  const successor = rig("conf-4", { carried, configured: "conf-other" });
+  await successor.root.start();
+  await active(successor, "carried-name");
+  expect(await sqlRow(srv, "SELECT 1 FROM alias_holds WHERE address = ?", `${EMAIL}/conf-other`)).toBeNull();
+});
+
+test("a resumed session whose remembered names can't be read skips the configured bind: the resume takes them back (#544 item 1)", async () => {
+  const before = await live("conf-unread-1", "kept");
+  await before.root.shutdown("detach");
+  // One storage read fails: the start's own look at what it would take back.
+  const remembered = spyOn(Controller.prototype as unknown as { remembered: () => Promise<string[] | undefined> }, "remembered").mockRejectedValueOnce(new Error("EIO: storage read failed"));
+  try {
+    const resumed = rig("conf-unread-1", { configured: "conf-unread-other" });
+    await resumed.root.start();
+    await active(resumed, "kept");
+  } finally { remembered.mockRestore(); }
+  expect(await row("conf-unread-1")).toMatchObject({ name: "kept" });
+  expect(await sqlRow(srv, "SELECT 1 FROM alias_holds WHERE address = ?", `${EMAIL}/conf-unread-other`)).toBeNull();
+});
+
+test("a configured bind that lands but whose prepare fails says the session is bound, not that it couldn't bind (#544 item 2)", async () => {
+  const prepare = spyOn(Controller.prototype as unknown as { prepare: () => Promise<void> }, "prepare").mockRejectedValueOnce(new Error("whoami unreachable"));
+  const r = rig("conf-prep-1", { configured: "conf-prep" });
+  try { await r.root.start(); } finally { prepare.mockRestore(); }
+  expect(await row("conf-prep-1")).toMatchObject({ name: "conf-prep" });
+  expect(r.logs).toEqual([{ level: "warning", message: expect.stringMatching(/^this session is bound as conf-prep, but delivery couldn't start \(Root enrolled; .+\)$/) }]);
+  expect(r.logs[0]!.message).not.toContain("couldn't bind");
+  // Bound for good: a later start takes it back instead of binding it again.
+  await r.root.resume();
+  await active(r, "conf-prep");
+  expect(r.logs).toHaveLength(1);
+});
+
+test("a configured name another session holds is said once and in the next tool result; a later start doesn't try it again", async () => {
+  await live("conf-held-1", "conf-held");
+  const r = rig("conf-held-2", { configured: "conf-held" });
+  await r.root.start();
+  const said = /^BUS_IDENTITY asked for "conf-held", but this session couldn't bind it \(.*alias_held.*\); it is unbound$/;
+  expect(r.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
+  expect(texts(await r.root.call("whoami", {}))[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
+  await r.root.resume();
+  expect(r.logs).toHaveLength(1);
+  expect(await row("conf-held-2")).toMatchObject({ name: null });
+});
+
+test("a tools-only root (push off) binds its configured name through its own connection; one another session holds is said once", async () => {
+  const r = rig("conf-tools", { configured: "conf-tools", push: false });
+  await r.root.start();
+  await until(async () => (await row("conf-tools"))?.name === "conf-tools", 10_000, "tools-only bound");
+  expect(r.logs).toEqual([]);
+
+  await live("conf-tools-held-1", "conf-tools-held");
+  const held = rig("conf-tools-held-2", { configured: "conf-tools-held", push: false });
+  await held.root.start();
+  const said = /^BUS_IDENTITY asked for "conf-tools-held", but this session couldn't bind it \(.*\); it started unbound$/;
+  await until(() => held.logs.length > 0, 10_000, "tools-only refusal said");
+  expect(held.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
+  expect(texts(await held.root.call("whoami", {}))[0]).toMatch(/^grayboard: BUS_IDENTITY asked for "conf-tools-held"/);
+});
+
+test("a tools-only configured bind the server couldn't be reached for is said once and tried again before the agent's next call, ahead of its own bind (#543 audit 4)", async () => {
+  const r = rig("conf-tools-retry", { configured: "conf-retry", push: false });
+  // The first bind fails as an unreachable server's does: client.call turns the throw into a failure result.
+  const real = r.client.call.bind(r.client);
+  let down = true;
+  r.client.call = async (proxy, tool, args, sessionID) => tool === "bind" && down ? failure("couldn't reach the grayboard server") : real(proxy, tool, args, sessionID);
+  await r.root.start();
+  await until(() => r.logs.length > 0, 10_000, "the unreachable try said");
+  expect(r.logs).toEqual([{ level: "warning", message: `BUS_IDENTITY asked for "conf-retry", but this session couldn't bind it (couldn't reach the grayboard server); it is unbound until a later try binds it` }]);
+  expect((await row("conf-tools-retry"))?.name ?? null).toBeNull();
+
+  down = false;
+  await r.root.call("bind", { name: "conf-own", create: true });
+  const held = await sqlRows<{ address: string }>(srv, "SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at", hostedSessionId(user, CLIENT, "conf-tools-retry"));
+  expect(held.map(h => h.address)).toEqual([`${EMAIL}/conf-retry`, `${EMAIL}/conf-own`]);
+  expect(r.logs).toHaveLength(1);
 });
 
 test("detach keeps the lease and name for the next runtime; release ends the session", async () => {
   const a = await live("detach-1", "keeper");
   await a.root.shutdown("detach");
-  expect(row("detach-1")).toMatchObject({ name: "keeper" });
-  expect(row("detach-1")!.lease_deadline).not.toBeNull();
+  expect(await row("detach-1")).toMatchObject({ name: "keeper" });
+  expect((await row("detach-1"))!.lease_deadline).not.toBeNull();
   const b = rig("detach-1");
   await b.root.start();
   await active(b, "keeper");
   await b.root.shutdown("release");
-  expect(row("detach-1")).toBeNull();
+  expect(await row("detach-1")).toBeNull();
   expect([...a.logs, ...b.logs]).toEqual([]);
+});
+
+// #1294 audit M-1: pi, omp and the Claude Code plugin shut down through RootDelivery, which shuts the session down
+// (queued behind a start in flight) and only then closes the Controller. A start whose wire still connects to a
+// server that never answers ends at the shutdown, not at the wire's 10 s timeout, and the release still runs.
+test("a release while a start's prepare is still connecting ends it at once and still ends the session", async () => {
+  await (await live("hung-1", "hung")).root.shutdown("detach");
+  const real = globalThis.fetch;
+  let armed = true;
+  const { promise: holding, resolve: hit } = Promise.withResolvers<void>();
+  const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const signal = init?.signal;
+    if (armed && signal && new Headers(init?.headers).get("X-Grayboard-Client") === "subscriber") {
+      armed = false; hit();
+      return new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    }
+    return real(input, init);
+  }) as typeof fetch);
+  try {
+    const b = rig("hung-1");
+    const started = b.root.start();
+    await holding;
+    const began = performance.now();
+    await b.root.shutdown("release");
+    expect(performance.now() - began).toBeLessThan(5000);
+    expect(await row("hung-1")).toBeNull();
+    await started;
+  } finally { fetchSpy.mockRestore(); }
+}, 30_000);
+
+// The Controller's wires (subscriber, temporary, child registration) declare a launcher client's flag too, not only
+// its proxy wire (#520): the port root.ts builds carries it.
+test.each([true, false])("a launcher client (%p) gives the Controller's port its launcher flag", launcher => {
+  const root = new RootDelivery(client([], launcher), { sessionID: `port-${launcher}`, stateDir, place: () => "hosted-core-root test", push: true, admit: async () => {}, onTools: () => {} });
+  const port = (Reflect.get(root, "port") as () => { launcher?: true }).call(root);
+  expect(port.launcher).toBe(launcher ? true : undefined);
 });
 
 test("admit gets the run loop's signal; once it aborts, the host's admit is never called", async () => {
@@ -255,7 +389,7 @@ test("notices are keyed slots shown with the next tool result: held, then the ho
   b.root.noticeOnce("last", "last");
   const result = await b.root.call("whoami", {}, async () => "before the call");
   expect(texts(result).slice(0, 4)).toEqual([`grayboard: ${HELD}`, "grayboard: first", "grayboard: last", "grayboard: before the call"]);
-  expect(texts(await b.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(texts(await b.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
 });
 
 test("a child's calls go through HostedClient.call: a refused register and a JSON-RPC error come back as error results with the retry hint and their message", async () => {
@@ -299,7 +433,7 @@ test("a sign-in store the root can't read for its epoch is said once, however ma
 
 test("a shutdown while a start's push connection is still connecting releases the lease first, then closes the connection that start built", async () => {
   await (await live("first-1", "first")).root.shutdown("detach");
-  expect(row("first-1")!.lease_deadline).not.toBeNull();
+  expect((await row("first-1"))!.lease_deadline).not.toBeNull();
 
   const real = globalThis.fetch;
   let armed = true;
@@ -324,13 +458,13 @@ test("a shutdown while a start's push connection is still connecting releases th
     if (mode === "push") made.push(p);
     return p;
   });
-  let down: Promise<string | undefined> | undefined;
+  let down: Promise<string[] | undefined> | undefined;
   try {
     const b = rig("first-1");
     const started = b.root.start();
     await holding;
     down = b.root.shutdown("release");
-    await until(() => row("first-1") === null, 10_000, "the session ended while the connect is held");
+    await until(async () => (await row("first-1")) === null, 10_000, "the session ended while the connect is held");
     expect(made).toHaveLength(1);
     expect(closed).not.toContain(made[0]);
     open();
@@ -346,3 +480,91 @@ test("a shutdown while a start's push connection is still connecting releases th
     proxySpy.mockRestore();
   }
 });
+
+test("#542: unbinding the last name answers name null and says unbound; the Controller forgets the hold, so a resume stays unbound", async () => {
+  const a = await live("unbind-last", "x");
+  const result = await a.root.call("unbind", { name: "x" });
+  expect(result.isError, texts(result).join("\n")).toBeUndefined();
+  expect(result.structuredContent).toMatchObject({ name: null });
+  expect(texts(result).join("\n")).toContain("This session is now unbound.");
+  expect(texts(result).join("\n")).not.toContain("send as");
+  await until(() => record(a)?.state === "unbound" && !record(a)?.held?.length, 10_000, "the hold forgotten");
+  const before = record(a)!.time;
+  await a.root.resume();
+  await until(() => record(a)!.time > before && record(a)?.state === "unbound", 10_000, "resumed unbound");
+  expect(record(a)?.held ?? []).toEqual([]);
+  expect(await row("unbind-last")).toMatchObject({ name: null });
+}, 30_000);
+
+// #1349: the server's session_register refusal reaches the root's diagnostic under its own code, not
+// invalid_response. A session already bound as its own root can't become another root's child (child_bound).
+test("a child already bound as its own root is refused registration, and the root's diagnostic names child_bound (#1349)", async () => {
+  const a = await live("register-root", "be");
+  await live("register-bound", "fe");
+  const result = await a.root.call("whoami", {}, undefined, { child: "register-bound" });
+  expect(result.isError).toBe(true);
+  expect(texts(result).join("\n")).toContain("child_bound");
+  const code = () => { const r = record(a); return r?.operation === "child_register" ? r.code : r?.failure?.operation === "child_register" ? r.failure.code : undefined; };
+  await until(() => code() !== undefined, 10_000, "the root's child_register diagnostic");
+  expect(code()).toBe("child_bound");
+}, 30_000);
+
+// #1099: a wire that only ends a session (HostedClient.endSession, children's end, the Controller's release and a
+// child's end) connects naming no session, so the server admits nothing for it: an ID it never saw, or one it already
+// ended, gets no row and no audit (no id.registered, id.reopened or hosted.ownership_started), only a stale lease's own
+// refusal row. Its calls still name the session, so a live one ends; a registration still admits.
+const audits = async () => (await sqlRows<{ action: string }>(srv, "SELECT action FROM access_log ORDER BY id")).map(r => r.action);
+test("ending-only wires admit nothing for an unknown or ended session, and still end a live one; a registration still admits (#1099)", async () => {
+  const logs: { message: string; level: Level }[] = [];
+  const c = client(logs);
+  const start = await audits();
+  await c.endSession("never-seen");
+  await end(c.temporary, { child: "never-seen-child" });
+  expect(await hostedRowCount(srv)).toBe(0);
+  expect(await audits()).toEqual(start);
+
+  await register(c.temporary, { root: "reg-root", via: [], child: "reg-child" });
+  expect(await hostedRowCount(srv)).toBe(2);
+  expect((await audits()).slice(start.length)).toContain("id.registered");
+  await end(c.temporary, { child: "reg-child" });
+  expect(await hostedRowCount(srv)).toBe(1);
+  await c.endSession("reg-root");
+  expect(await hostedRowCount(srv)).toBe(0);
+  const ended = await audits();
+  await c.endSession("reg-root");
+  await end(c.temporary, { child: "reg-child" });
+  expect(await hostedRowCount(srv)).toBe(0);
+  expect(await audits()).toEqual(ended);
+  expect(logs).toEqual([]);
+}, 30_000);
+
+test("the Controller's release and child end under a session the server already ended admit nothing (#1099)", async () => {
+  const a = await live("release-1", "releaser");
+  const controller = Reflect.get(a.root, "controller") as Controller;
+  // A child the root's call registered, which the server then ends (as its own session_end would).
+  expect((await a.root.call("whoami", {}, undefined, { child: "release-child" })).isError).toBeUndefined();
+  expect(await hostedRowCount(srv)).toBe(2);
+  await a.client.endSession("release-child");
+  expect(await hostedRowCount(srv)).toBe(1);
+  const before = await audits();
+  await controller.ended("release-child");
+  expect(await hostedRowCount(srv)).toBe(1);
+  expect(await audits()).toEqual(before);
+  // The first pause stops the run loop and releases the root; a second release (a stale lease on a root the
+  // server already ended) sends delivery_release then session_end under the ended ID. The live root's own
+  // delivery_release must succeed on the ending wire: release() records its failure and goes on.
+  const failed: string[] = [];
+  const failure = (Reflect.get(controller, "failure") as (...a: unknown[]) => void).bind(controller);
+  Reflect.set(controller, "failure", (...a: unknown[]) => { failed.push(String(a[0])); failure(...a); });
+  const root = (Reflect.get(controller, "roots") as Map<string, { lease?: { capability: string } }>).get("release-1")!;
+  expect(root.lease).toBeDefined();
+  await controller.pause();
+  expect(failed).toEqual([]);
+  expect(await hostedRowCount(srv)).toBe(0);
+  const released = await audits();
+  root.lease = { capability: "a".repeat(43) } as never;
+  await controller.pause();
+  expect(failed).toEqual(["delivery_release"]);
+  expect(await hostedRowCount(srv)).toBe(0);
+  expect(await audits()).toEqual([...released, "hosted.stale_capability"]);
+}, 30_000);

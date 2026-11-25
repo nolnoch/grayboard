@@ -97,7 +97,7 @@ try {
   }
   assert(saved.kind === "replay");
   for (let n = 0; n < 300 && !inputs.some(i => i.id === saved.input.id); n++) await Bun.sleep(50);
-  assert(inputs.some(i => i.id === saved.input.id), "Installed plugin replayed same real issued item after process reload");
+  assert(inputs.some(i => i.id === saved.input.id), `Installed plugin replayed same real issued item after process reload (wanted ${saved.input.id} for ${saved.input.sessionID}; saw ${JSON.stringify(inputs.map(i => [i.sessionID, i.id]))})`);
   if (digestInput) {
     for (let n = 0; n < 300 && !inputs.some(i => i.id === digestInput.id); n++) await Bun.sleep(50);
     assert.deepEqual(inputs.find(i => i.id === digestInput.id), digestInput);

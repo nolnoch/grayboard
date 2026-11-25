@@ -10,25 +10,32 @@ import { ApplicationError, createApplication } from "./application.ts";
 import { createHostedMcp, MCP_PROTOCOL_VERSIONS } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
-import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { issueOAuth, type IssuedOAuth } from "../../tests/helpers/oauth.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
-import { createBoard, post, subscribe } from "../core/boards.ts";
+import { sessionEndPort } from "./session_end.ts";
+import { createBoard, post, subscribe, openAccess, setAccess } from "../core/boards.ts";
+import { stubAuthRead } from "../../tests/support/auth_stub.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
+import { until } from "../../tests/support/until.ts";
+import { gateCount } from "./metrics.ts";
 const meta = { "ai.opencode/sessionID": "resource-root" };
 
 let store: ReturnType<typeof openDatabase>, application: ReturnType<typeof createApplication>;
 let oauth: ReturnType<typeof createOAuthServer>, hosted: ReturnType<typeof createHostedMcp>;
-let dir: string, grant: ReturnType<typeof issueOAuth>;
+let dir: string, grant: IssuedOAuth;
 const clients: Client[] = [];
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-mcp-resource-unit-"));
-  store = openDatabase(":memory:", { blobDir: dir });
-  application = createApplication(store.repo, store.db);
-  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+  store = openDatabase(scratchDbPath(), { blobDir: dir , sessionEnd: sessionEndPort("team") });
+  setAccess(store.db, openAccess(store.db)); // core seeds on a server database opt in to local mode's open Access
+  application = createApplication(store.repo);
+  oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer });
-  grant = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
-  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "be", create: true });
 });
@@ -41,7 +48,7 @@ afterEach(async () => {
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
   oauth.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -49,7 +56,7 @@ async function connect(version: string, role = "subscriber", signal?: AbortSigna
   const client = new Client({ name: "resource-unit", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
-    requestInit: { headers: { Authorization: `Bearer ${grant.token}`, "X-Grayboard-Identity": "be", ...(role === "native" ? {} : { "X-Grayboard-Client": role }) } },
+    requestInit: { headers: { Authorization: `Bearer ${grant.token}`, ...(role === "native" ? {} : { "X-Grayboard-Client": role }) } },
     fetch: async (input, init) => {
       let request = new Request(input, { ...init, ...(signal ? { signal } : {}) });
       if (request.method === "POST" && request.body) {
@@ -87,21 +94,23 @@ test("receipt capacity is structured and release then bind false reopens under a
   const opened = await client.callTool({ name: "delivery_open", arguments: {} });
   const first = JSON.parse((opened.content as { text: string }[])[0]!.text);
   headers.set("X-Grayboard-Lease", first.capability);
-  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
-  createBoard(store.db, "alice@example.com/be", "capacity", "digest receipt bound");
-  subscribe(store.db, "alice@example.com/be", "capacity", "digest");
+  await seed(store.repo, () => {
+    createBoard(store.db, "alice@example.com/be", "capacity", "digest receipt bound");
+    subscribe(store.db, "alice@example.com/be", "capacity", "digest");
+  });
   for (let i = 0; i < 1000; i++) {
-    post(store.db, "alice@example.com/sender", "capacity", `version ${i}`);
+    await seed(store.repo, () => post(store.db, "alice@example.com/sender", "capacity", `version ${i}`));
     await hosted.delivery.pending(principal, sessionContext(principal, meta), first.capability);
   }
-  post(store.db, "alice@example.com/sender", "capacity", "overflow");
+  await seed(store.repo, () => post(store.db, "alice@example.com/sender", "capacity", "overflow"));
   await expect(client.readResource({ uri: "grayboard://inbox" })).rejects.toMatchObject({ data: { code: "receipt_capacity" } });
   const renew = hosted.delivery.renew;
   hosted.delivery.renew = async () => { throw new ApplicationError("receipt_capacity", "receipt capacity reached"); };
   try { expect((await client.callTool({ name: "delivery_renew", arguments: {} })).structuredContent).toEqual({ code: "receipt_capacity" }); }
   finally { hosted.delivery.renew = renew; }
-  const alias = store.repo.aliases.find(`${grant.authed.user_email}/be`);
+  const alias = await store.repo.aliases.find(store.repo.read, `${grant.authed.user_email}/be`);
   await client.callTool({ name: "delivery_release", arguments: {} });
   expect((await client.callTool({ name: "bind", arguments: { name: "be", create: false } })).isError).not.toBe(true);
   const replacement = JSON.parse(((await client.callTool({ name: "delivery_open", arguments: {} })).content as { text: string }[])[0]!.text);
@@ -109,13 +118,43 @@ test("receipt capacity is structured and release then bind false reopens under a
   expect(replacement.ownership).not.toBe(first.ownership);
   headers.set("X-Grayboard-Lease", replacement.capability);
   expect((await client.readResource({ uri: "grayboard://inbox" })).contents).toHaveLength(1);
-  expect(store.repo.aliases.find(`${grant.authed.user_email}/be`)).toEqual(alias);
+  expect(await store.repo.aliases.find(store.repo.read, `${grant.authed.user_email}/be`)).toEqual(alias);
   await expect(hosted.delivery.pending(principal, sessionContext(principal, meta), first.capability)).rejects.toHaveProperty("code", "not_found");
 });
 
+// #1537 C5, C7: a subscriber exchange's open, renew, inbox read (pending), receipt and bind reuse its selection's verdict
+// (hosted.ts withPrior) instead of running a second gate body: on SQLite each counts one prior body (`skipped`: its body
+// is exclusive) and no gate body under its method. Mutation: mcp-resources.ts passing no verdict to one of them (that
+// method's gate count reads 1, its prior 0).
+test("a subscriber's open, renew, inbox read, receipt and bind run a prior on the exchange's verdict, not a second gate body", async () => {
+  const methods = ["open", "renew", "pending", "receipt", "bind"] as const;
+  const at = () => Object.fromEntries(methods.map(m => [m, { gate: gateCount("gate", "skipped", m), prior: gateCount("prior", "skipped", m) }]));
+  const headers = new Headers(), client = await connect("2026-07-28", "subscriber", undefined, headers);
+  const before = at();
+  const lease = JSON.parse(((await client.callTool({ name: "delivery_open", arguments: {} })).content as { text: string }[])[0]!.text);
+  headers.set("X-Grayboard-Lease", lease.capability);
+  expect((await client.callTool({ name: "delivery_renew", arguments: {} })).isError).not.toBe(true);
+  await seed(store.repo, () => {
+    createBoard(store.db, "alice@example.com/be", "verdict", "the subscriber's verdict reuse");
+    subscribe(store.db, "alice@example.com/be", "verdict", "push");
+    post(store.db, "alice@example.com/sender", "verdict", "one");
+  });
+  const inbox = JSON.parse(((await client.readResource({ uri: "grayboard://inbox" })).contents[0] as { text: string }).text) as { items: { id: string }[] };
+  expect(inbox.items).toHaveLength(1);
+  expect((await client.callTool({ name: "delivery_receipt", arguments: { ids: inbox.items.map(i => i.id) } })).isError).not.toBe(true);
+  expect((await client.callTool({ name: "bind", arguments: { name: "qa", create: true } })).isError).not.toBe(true);
+  const after = at();
+  expect(Object.fromEntries(methods.map(m => [m, { gate: after[m]!.gate - before[m]!.gate, prior: after[m]!.prior - before[m]!.prior }])))
+    .toEqual(Object.fromEntries(methods.map(m => [m, { gate: 0, prior: 1 }])));
+  // The native role's bind tool the same (mcp.ts).
+  const native = await connect("2026-07-28", "native"), bound = at();
+  expect((await native.callTool({ name: "bind", arguments: { name: "qa2", create: true } })).isError).not.toBe(true);
+  expect({ gate: at().bind!.gate - bound.bind!.gate, prior: at().bind!.prior - bound.bind!.prior }).toEqual({ gate: 0, prior: 1 });
+});
+
 test("subscriber known suggestions stay account scoped and reject malformed extra fields without getters", async () => {
-  const bob = issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
-  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${bob.token}` } }));
+  const bob = await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${bob.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "private-name", create: true });
   const client = await connect("2026-07-28");
@@ -149,7 +188,7 @@ test("subscriber known suggestions stay account scoped and reject malformed extr
 });
 
 test("subscriber in-use refusals name the holder as bounded plain text", async () => {
-  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": "other-root" }), { name: "fe", create: true, where: "/work/app" });
   const client = await connect("2026-07-28");
@@ -171,11 +210,11 @@ test("hosted audit actors and clients survive grant deletion and ownership clean
   const client = await connect("2026-07-28");
   const opened = await client.callTool({ name: "delivery_open", arguments: {} });
   expect(opened.isError).not.toBe(true);
-  const p = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const p = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (p instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.register(p, sessionContext(p, meta), "audit-child");
   await hosted.sessions.end(p, sessionContext(p, meta));
-  store.repo.oauth.cleanup(Date.now() + OAUTH_TTL.grant + 1);
+  await seed(store.repo, tx => store.repo.oauth.cleanup(tx, Date.now() + OAUTH_TTL.grant + 1));
   const rows = store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action LIKE 'hosted.%'").all();
   expect(rows.length).toBeGreaterThanOrEqual(5);
   for (const row of rows) {
@@ -192,18 +231,18 @@ test("a live subscriber hint failure closes its stream with one private-safe dia
   headers.set("X-Grayboard-Lease", JSON.parse((opened.content as { text: string }[])[0]!.text).capability);
   const listen = await sub.listen({ resourceSubscriptions: ["grayboard://inbox"] });
   const native = await connect("2026-07-28", "native");
-  const original = hosted.delivery.describe;
+  const original = hosted.delivery.identityFull;
   const log = spyOn(console, "error").mockImplementation(() => {});
-  hosted.delivery.describe = () => { throw new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" }); };
+  hosted.delivery.identityFull = () => { throw new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" }); };
   try {
     expect((await native.callTool({ name: "dm_send", arguments: { to: "be", body: "hint fixture" } })).isError).not.toBe(true);
     expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"mcp.hint","category":"failure","level":"error","class":"Error"}']);
     expect(hosted.activeListens).toBe(0);
-  } finally { hosted.delivery.describe = original; log.mockRestore(); await listen.close(); }
+  } finally { hosted.delivery.identityFull = original; log.mockRestore(); await listen.close(); }
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) for (const creatorHeld of [false, true]) test(`${version}: canceled open cannot release a successful shared lease, creatorHeld=${creatorHeld}`, async () => {
-  const p = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const p = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (p instanceof Response) throw new Error("fixture unauthorized");
   const context = sessionContext(p, meta);
   await hosted.sessions.register(p, context, "child");
@@ -223,11 +262,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const creatorHeld of [false, t
     const pending = canceled.callTool({ name: "delivery_open", arguments: {} }, { signal: abort.signal }).catch(error => error);
     await reached;
     if (creatorHeld) expect((await successful.callTool({ name: "delivery_open", arguments: {} })).isError).not.toBe(true);
-    const rows = store.repo.hosted.all(), ownership = rows[0]!.ownership_id;
+    const rows = await store.repo.hosted.all(store.repo.read), ownership = rows[0]!.ownership_id;
     abort.abort(); resume(); await pending; await Bun.sleep(0);
     expect(hosted.activeLeases).toBe(1);
-    expect(store.repo.hosted.all()).toHaveLength(2);
-    expect(store.repo.hosted.all().every(row => row.ownership_id === ownership)).toBe(true);
+    expect(await store.repo.hosted.all(store.repo.read)).toHaveLength(2);
+    expect((await store.repo.hosted.all(store.repo.read)).every(row => row.ownership_id === ownership)).toBe(true);
     expect((await successful.callTool({ name: "whoami", arguments: {} })).isError).not.toBe(true);
     expect((await successful.callTool({ name: "delivery_open", arguments: {} })).isError).not.toBe(true);
   } finally { resume(); hosted.delivery.open = original; }
@@ -249,20 +288,24 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     const pending = client.callTool({ name: "delivery_open", arguments: {} }, { signal: abort.signal }).catch(e => e);
     await ready;
     expect(hosted.activeLeases).toBe(1);
-    if (stop === "access") store.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now());
+    if (stop === "access") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, Date.now()));
     if (stop === "abort") abort.abort();
     const closing = stop === "close" ? hosted.close() : undefined;
     resume();
     await closing;
     if (stop === "close") await client.close();
     const result = await pending;
-    if (stop === "access") expect(result).toMatchObject({ isError: true });
+    // A revoke past admission answers the exchange's 401, not a tool error (#1312), where the response waits for the
+    // result; a legacy session's SSE response returned before it, so its refusal stays the tool's. An abort or a
+    // hosted close (the bearer still live) never answers 401.
+    if (stop === "access") expect(result).toMatchObject(version === "2026-07-28" ? { name: "SdkHttpError", status: 401 } : { isError: true });
+    else expect((result as { status?: number }).status).not.toBe(401);
     await Bun.sleep(0);
     expect(hosted.activeLeases).toBe(0);
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
     if (stop !== "close") {
-      const replacement = new AppSession(application, grant.authed, "be");
+      const replacement = new AppSession(application, store.repo, grant.authed, "be");
       await replacement.connect();
       replacement.close();
     }
@@ -289,25 +332,27 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: resource and cont
 
 for (const version of MCP_PROTOCOL_VERSIONS) for (const method of ["list", "read"] as const) for (const boundary of ["grant", "session"] as const) test(`${version}: resource ${method} extra ${boundary} storage check preserves internal-error provenance`, async () => {
   const client = await connect(version, "native");
-  const findAccess = store.repo.oauth.findActiveAccess, validate = application.revalidateSession;
+  // A legacy client opens its GET stream in the background; its checks must not take the counted fault (#807 P3 A7c).
+  if (version !== "2026-07-28") await until(() => hosted.activeGetStreams === 1, 1000);
+  const validate = application.revalidateSession;
   let accessChecks = 0, sessionChecks = 0;
-  store.repo.oauth.findActiveAccess = (...args) => {
+  const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", findAccess => (...args) => {
     accessChecks++;
     if (boundary === "grant" && accessChecks === 5) throw new Error("SELECT secret FROM private_database");
     return findAccess(...args);
-  };
+  });
   application.revalidateSession = session => {
     sessionChecks++;
     if (boundary === "session" && sessionChecks === 2) throw new Error("SELECT secret FROM private_database");
-    validate(session);
+    return validate(session);
   };
   try {
     const request = method === "list" ? client.listResources() : client.readResource({ uri: "grayboard://boards/general" });
     await expect(request).rejects.toThrow(/internal.*error/i);
     expect(accessChecks).toBeGreaterThanOrEqual(5);
     expect(sessionChecks).toBe(boundary === "grant" ? 0 : 2);
-    expect(store.repo.cursors.directFor("alice@example.com/be")).toBe(0);
-  } finally { store.repo.oauth.findActiveAccess = findAccess; application.revalidateSession = validate; }
+    expect(await store.repo.cursors.directFor(store.repo.read, "alice@example.com/be")).toBe(0);
+  } finally { restoreAccess(); application.revalidateSession = validate; }
   expect((await client.listResources()).resources.every(r => r.uri !== "grayboard://identity")).toBe(true);
 });
 
@@ -317,12 +362,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const method of ["renew", "inb
   const opened = await client.callTool({ name: "delivery_open", arguments: {} });
   const lease = JSON.parse((opened.content[0] as { text: string }).text) as { capability: string };
   headers.set("X-Grayboard-Lease", lease.capability);
-  const isActive = store.repo.oauth.findActiveAccess;
   let calls = 0;
-  store.repo.oauth.findActiveAccess = (...args) => {
+  const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", isActive => (...args) => {
     if (++calls === faultAt) throw new Error("SELECT secret FROM private_database");
     return isActive(...args);
-  };
+  });
   try {
     if (method === "renew") {
       const result = await client.callTool({ name: "delivery_renew", arguments: {} }).catch(error => error);
@@ -333,9 +377,86 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const method of ["renew", "inb
     }
     expect(calls).toBe(faultAt);
     expect(hosted.activeLeases).toBe(1);
-    expect(store.repo.cursors.directFor("alice@example.com/be")).toBe(0);
-  } finally { store.repo.oauth.findActiveAccess = isActive; }
+    expect(await store.repo.cursors.directFor(store.repo.read, "alice@example.com/be")).toBe(0);
+  } finally { restoreAccess(); }
   const renewed = await client.callTool({ name: "delivery_renew", arguments: {} });
   expect(renewed.isError).toBeUndefined();
   expect(JSON.parse((renewed.content[0] as { text: string }).text).capability).toBe(lease.capability);
+});
+
+test("the subscriber role's whoami carries the session's id and principal beside its holds, as the native one does (#489)", async () => {
+  const p = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (p instanceof Response) throw new Error("fixture unauthorized");
+  const context = sessionContext(p, meta);
+  if (!("id" in context)) throw new Error("fixture context");
+  const client = await connect("2026-07-28");
+  const result = await client.callTool({ name: "whoami", arguments: {} });
+  expect(result.isError).not.toBe(true);
+  const body = JSON.parse((result.content as { text: string }[])[0]!.text);
+  expect(body).toMatchObject({ id: context.id, principal: "alice@example.com", held: ["alice@example.com/be"], primary: "alice@example.com/be" });
+  // The subscriber names its holds `held`, as the native role does; local whoami calls them `aliases`.
+  expect(body).not.toHaveProperty("aliases");
+});
+
+// #805 F-06: the configured caps reach the hosted sessions and delivery the MCP surface builds.
+test("configured hosted caps reach the session and lease limits the MCP surface enforces", async () => {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, caps: { sessions: { global: 5000, perUser: 300 }, leases: { global: 256, perUser: 1 }, watches: { global: 1024, perSession: 32 } } });
+  expect(hosted.sessions.limits).toMatchObject({ user: 300, global: 5000 });
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const first = sessionContext(principal, meta), second = sessionContext(principal, { "ai.opencode/sessionID": "resource-second" });
+  await hosted.sessions.bind(principal, second, { name: "fe", create: true });
+  await hosted.delivery.open(principal, first);
+  await expect(hosted.delivery.open(principal, second)).rejects.toThrow("delivery lease capacity reached");
+});
+
+test("a configured per-session watch cap bounds a listen's resource subscriptions (#805 F-06)", async () => {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, caps: { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 1 } } });
+  const headers = new Headers();
+  const sub = await connect("2026-07-28", "subscriber", undefined, headers);
+  const opened = await sub.callTool({ name: "delivery_open", arguments: {} });
+  headers.set("X-Grayboard-Lease", JSON.parse((opened.content as { text: string }[])[0]!.text).capability);
+  // Both URIs are valid, so only the cap refuses; the refusal reaches the client as a generic bad request.
+  await expect(sub.listen({ resourceSubscriptions: ["grayboard://inbox", "grayboard://inbox"] })).rejects.toThrow("bad_request");
+  const listen = await sub.listen({ resourceSubscriptions: ["grayboard://inbox"] });
+  await listen.close();
+});
+
+test("a configured per-session watch cap bounds an older-protocol session's resource subscriptions (#805 F-06)", async () => {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, caps: { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 1 } } });
+  const client = await connect("2025-11-25", "native");
+  for (const name of ["one", "two"]) expect((await client.callTool({ name: "board_create", arguments: { name, purpose: "legacy watch cap" } })).isError).not.toBe(true);
+  expect(await client.subscribeResource({ uri: "grayboard://boards/one" })).toEqual({});
+  await expect(client.subscribeResource({ uri: "grayboard://boards/two" })).rejects.toThrow();
+});
+
+// #807 P3 B1b: a root that holds no name is refused a watch on a board its user can list. Two checks refuse it:
+// bindingLive (its stamp says holding false) and the board capability (it has no address); the legacy wire masks both.
+test("an unbound native root's board subscribe is refused though its user lists the board", async () => {
+  const bound = await connect("2025-11-25", "native");
+  expect((await bound.callTool({ name: "board_create", arguments: { name: "seen", purpose: "unbound watch" } })).isError).not.toBe(true);
+  expect(await bound.subscribeResource({ uri: "grayboard://boards/seen" })).toEqual({});
+  meta["ai.opencode/sessionID"] = "resource-unbound-root";
+  try {
+    const unbound = await connect("2025-11-25", "native");
+    expect((await unbound.callTool({ name: "board_list", arguments: {} })).content).toEqual(expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("seen") })]));
+    await expect(unbound.subscribeResource({ uri: "grayboard://boards/seen" })).rejects.toThrow("resource not found");
+  } finally { meta["ai.opencode/sessionID"] = "resource-root"; }
+});
+
+// #881 passes a lease call's first authorization to the lease capability check instead of authorizing again.
+for (const method of ["renew", "inbox"] as const) test(`#902: a warm ${method} checks its grant ${method === "renew" ? 10 : 11} times`, async () => {
+  const headers = new Headers();
+  const client = await connect("2026-07-28", "subscriber", undefined, headers);
+  const opened = await client.callTool({ name: "delivery_open", arguments: {} });
+  headers.set("X-Grayboard-Lease", (JSON.parse((opened.content[0] as { text: string }).text) as { capability: string }).capability);
+  const call = () => method === "renew" ? client.callTool({ name: "delivery_renew", arguments: {} }) : client.readResource({ uri: "grayboard://inbox" });
+  await call();
+  let calls = 0;
+  const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", isActive => (...args) => { calls++; return isActive(...args); });
+  try { await call(); } finally { restoreAccess(); }
+  expect(calls).toBe(method === "renew" ? 10 : 11); // before #881, 11 and 12
 });

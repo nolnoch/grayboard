@@ -23,11 +23,12 @@ import { localEnv, serverEnv } from "../support/env.ts";
 import { closeSessions, localSession, mcpSession, stopSession, type Session } from "../support/mcp.ts";
 import type { DeliveryEvent } from "../../src/server/application.ts";
 import { hashToken } from "../../src/server/auth.ts";
+import { GOOGLE_ISSUER } from "../../src/server/idp_google.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
-import { direct } from "../support/events.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
 import { CLI } from "../support/paths.ts";
 import { newer } from "../../src/cli/update.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
@@ -136,6 +137,25 @@ function schema(path: string): Schema {
   }
 }
 
+// users' IdP columns and its own indexes (#928 D3), read-only.
+function identities(path: string): { email: string; idp_issuer: string | null; idp_subject: string | null }[] {
+  const db = new Database(path, { readonly: true });
+  try {
+    return db.query("SELECT email, idp_issuer, idp_subject FROM users ORDER BY id").all() as { email: string; idp_issuer: string | null; idp_subject: string | null }[];
+  } finally {
+    db.close();
+  }
+}
+
+function userIndexes(path: string): string[] {
+  const db = new Database(path, { readonly: true });
+  try {
+    return (db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'users' AND name LIKE 'idx_%' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+  } finally {
+    db.close();
+  }
+}
+
 function expectUpgraded(before: Schema, upgraded: Schema, fresh: Schema): void {
   for (const [table, cols] of Object.entries(before)) {
     expect(Object.keys(upgraded[table] ?? {}), `${rel.tag} table ${table}`).toEqual(expect.arrayContaining(Object.keys(cols)));
@@ -219,17 +239,7 @@ async function releaseToken(server: ServerProcess, dbPath: string, email: string
   }
   // ServerProcess's public URL: the issuer, and the origin its redirects name.
   const issuer = "http://localhost";
-  const cookies = new Map([["gb_oauth_session", session]]);
-  const request = async (url: string, init: RequestInit = {}) => {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(url.replace(issuer, server.base), { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) {
-      const [k, v] = cookie.split(";")[0]!.split("=");
-      cookies.set(k!, v!);
-    }
-    return res;
-  };
+  const browser = new Browser({ cookies: { gb_oauth_session: session }, rewrite: url => url.replace(issuer, server.base) }), request = browser.request.bind(browser);
   const verifier = secret();
   const redirectUri = "http://127.0.0.1:45678/callback";
   const binding = { client_id: HOSTED_CLIENT, redirect_uri: redirectUri, resource: `${issuer}/mcp` };
@@ -239,8 +249,7 @@ async function releaseToken(server: ServerProcess, dbPath: string, email: string
   // Anywhere else (Google's sign-in) means the release refused the hand-written session.
   expect(authorize.headers.get("Location"), "the release didn't accept the hand-written oauth_browsers session").toStartWith(`${issuer}/oauth/consent`);
   const page = await (await request(authorize.headers.get("Location")!)).text();
-  const form = { request: /name="request" value="([^"]+)"/.exec(page)?.[1] ?? "", csrf: /name="csrf" value="([^"]+)"/.exec(page)?.[1] ?? "" };
-  const decided = await request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: issuer }, body: new URLSearchParams({ ...form, decision: "approve" }) });
+  const decided = await submitConsent(browser, `${issuer}/oauth/consent`, consentForm(page));
   expect(decided.status, page).toBe(303);
   const code = new URL(decided.headers.get("Location")!).searchParams.get("code")!;
   const token = await fetch(`${server.base}/oauth/token`, { method: "POST", body: new URLSearchParams({ ...binding, grant_type: "authorization_code", code, code_verifier: verifier }) });
@@ -326,9 +335,15 @@ function hostedReader(s: HostedSession): Reader {
       await s.next((e) => match(textOf(e)), 10_000);
     },
     quiet: (match) => s.none((e) => match(textOf(e))),
+    // The lease's inbox is every DM past the read point (application.pending), so the first read
+    // that shows `offline` also shows any DM a lost read point would bring back: no window to wait out.
     onlyDm: async (offline) => {
-      await s.next(direct((m) => m.body === offline), 10_000);
-      await s.none(direct());
+      const dms = await until(async () => {
+        const read = (await s.inbox()).filter((item) => item.event.kind === "direct");
+        return read.length ? read : undefined;
+      }, 10_000, `a DM in ${offline}'s recipient's inbox`);
+      expect(dms.map((item) => (item.event.kind === "direct" ? item.event.message.body : ""))).toEqual([offline]);
+      await s.receipt(dms.map((item) => item.id));
     },
     file: (id) => s.download(id),
   };
@@ -383,15 +398,6 @@ function mailbox(path: string, readPointSql: string, newestSql: string): Mailbox
   return { readPoint: (a) => one(readPointSql, a), newest: (a) => one(newestSql, a) };
 }
 
-function hasTable(path: string, name: string): boolean {
-  const db = new Database(path, { readonly: true });
-  try {
-    return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== null;
-  } finally {
-    db.close();
-  }
-}
-
 // Waits until each agent's read point covers what it was delivered, takes
 // both offline, and has a third agent DM each of them.
 async function sendWhileOffline(m: Mailbox, be: Writer, fe: Writer, sim: () => Promise<Writer>, beHandle: string, feHandle: string): Promise<void> {
@@ -420,7 +426,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   const dbPath = join(dir, "old", "grayboard.db");
   mkdirSync(join(dir, "old"));
   // Hosted sessions spend hosted requests polling their inbox.
-  old = await ServerProcess.start(rel.server, dbPath, { GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000" });
+  old = await ServerProcess.start(rel.server, { dbPath: dbPath }, { GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000" });
   const alice = await old.login("alice@example.com");
   const bob = await old.login("bob@example.com");
   const signIns: Record<string, string> = { "alice@example.com": alice, "bob@example.com": bob };
@@ -450,7 +456,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
     }
   }
   // A 2.x server keeps read points by address (#284); a 1.x server by identity.
-  const byAddress = hasTable(dbPath, "mailbox_cursors");
+  const byAddress = "mailbox_cursors" in schema(dbPath);
   const m = mailbox(
     dbPath,
     byAddress
@@ -461,9 +467,31 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   await sendWhileOffline(m, be, fe, () => session("alice@example.com", "sim"), "alice@example.com/be", "bob@example.com/fe");
   await stopOld();
   keep(`${label}-as-written`, join(dir, "old"));
+  // #927: ownership moves into role bindings once, on the first open. Bob is made an explicit owner and alice a
+  // creator from before roles (a null role), the two rows the seed reads, by hand on whatever the release wrote (a
+  // release from before team_members.role gets the column as this tree's open would add it).
+  // A release with role_bindings already ran the seed, so these rows reach no binding.
+  const roles = teams && !("role_bindings" in schema(dbPath));
+  if (roles) {
+    const d = new Database(dbPath);
+    try {
+      if (!("role" in (schema(dbPath).team_members ?? {}))) d.run("ALTER TABLE team_members ADD COLUMN role TEXT");
+      d.run("UPDATE team_members SET role = 'owner' WHERE user_id = (SELECT id FROM users WHERE email = 'bob@example.com')");
+      d.run("UPDATE team_members SET role = NULL WHERE user_id = (SELECT id FROM users WHERE email = 'alice@example.com')");
+    } finally { d.close(); }
+  }
   const before = schema(dbPath);
+  // A release with users.idp_issuer already stamped what it would (#928 D3); this tree's open adds Google's to a user
+  // with a subject only, so a dev-auth user it wrote keeps its null.
+  const written = "idp_issuer" in (before.users ?? {}) ? identities(dbPath) : undefined;
 
-  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs"), hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs"), hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  // #928 D3: on a release from before the column, every user it wrote (a v1.0.0 one with no idp_subject, or a
+  // post-F-13 one) is stamped with Google's issuer; and the old index is gone.
+  const stamped = new Map(written?.map(u => [u.email, u.idp_subject !== null ? GOOGLE_ISSUER : u.idp_issuer])
+    ?? identities(dbPath).map(u => [u.email, GOOGLE_ISSUER]));
+  expect(identities(dbPath).map(u => u.idp_issuer)).toEqual(identities(dbPath).map(u => stamped.get(u.email) ?? null));
+  expect(userIndexes(dbPath)).toEqual(["idx_users_idp_identity"]);
   // The old sign-ins still hold.
   for (const token of [alice, bob]) expect((await srv.api(token, "GET", "/api/whoami")).status).toBe(200);
   // The read-back is a hosted session's: the names the release wrote bind as they stand.
@@ -476,30 +504,99 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
     const members = await runCli(["--json", "team", "members", "core"], { cwd: dir, env: serverEnv(dir, srv.base, alice, "be", { GRAYBOARD_CREDENTIALS: creds }) });
     expect(members.out).toContain("bob@example.com");
   }
+  if (roles) expect(owners(dbPath)).toEqual([["alice@example.com", "core"], ["bob@example.com", "core"]]);
 
-  const fresh = new TestServer({ dbPath: join(dir, "fresh.db") });
+  const fresh = await TestServer.open({ dbPath: join(dir, "fresh.db") });
   await fresh.stop();
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
+
+  // The stamp runs once, with the column: a row unlink-idp cleared isn't re-stamped by a later open.
+  await srv.app.repo.write(async tx => srv!.app.repo.users.clearSubject(tx, (await srv!.app.repo.users.findByEmail(tx, "bob@example.com"))!.id));
+  await srv.stop();
+  srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "bob@example.com"))).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))).toMatchObject({ idp_issuer: stamped.get("alice@example.com") });
+  // The ownership seed runs once, with the table: a binding revoked after it isn't seeded back by a later open, though
+  // team_members.role still says owner.
+  if (roles) {
+    await srv.app.repo.write(tx => srv!.app.repo.roles.revoke(tx, { holder: "bob@example.com", role: "team_owner", scope: "core", byUser: null, authority: "none", actor: null }));
+    await srv.stop();
+    srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
+    expect(owners(dbPath)).toEqual([["alice@example.com", "core"]]);
+  }
 }, 60_000);
 
-// #282: this tree's server no longer serves `grayboard mcp --mode server` over WebSocket. A 2.x release's
-// process learns that at its first frame and exits with the refusal inside 2 s; a 1.x one is refused the
-// same way but may only time out (older than 1.10.0 never reads the answer), so for it the contract is that
-// no session is registered.
-test(`server: ${FROM}'s \`mcp --mode server\` is refused by this tree's server`, async () => {
+// Every team_owner binding, as [holder, team].
+function owners(path: string): [string, string][] {
+  const d = new Database(path, { readonly: true });
+  try {
+    return (d.query("SELECT p.name AS holder, s.name AS team FROM role_bindings b JOIN principals p ON p.id = b.principal_id JOIN principals s ON s.id = b.scope_id WHERE b.role = 'team_owner' ORDER BY p.name").all() as { holder: string; team: string }[]).map(r => [r.holder, r.team]);
+  } finally { d.close(); }
+}
+
+// #928 D3, the documented rollback: this tree opens a database, the release's binary then runs on it, and this
+// tree opens it again. A release's Google sign-in can't be driven from another process (releaseToken), so the
+// subject it would link is written by hand, and only for a release that knows idp_subject (it recreates
+// idx_users_idp_subject); an older release only adds subjectless users, which come back with neither column.
+test(`server: a database this tree wrote, run under ${FROM} and reopened, keeps every identity Google's`, async () => {
+  label = "rollback";
+  const dbPath = join(dir, "old", "grayboard.db");
+  mkdirSync(join(dir, "old"));
+  srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
+  await srv.login("alice@example.com");
+  expect(await srv.app.repo.write(async tx => (await srv!.app.repo.users.signIn(tx, GOOGLE_ISSUER, "g-alice", "alice@example.com", null)).status)).toBe("ok");
+  await srv.stop();
+  srv = undefined;
+
+  old = await ServerProcess.start(rel.server, { dbPath: dbPath });
+  await old.login("bob@example.com");
+  await stopOld();
+  const knowsSubjects = userIndexes(dbPath).includes("idx_users_idp_subject");
+  if (knowsSubjects) {
+    const db = new Database(dbPath);
+    try { db.run("UPDATE users SET idp_subject = 'g-bob' WHERE email = 'bob@example.com'"); } finally { db.close(); }
+  }
+  keep(`${label}-as-rolled-back`, join(dir, "old"));
+
+  srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
+  expect(userIndexes(dbPath)).toEqual(["idx_users_idp_identity"]);
+  expect(identities(dbPath)).toEqual([
+    { email: "alice@example.com", idp_issuer: GOOGLE_ISSUER, idp_subject: "g-alice" },
+    knowsSubjects
+      ? { email: "bob@example.com", idp_issuer: GOOGLE_ISSUER, idp_subject: "g-bob" }
+      : { email: "bob@example.com", idp_issuer: null, idp_subject: null },
+  ]);
+  const repo = srv.app.repo;
+  expect(await repo.write(async tx => (await repo.users.signIn(tx, GOOGLE_ISSUER, "g-alice", "alice@example.com", null)).status)).toBe("ok");
+  expect(await repo.write(tx => repo.users.signIn(tx, GOOGLE_ISSUER, "g-bob", "bob@example.com", null))).toMatchObject({ status: "ok", user: { idp_issuer: GOOGLE_ISSUER, idp_subject: "g-bob" } });
+}, 60_000);
+
+// #282, #475: this tree's server serves no WebSocket. `/ws`, or any path, answers an upgrade with the
+// ordinary 404 and registers nothing. A v2.3.0-or-later release's CLI refuses `mcp --mode server` itself
+// and exits non-zero inside 2 s. An older release dials the removed transport: with no refusal handler
+// it reads the 404 as a dropped connection and retries until killed (the maintainer's call, #475: no
+// shim for it), so for it the contract is that it never exits 0 and no session is registered.
+test(`server: ${FROM}'s \`mcp --mode server\` gets no session from this tree's server`, async () => {
   label = "refusal";
-  srv = new TestServer({ dbPath: join(dir, "grayboard.db") });
+  srv = await TestServer.open({ dbPath: join(dir, "grayboard.db") });
   const token = await srv.login("alice@example.com");
+  const upgrade = { Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version": "13" };
+  for (const path of ["/ws", "/"]) {
+    const res = await fetch(`${srv.base}${path}`, { headers: { ...upgrade, Authorization: `Bearer ${token}` } });
+    expect(res.status, path).toBe(404);
+    expect(res.headers.get("upgrade"), path).toBeNull();
+  }
   const run = (timeoutMs: number) =>
     runCli(["mcp", "--mode", "server"], { bin: rel.cli, cwd: dir, env: serverEnv(dir, srv!.base, token, "be"), holdStdin: true, timeoutMs });
-  if (FROM.startsWith("v1.")) {
-    await run(15_000).catch(() => undefined);
-  } else {
+  if (HOSTED_ONLY) {
     const started = Date.now();
     const r = await run(2_000);
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(r.code).not.toBe(0);
     expect(r.err).toContain("no longer serves `grayboard mcp` over WebSocket");
+  } else {
+    const r = await run(5_000).catch((e: Error) => e);
+    if (!(r instanceof Error)) expect(r.code, r.err).not.toBe(0);
   }
   expect((srv.app.db.prepare(`SELECT COUNT(*) AS n FROM ids`).get() as { n: number }).n).toBe(0);
 }, 30_000);

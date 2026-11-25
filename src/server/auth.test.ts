@@ -2,23 +2,10 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTouchQueue, hashToken, mintToken, verifySessionToken, verifyGoogleIdToken } from "./auth.ts";
-import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWTPayload } from "jose";
+import { createTouchQueue, hashToken, mintToken, reauthDue, verifySessionToken } from "./auth.ts";
 import { openDatabase, type Repo } from "./db.ts";
-
-test("Google JWT verification preserves issuer/audience/domain and requires verified typed email and bound nonce", async () => {
-  const { privateKey, publicKey } = await generateKeyPair("RS256");
-  const keyResolver = createLocalJWKSet({ keys: [{ ...await exportJWK(publicKey), kid: "test" }] });
-  const claims: JWTPayload = { iss: "https://accounts.google.com", aud: "client", sub: "subject", iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 60,
-    hd: "example.com", email: "YOU@example.com", email_verified: true, nonce: "nonce", name: "You" };
-  const sign = (payload: JWTPayload) => new SignJWT(payload).setProtectedHeader({ alg: "RS256", kid: "test" }).sign(privateKey);
-  expect(await verifyGoogleIdToken(await sign(claims), "client", "example.com", { expectedNonce: "nonce", keyResolver })).toEqual({ email: "you@example.com", displayName: "You" });
-  for (const patch of [{ iss: "https://evil.example" }, { aud: "wrong" }, { hd: "wrong" }, { email_verified: false }, { email_verified: "true" }, { email: 12 }, { email: "" }, { nonce: "wrong" }, { nonce: undefined }, { exp: 1 }, { exp: undefined }, { sub: undefined }]) {
-    await expect(verifyGoogleIdToken(await sign({ ...claims, ...patch }), "client", "example.com", { expectedNonce: "nonce", keyResolver })).rejects.toThrow();
-  }
-  // Existing CLI calls do not supply a nonce; AS calls always do.
-  expect((await verifyGoogleIdToken(await sign({ ...claims, nonce: undefined }), "client", "example.com", { keyResolver })).email).toBe("you@example.com");
-});
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 describe("token helpers", () => {
   test("mintToken has gbrd_v1_ prefix", () => {
@@ -39,50 +26,129 @@ describe("token helpers", () => {
   });
 });
 
+test("a touch scheduled after cancelAll never runs: stop() closed the queue (#385)", async () => {
+  const touches = createTouchQueue();
+  const ran: string[] = [];
+  touches.schedule(() => ran.push("before"));
+  touches.cancelAll();
+  touches.schedule(() => ran.push("after"));
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  expect(ran).toEqual([]);
+});
+
+describe("reauthDue (#930)", () => {
+  const now = 1_000 * 86_400_000, day = 86_400_000;
+  const user = (u: Partial<Parameters<typeof reauthDue>[0]>) => ({ kind: "user" as const, idp_issuer: "https://idp.example", idp_checked_at: now - day, ...u });
+  test("due once the clock is older than the window, never at 0 days", () => {
+    expect(reauthDue(user({ idp_checked_at: now - 30 * day }), now, 30)).toBe(false);
+    expect(reauthDue(user({ idp_checked_at: now - 30 * day - 1 }), now, 30)).toBe(true);
+    expect(reauthDue(user({ idp_checked_at: now - 3000 * day }), now, 0)).toBe(false);
+  });
+  test("a linked user with no clock is due; a dev login (no issuer, no clock) and a service never are; an unlinked user keeps its clock", () => {
+    expect(reauthDue(user({ idp_checked_at: null }), now, 30)).toBe(true);
+    expect(reauthDue(user({ idp_issuer: null, idp_checked_at: null }), now, 30)).toBe(false);
+    expect(reauthDue(user({ kind: "service", idp_checked_at: null }), now, 30)).toBe(false);
+    expect(reauthDue(user({ idp_issuer: null, idp_checked_at: now - 31 * day }), now, 30)).toBe(true);
+  });
+});
+
 describe("verifySessionToken", () => {
   let repo: Repo;
+  let db: ReturnType<typeof openDatabase>["db"];
   const touches = createTouchQueue();
 
   beforeEach(() => {
-    const { repo: r } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-    repo = r;
+    ({ repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
   });
 
-  test("valid token returns authed user", () => {
-    const u   = repo.users.upsertByEmail("wade@example.com", null);
+  test("valid token returns authed user", async () => {
     const raw = mintToken();
-    repo.sessions.create(u.id, hashToken(raw), null);
-    const authed = verifySessionToken(raw, repo, touches);
+    await seed(repo, async tx => {
+      const u = await repo.users.upsertByEmail(tx, "wade@example.com", null);
+      await repo.sessions.create(tx, u.id, hashToken(raw), null);
+    });
+    const authed = await verifySessionToken(raw, repo, touches, 0, 0);
     expect(authed).not.toBeNull();
     expect(authed!.user_email).toBe("wade@example.com");
   });
 
-  test("missing token returns null", () => {
-    expect(verifySessionToken("gbrd_v1_nonexistent", repo, touches)).toBeNull();
+  // Security audit F-14: idle, not age. A token used within the window keeps
+  // working however old it is; one unused for longer is refused; 0 never expires.
+  test("a token unused longer than idleDays is refused; use keeps it alive", async () => {
+    const raw = mintToken();
+    const s   = await seed(repo, async tx => repo.sessions.create(tx, (await repo.users.upsertByEmail(tx, "wade@example.com", null)).id, hashToken(raw), null));
+    const day = 86_400_000;
+    const idle = (days: number) => seed(repo, tx => repo.sessions.touch(tx, s.id, repo.now() - days * day));
+    await idle(29);
+    expect(await verifySessionToken(raw, repo, touches, 30, 0)).not.toBeNull();
+    await idle(31);
+    expect(await verifySessionToken(raw, repo, touches, 30, 0)).toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 0, 0)).not.toBeNull();
+    // Age doesn't count: a year-old token used yesterday works.
+    await seed(repo, async tx => {
+      db.run("UPDATE sessions SET created_at = ? WHERE id = ?", [repo.now() - 365 * day, s.id]);
+      await repo.sessions.touch(tx, s.id, repo.now() - day);
+    });
+    expect(await verifySessionToken(raw, repo, touches, 30, 0)).not.toBeNull();
   });
 
-  test("revoked token returns null", () => {
-    const u   = repo.users.upsertByEmail("wade@example.com", null);
-    const raw = mintToken();
-    const s   = repo.sessions.create(u.id, hashToken(raw), null);
-    repo.sessions.revoke(s.id);
-    expect(verifySessionToken(raw, repo, touches)).toBeNull();
+  // #930: a CLI token stops working once the IdP last vouched for its user more than reauthDays ago, as a refresh does.
+  test("a token whose user's IdP clock is older than reauthDays is refused; a fresh sign-in restores it", async () => {
+    const raw = mintToken(), day = 86_400_000;
+    const u = await seed(repo, async tx => {
+      const r = await repo.users.signIn(tx, "https://idp.example", "sub-wade", "wade@example.com", null);
+      if (r.status !== "ok") throw new Error(r.status);
+      await repo.sessions.create(tx, r.user.id, hashToken(raw), null);
+      return r.user;
+    });
+    const checked = (days: number) => seed(repo, () => db.run("UPDATE users SET idp_checked_at = ? WHERE id = ?", [repo.now() - days * day, u.id]));
+    await checked(29);
+    expect(await verifySessionToken(raw, repo, touches, 0, 30)).not.toBeNull();
+    await checked(31);
+    expect(await verifySessionToken(raw, repo, touches, 0, 30)).toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 0, 0)).not.toBeNull();
+    await seed(repo, tx => repo.users.signIn(tx, "https://idp.example", "sub-wade", "wade@example.com", null));
+    expect(await verifySessionToken(raw, repo, touches, 0, 30)).not.toBeNull();
   });
 
-  test("disabled user returns null", () => {
-    const u   = repo.users.upsertByEmail("wade@example.com", null);
-    const raw = mintToken();
-    repo.sessions.create(u.id, hashToken(raw), null);
-    repo.users.setDisabled(u.id, true);
-    expect(verifySessionToken(raw, repo, touches)).toBeNull();
+  test("missing token returns null", async () => {
+    expect(await verifySessionToken("gbrd_v1_nonexistent", repo, touches, 0, 0)).toBeNull();
   });
 
-  test("re-enabled user returns authed user", () => {
-    const u   = repo.users.upsertByEmail("wade@example.com", null);
+  test("revoked token returns null", async () => {
     const raw = mintToken();
-    repo.sessions.create(u.id, hashToken(raw), null);
-    repo.users.setDisabled(u.id, true);
-    repo.users.setDisabled(u.id, false);
-    expect(verifySessionToken(raw, repo, touches)).not.toBeNull();
+    await seed(repo, async tx => {
+      const u = await repo.users.upsertByEmail(tx, "wade@example.com", null);
+      const s = await repo.sessions.create(tx, u.id, hashToken(raw), null);
+      await repo.sessions.revoke(tx, s.id);
+    });
+    expect(await verifySessionToken(raw, repo, touches, 0, 0)).toBeNull();
+  });
+
+  test("disabled user returns null", async () => {
+    const raw = mintToken();
+    await seed(repo, async tx => {
+      const u = await repo.users.upsertByEmail(tx, "wade@example.com", null);
+      await repo.sessions.create(tx, u.id, hashToken(raw), null);
+      await repo.users.setDisabled(tx, u.id, true);
+    });
+    expect(await verifySessionToken(raw, repo, touches, 0, 0)).toBeNull();
+  });
+
+  // Security audit F-14: disable revokes the token, so enable doesn't revive it.
+  test("re-enabled user's old token stays revoked; a new one works", async () => {
+    const raw = mintToken();
+    const u = await seed(repo, async tx => {
+      const u = await repo.users.upsertByEmail(tx, "wade@example.com", null);
+      await repo.sessions.create(tx, u.id, hashToken(raw), null);
+      await repo.users.setDisabled(tx, u.id, true);
+      await repo.users.setDisabled(tx, u.id, false);
+      return u;
+    });
+    expect(await verifySessionToken(raw, repo, touches, 0, 0)).toBeNull();
+    const fresh = mintToken();
+    await seed(repo, tx => repo.sessions.create(tx, u.id, hashToken(fresh), null));
+    expect(await verifySessionToken(fresh, repo, touches, 0, 0)).not.toBeNull();
   });
 });

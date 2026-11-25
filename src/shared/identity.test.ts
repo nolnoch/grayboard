@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
+import { configuredIdentity, defaultIdentity, describeLocation, linkedWorktreeName, pinnedIdentity, resolveIdentity, sessionIdentity } from "./identity.ts";
 
 let root: string;
 const at = (...p: string[]) => join(root, ...p);
@@ -70,6 +70,27 @@ describe("describeLocation", () => {
   test("outside git: the directory name", () => expect(describeLocation(at("plain", "sub"))).toBe("sub"));
 });
 
+describe("configuredIdentity (#443: a hosted adapter's start bind)", () => {
+  test("nothing without an explicit BUS_IDENTITY", () => {
+    expect(configuredIdentity({}, at("repo"))).toBeUndefined();
+    expect(configuredIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBeUndefined();
+  });
+  test("a pin echo is none", () => {
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try { expect(configuredIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBeUndefined(); }
+    finally { rmSync(at("repo", ".mcp.json")); }
+  });
+  test("an explicit one is lowercased, verbatim otherwise; one the naming rule refuses is an error", () => {
+    expect(configuredIdentity({ BUS_IDENTITY: "Sim" }, at("repo", ".wt", "stream"))).toEqual({ name: "sim" });
+    expect(configuredIdentity({ BUS_IDENTITY: "no spaces" }, at("repo"))).toEqual({ error: expect.stringContaining("invalid identity name") });
+  });
+  test("a server name may carry a scope (#543 audit 2)", () => {
+    expect(configuredIdentity({ BUS_IDENTITY: "Eng/Deploy" }, at("repo"))).toEqual({ name: "eng/deploy" });
+    expect(configuredIdentity({ BUS_IDENTITY: "you@example.com/sim" }, at("repo"))).toEqual({ name: "you@example.com/sim" });
+  });
+});
+
 describe("sessionIdentity", () => {
   test("BUS_IDENTITY wins", () => expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be"));
   test("default plus worktree suffix", () => expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream"));
@@ -102,9 +123,9 @@ describe("sessionIdentity", () => {
   });
 
   test("a BUS_IDENTITY equal to the repo's .omp/mcp.json pin stays derived: the suffix composes", () => {
-    // omp pins its own identity in .omp/mcp.json (README §Other harnesses)
-    // and delivers it as BUS_IDENTITY — an omp session in a worktree must
-    // keep the suffix it always had, so comparing against .mcp.json alone
+    // A BUS_IDENTITY equal to omp's .omp/mcp.json pin re-delivers it (omp
+    // ran that entry before #523) — an omp session in a worktree must keep
+    // the suffix it always had, so comparing against .mcp.json alone
     // (treating omp's pin as explicit) would orphan that handle's mail.
     const ompPin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
     mkdirSync(at("repo", ".omp"), { recursive: true });
@@ -125,18 +146,32 @@ describe("sessionIdentity", () => {
     }
   });
 
-  test("a repo with only an omp pin keeps the directory default: echo detection, not default naming", () => {
-    // The omp pin participates in isExplicitIdentity only (a BUS_IDENTITY
-    // re-delivering it stays derived). Default naming with no BUS_IDENTITY
-    // stays .mcp.json alone, as before this PR: a repo that pins only
-    // .omp/mcp.json keeps its directory-derived handles (#182 specifies
-    // default resolution further).
-    const ompPin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
+  test("default naming reads a repo's .omp/mcp.json pin under omp only, after .mcp.json, enabled or not", () => {
+    // Other harnesses never read .omp/mcp.json: a repo that pins only there
+    // keeps their directory-derived handles (#182). Under omp (its local
+    // adapter sets BUS_HARNESS=omp) the pin names the session, from a
+    // disabled entry too, since the adapter refuses an enabled one (#523).
+    const ompPin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], enabled: false, env: { BUS_IDENTITY: "fe" } } } };
     mkdirSync(at("repo", ".omp"), { recursive: true });
     writeFileSync(at("repo", ".omp", "mcp.json"), JSON.stringify(ompPin));
     try {
-      expect(sessionIdentity({}, at("repo", "src"))).toBe("repo");
-      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream");
+      for (const env of [{}, { BUS_HARNESS: "pi" }]) {
+        expect(sessionIdentity(env, at("repo", "src"))).toBe("repo");
+        expect(sessionIdentity(env, at("repo", ".wt", "stream"))).toBe("repo-stream");
+        expect(pinnedIdentity(at("repo", "src"), env)).toBeUndefined();
+      }
+      const omp = { BUS_HARNESS: "omp" };
+      expect(sessionIdentity(omp, at("repo", "src"))).toBe("fe");
+      expect(sessionIdentity(omp, at("repo", ".wt", "stream"))).toBe("fe-stream");
+      expect(pinnedIdentity(at("repo", "src"), omp)).toEqual({ name: "fe", file: ".omp/mcp.json" });
+      // .mcp.json's pin comes first, under omp too.
+      writeFileSync(at("repo", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } }));
+      try {
+        expect(sessionIdentity(omp, at("repo", "src"))).toBe("be");
+        expect(pinnedIdentity(at("repo", "src"), omp)).toEqual({ name: "be", file: ".mcp.json" });
+      } finally {
+        rmSync(at("repo", ".mcp.json"));
+      }
     } finally {
       rmSync(at("repo", ".omp"), { recursive: true, force: true });
     }

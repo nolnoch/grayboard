@@ -1,7 +1,10 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, holdingSessionSql, isHuman, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type PostResult, type Viewer } from "./boards.ts";
+import { holderUserRule } from "./claim_holder.ts";
+import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
+import { immediateTx } from "./write_tx.ts";
 
 export type Claim = {
   key: string;
@@ -12,10 +15,68 @@ export type Claim = {
   expires_at: number;
 };
 
-type ClaimChanges = { wake: string[]; boards: string[] };
+// The columns a caller sees: every one but holder_user, which names the claimant's user (#855).
+const CLAIM_COLS = "key, holder, note, board, acquired_at, expires_at";
+// A row as the claim's own code reads it: holder_user is the claimant's signed-in user, null in local mode and
+// on a claim taken before the column.
+export type ClaimRow = Claim & { holder_user: string | null };
+
+// holderUserRule lives in claim_holder.ts, which reaches no SQLite module, so the Postgres store runs the same rule.
+export { holderUserRule };
+
+/** holderUserRule's facts: the principal of the ID `holder` names, and of the session holding `holder` as an alias. */
+export function holderPrincipals(db: Database, holder: string): { idPrincipal: string | null; heldPrincipal: string | null } {
+  const held = db.prepare(`SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`).get(holder) as
+    { principal: string | null } | null;
+  return { idPrincipal: idRow(db, holder)?.principal ?? null, heldPrincipal: held?.principal ?? null };
+}
+
+export function holderUser(db: Database, c: ClaimRow): string | undefined {
+  if (c.holder_user) return c.holder_user;
+  const f = holderPrincipals(db, c.holder);
+  return holderUserRule(c, f.idPrincipal, f.heldPrincipal);
+}
+
+/**
+ * Who a claim's end (a release or a lapse) is announced for on its board (#1286), judged in order:
+ * - `"holder"`: the holder can still see the board; a release carries its note.
+ * - `"user"`: the holder can't, but the claimant's user (holderUser, #855) can, as a session confined to its binder's
+ *   other team (#1255) whose user still sees the board. The post is written for that user, in fixed text: never the
+ *   caller's note, explicit claim_release or a session end's alike, so a confined holder's own words can't reach a
+ *   board outside its team. Its watchers keep the end post they were promised (principle 3).
+ * - `null`: neither can (or the claim has no board): a quiet end, its watches consumed all the same.
+ * The rule is pure; both modes read its facts, the user's only when the holder's fails.
+ */
+export function endReachRule(board: string | null, holderSees: boolean, user: string | undefined, userSees: boolean): "holder" | "user" | null {
+  if (!board) return null;
+  if (holderSees) return "holder";
+  return user !== undefined && userSees ? "user" : null;
+}
+
+/** endReachRule on `db` for claim `c`: the board and, on the user's path, the user and its sight for the post's gate. */
+function endReach(db: Database, c: ClaimRow): { board: string; user?: { name: string; sees: BoardPredicate } } | null {
+  const board = c.board;
+  const holderSees = !!board && canSeeBoard(db, c.holder, board);
+  const user = board && !holderSees ? holderUser(db, c) : undefined;
+  const sees = user === undefined ? undefined : userViewer(db, user);
+  const via = endReachRule(board, holderSees, user, !!board && !!sees && canSeeBoard(db, sees, board));
+  if (via === null) return null;
+  return via === "holder" ? { board: board! } : { board: board!, user: { name: user!, sees: sees! } };
+}
+
+// A claim as a reader sees it: a holder whose name the reader may not see (a team's alias, outside the team,
+// #871) reads as held by nobody named, its note withheld with it, since a team's labels stay inside it (#284 S13).
+export type ClaimView = Omit<Claim, "holder"> & { holder: string | null };
+
+// Whether `seer` (a session ID or handle) may not see that `holder` exists (#348, #871).
+function holderHidden(db: Database, seer: string, holder: string): boolean {
+  return seenHandles(db, seer, [holder]).length === 0;
+}
+
+export type ClaimChanges = { wake: string[]; boards: string[] };
 export type ClaimResult = ClaimChanges & (
   | { ok: true; claim: Claim; renewed: boolean }
-  | { ok: false; held_by: string; note: string | null; expires_at: number }
+  | { ok: false; held_by: string | null; note: string | null; expires_at: number }
 );
 
 const DEFAULT_TTL_MIN = 30;
@@ -36,38 +97,239 @@ function expiresAt(now: number, minutes: number | undefined, until: string | und
   return now + m * 60_000;
 }
 
-function validKey(key: string): string {
+export function validKey(key: string): string {
   const k = key.trim();
   if (!k || k.length > 200) throw new CoreError("claim key must be 1-200 chars");
+  // Postgres text can't hold NUL (#807 P3 C5a F1), and a key goes into every announcement of its claim.
+  if (k.includes("\0")) throw new CoreError("claim key contains a NUL character");
   return k;
 }
 
-type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
+// A claim note is a line of status (#76): stored on the claim and every
+// claim_events row, and announced on its board.
+export const MAX_NOTE_CHARS = 1000;
+function validNote(note: string | undefined): void {
+  if (note !== undefined && note.length > MAX_NOTE_CHARS) throw new CoreError(`note must be at most ${MAX_NOTE_CHARS} chars`);
+  if (note?.includes("\0")) throw new CoreError("claim note contains a NUL character");
+}
 
-// One claim_events row; callers are inside the claim's transaction.
+export type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
+export type ClaimEventRow = { handle: string; event: ClaimEvent; note: string | null; at: number };
+
+// One claim_events row; callers are inside the claim's transaction. session_id (#1351) is the session holding `handle`
+// now: the alias's holder, else `handle` itself when it is a session ID (live or ended), else null (an alias no
+// session holds). Every event kind records it, so there's one write path.
 export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
   db.prepare(
-    `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${holdingSessionSql("?2")})`,
   ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
 }
 
 // The calling session (#284): `addresses` is its address set, the primary
-// first; `session` its ID, recorded on the posts it makes (S8).
-export type ClaimCtx = { addresses?: string[]; session?: string };
+// first; `session` its ID, recorded on the posts it makes (S8); `via` the
+// child session acting under those addresses (#523), recorded beside it;
+// `user` the signed-in user on a server, recorded as the post's author_user.
+export type ClaimCtx = { addresses?: string[]; session?: string; via?: string; user?: string };
 
-function announce(db: Database, handle: string, board: string | null, text: string, session?: string): ClaimChanges {
-  if (!board) return { wake: [], boards: [] };
-  const result = post(db, handle, board, text, null, { author_id: session });
-  return { wake: result.wake, boards: [result.post.board] };
+// --- The claim rules, pure (#807 B5b3a): both modes' claim tools run these in the same order over their own reads
+// and writes, so the decisions and the texts have one copy.
+
+export type TakeOpts = { ttl_minutes?: number; until?: string; note?: string; board?: string };
+
+/** claim_take's argument checks, in order: the key, the note, the reserved queue: keyspace, the ttl or stop time,
+ * the board name. Throws CoreError; reads nothing. */
+export function checkTake(keyInput: string, opts: TakeOpts, now = Date.now()): { key: string; board: string | null } {
+  const key = validKey(keyInput);
+  validNote(opts.note);
+  // The queue: keyspace is the delivery machinery's: only claimQueuePost
+  // mints these keys, against a post that exists on a board the lane can
+  // see. A public take would let any handle squat a future post's key - the
+  // audit would record a delivery that never happened, and the lane's
+  // reply-ack would fail (#192 review).
+  if (key.startsWith("queue:"))
+    throw new CoreError(
+      `claim keys starting "queue:" are reserved for queue-board delivery; pick up queued work through the board flow instead`,
+    );
+  expiresAt(now, opts.ttl_minutes, opts.until); // validate before taking the lock
+  return { key, board: opts.board ? normalizeBoard(opts.board) : null };
 }
 
-// The claim's watchers as @mentions for a post about it. An end post takes
-// them (clears them), so a later claim on the same key starts with none.
-// Mentions skip anyone who can't see the board.
-function watchersCc(db: Database, key: string, take: boolean): string {
-  const sql = take ? `DELETE FROM claim_watches WHERE key = ? RETURNING handle` : `SELECT handle FROM claim_watches WHERE key = ?`;
-  const rows = db.prepare(sql).all(key) as { handle: string }[];
-  return rows.length ? ` cc ${rows.map((r) => `@${r.handle}`).join(" ")}` : "";
+export type TakeDecision = { held: true } | { held: false; renewed: boolean; as: string; expires: number };
+
+/** Whether `cur` (the key's row, any expiry) is someone else's live claim, and if not, the take: a claim held by any
+ * of `addresses` renews as its holder; a renewal without a ttl or stop time never shortens it; a new claim is
+ * taken as `handle`. */
+export function takeDecision(cur: Claim | undefined, addresses: string[], handle: string, now: number, opts: TakeOpts): TakeDecision {
+  let expires = expiresAt(now, opts.ttl_minutes, opts.until);
+  const renewed = !!cur && cur.expires_at > now && addresses.includes(cur.holder);
+  if (cur && cur.expires_at > now && !renewed) return { held: true };
+  if (renewed && opts.ttl_minutes === undefined && opts.until === undefined) expires = Math.max(expires, cur.expires_at);
+  return { held: false, renewed, as: renewed ? cur.holder : handle, expires };
+}
+
+/** A held take's answer: a holder the caller may not see reads as nobody named, its note withheld with it (#871). */
+/** A held claim's answer: no holder or note for a holder the caller can't see, and no note for a claim on a board it
+ * can't see, since the note was written for that board's room (#1257). */
+export function heldAnswer(cur: Claim, hidden: boolean, boardHidden = false): { ok: false; held_by: string | null; note: string | null; expires_at: number } {
+  return { ok: false, held_by: hidden ? null : cur.holder, note: hidden || boardHidden ? null : cur.note, expires_at: cur.expires_at };
+}
+
+/** Whether a renewal moves the claim onto a board it wasn't on. */
+export function moves(renewed: boolean, row: Claim, cur: Claim | undefined): boolean {
+  return renewed && !!row.board && row.board !== cur?.board;
+}
+
+/** A renewal that moves the claim onto an archived board would start new business there (#635), like a fresh
+ * [claim]; it rolls back instead. So does one moving it onto a board its holder can't see (#1269): the caller saw the
+ * board, but a renewal through another of its addresses keeps that address as holder, which would then hold a claim on
+ * a board it can't read and announce nothing there. `archived` is whether `row.board` is archived; `holderSees` whether
+ * `row.holder` may see it. */
+export function checkMove(renewed: boolean, row: Claim, cur: Claim | undefined, archived: boolean, holderSees: boolean): void {
+  if (!moves(renewed, row, cur)) return;
+  if (archived) throw new CoreError(`#${row.board} is archived; a claim can't move onto it`);
+  if (!holderSees) throw new CoreError(`${row.holder}, which holds ${row.key}, can't see #${row.board}; a claim can't move onto it`);
+}
+
+/** Whether a renewal announces: its note changed. The caller also needs the board, seen by the holder. */
+export function renewAnnounces(note: string | undefined, cur: Claim | undefined): boolean {
+  return note !== undefined && note !== cur?.note;
+}
+
+/** The watchers as a post's mentions. */
+export const ccText = (handles: string[]): string => handles.length ? ` cc ${handles.map((h) => `@${h}`).join(" ")}` : "";
+export const claimText = (key: string, note: string | null): string => `[claim] ${key}${note ? ` — ${note}` : ""}`;
+export const updateText = (key: string, note: string, cc: string[]): string => `[update] ${key} — ${note}${ccText(cc)}`;
+export const releaseText = (key: string, note: string | undefined, cc: string[]): string => `[release] ${key}${note ? ` — ${note}` : ""}${ccText(cc)}`;
+export const expiredText = (key: string, holder: string, cc: string[]): string =>
+  `[expired] ${key}: not released by ${holder}; check with them before relying on it${ccText(cc)}`;
+export const unclaimedText = (key: string, takers: number, cc: string[]): string =>
+  `[unclaimed] ${key}: ${takers === 1 ? "its one lane" : `all ${takers} lanes`} passed on it, and no other lane is left; it stays here unclaimed${ccText(cc)}`;
+
+/** release's argument checks: the key and the note. */
+export function checkRelease(keyInput: string, note: string | undefined): string {
+  const key = validKey(keyInput);
+  validNote(note);
+  return key;
+}
+
+/** Whether `cur` is a live claim held by one of `addresses`: the only claim release ends. */
+export function releasable(cur: Claim | undefined, addresses: string[], now: number): boolean {
+  return !!cur && cur.expires_at > now && addresses.includes(cur.holder);
+}
+
+/** A release that ends nothing: no live claim, or someone else's (named only when the caller may see them). */
+export function releaseRefusal(key: string, cur: Claim | undefined, now: number, hidden: boolean): CoreError {
+  if (!cur || cur.expires_at <= now) return new CoreError(`no active claim on "${key}"`);
+  return new CoreError(hidden ? `"${key}" is held by someone else` : `"${key}" is held by ${cur.holder}, not you`);
+}
+
+/** When one of `addresses` released `key`, if nothing has happened to the key since: its release is the key's
+ * latest event, or on a queue: key the one its own redelivery directly followed. `events` are the key's latest
+ * two, newest first. Otherwise undefined. */
+export function releasedByRule(events: ClaimEventRow[], key: string, addresses: string[]): number | undefined {
+  const [last, prev] = events;
+  if (last?.event === "release" && addresses.includes(last.handle)) return last.at;
+  const redelivered = key.startsWith("queue:") && last?.event === "take" && last.note === REDELIVERED_NOTE;
+  if (redelivered && prev?.event === "release" && addresses.includes(prev.handle)) return prev.at;
+  return undefined;
+}
+
+/** claim_watch's refusals, in the order its checks run. */
+export const watchNoClaim = (key: string) => new CoreError(`no active claim on "${key}"; claim_take it instead`);
+export const watchOwn = (key: string) => new CoreError(`you hold "${key}"`);
+export const watchNoBoard = (key: string, holder: string | null) => new CoreError(
+  `"${key}" isn't announced on a board you can see, so its end can't reach you; ask ${holder ?? "its holder"} to renew it with board=`,
+);
+export const watching = (key: string, board: string) => `ok: watching ${key}; its updates, release or expiry on #${board} will mention you`;
+export const notWatching = (key: string) => `ok: not watching ${key}`;
+
+/** claim_release's answers: a release, and a repeat of the caller's own. */
+export const releasedText = (key: string) => `released ${key}`;
+export const alreadyReleasedText = (at: number) => `already released by you at ${new Date(at).toISOString()}`;
+
+// --- The claim SQL (#807 B5b3a). Each statement is already the form a concurrent store needs, so SQLite runs the
+// shape Postgres will: a take or release that a racing write beat returns no row rather than overwriting.
+
+/** The key's row, live or lapsed. */
+export function claimRow(db: Database, key: string): ClaimRow | undefined {
+  return (db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as ClaimRow | null) ?? undefined;
+}
+
+export type TakeRow = { key: string; as: string; note: string | null; board: string | null; now: number; expires: number; user: string | null };
+
+/** Take or renew: the upsert keeps the note and board a renewal leaves out, and the acquired time of a live
+ * renewal. It overwrites only a lapsed row or the holder's own (D3): null when a live claim of someone else's
+ * was there, which the caller answers as held. */
+export function takeClaim(db: Database, t: TakeRow): Claim | null {
+  return (db.prepare(
+    `INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+     ON CONFLICT(key) DO UPDATE SET
+       holder = excluded.holder,
+       holder_user = excluded.holder_user,
+       note = COALESCE(excluded.note, CASE WHEN claims.holder = excluded.holder THEN claims.note END),
+       board = COALESCE(excluded.board, CASE WHEN claims.holder = excluded.holder THEN claims.board END),
+       acquired_at = CASE WHEN claims.holder = excluded.holder AND claims.expires_at > ?5
+                          THEN claims.acquired_at ELSE excluded.acquired_at END,
+       expires_at = excluded.expires_at
+     WHERE claims.expires_at <= ?5 OR claims.holder = excluded.holder
+     RETURNING ${CLAIM_COLS}`,
+  ).get(t.key, t.as, t.note, t.board, t.now, t.expires, t.user) as Claim | null) ?? null;
+}
+
+/** End `holder`'s live claim on `key`: the deleted row, or null when it wasn't (a racing release or sweep ended it). */
+export function releaseClaim(db: Database, key: string, holder: string, now: number): ClaimRow | null {
+  return (db.prepare(`DELETE FROM claims WHERE key = ? AND holder = ? AND expires_at > ? RETURNING *`).get(key, holder, now) as ClaimRow | null) ?? null;
+}
+
+/** The key's latest two events, newest first: what releasedByRule reads. */
+export function recentClaimEvents(db: Database, key: string): ClaimEventRow[] {
+  return db.prepare(`SELECT handle, event, note, at FROM claim_events WHERE key = ? ORDER BY id DESC LIMIT 2`).all(key) as ClaimEventRow[];
+}
+
+/** The claim's watchers, by handle. */
+export function claimWatchers(db: Database, key: string): string[] {
+  return (db.prepare(`SELECT handle FROM claim_watches WHERE key = ? ORDER BY handle`).all(key) as { handle: string }[]).map((r) => r.handle);
+}
+
+/** The watchers of a claim that ended, by handle, and their watches gone: a later claim on the key starts with none. */
+export function takeClaimWatchers(db: Database, key: string): string[] {
+  const handles = claimWatchers(db, key);
+  if (handles.length) db.prepare(`DELETE FROM claim_watches WHERE key = ?`).run(key);
+  return handles;
+}
+
+/** The key's live claim, for a watch. */
+export function liveClaim(db: Database, key: string, now: number): Claim | undefined {
+  return (db.prepare(`SELECT * FROM claims WHERE key = ? AND expires_at > ?`).get(key, now) as Claim | null) ?? undefined;
+}
+
+export function addClaimWatch(db: Database, key: string, handle: string): void {
+  db.prepare(`INSERT OR IGNORE INTO claim_watches (key, handle) VALUES (?, ?)`).run(key, handle);
+}
+
+export function removeClaimWatch(db: Database, key: string, handle: string): void {
+  db.prepare(`DELETE FROM claim_watches WHERE key = ? AND handle = ?`).run(key, handle);
+}
+
+/** Delete the claims lapsed at `now`, and return them in lapse order, by key within a tie: the delete makes each
+ * lapse announce once, however many sweep, and the order is the store's, not the delete's. A queue claim's lapse
+ * redelivers its post, so lapse order keeps the lanes' rotation as the claims were taken. */
+export function expireClaims(db: Database, now: number): ClaimRow[] {
+  const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as ClaimRow[];
+  return gone.sort((a, b) => a.expires_at - b.expires_at || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+}
+
+// --- Core's claim tools, composed over the rules and the SQL above.
+
+// A new claim can't announce on an archived board (#635); its update, release
+// or expiry, ending what's already there, can (`ending`).
+// `seenBy` passes the gate for a claimant's user whose holder lost the board (endReach, #1286).
+function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}, ending = true, seenBy?: BoardPredicate): ClaimChanges {
+  if (!board) return { wake: [], boards: [] };
+  const result = post(db, handle, board, systemBody(text), null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending, seenBy, system: true });
+  return { wake: result.wake, boards: [result.post.board] };
 }
 
 // Acquire, or renew if you already hold it. Expired claims are free. A
@@ -81,73 +343,92 @@ export function claim(
   db: Database,
   handle: string,
   keyInput: string,
-  opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } & ClaimCtx = {},
+  opts: TakeOpts & ClaimCtx = {},
 ): ClaimResult {
-  const key = validKey(keyInput);
-  // The queue: keyspace is the delivery machinery's: only claimQueuePost
-  // mints these keys, against a post that exists on a board the lane can
-  // see. A public take would let any handle squat a future post's key - the
-  // audit would record a delivery that never happened, and the lane's
-  // reply-ack would fail (#192 review).
-  if (key.startsWith("queue:"))
-    throw new CoreError(
-      `claim keys starting "queue:" are reserved for queue-board delivery; pick up queued work through the board flow instead`,
-    );
-  expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
-  const board = opts.board ? normalizeBoard(opts.board) : null;
+  const { key, board } = checkTake(keyInput, opts);
   const addresses = opts.addresses ?? [handle];
 
   return db.transaction((): ClaimResult => {
+    // A board that doesn't exist, or that `handle` can't see, refuses as a
+    // post to it would (#81), not as the claims row's foreign key failing.
+    if (board && !canSeeBoard(db, handle, board)) throw new CoreError(`no such board #${board}; see board_list`);
     const now = Date.now();
-    let expires = expiresAt(now, opts.ttl_minutes, opts.until);
     // Announce a lapsed claim before anyone takes it over.
     const lapsed = sweepChanges(db, now);
-    const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
-    const renewed = !!cur && cur.expires_at > now && addresses.includes(cur.holder);
-    if (cur && cur.expires_at > now && !renewed) {
+    const held = (cur: Claim): ClaimResult => {
       logEvent(db, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
-      return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, ...lapsed };
-    }
-    const as = renewed ? cur.holder : handle;
-    if (renewed && opts.ttl_minutes === undefined && opts.until === undefined) expires = Math.max(expires, cur.expires_at);
-    const row = db
-      .prepare(
-        `INSERT INTO claims (key, holder, note, board, acquired_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(key) DO UPDATE SET
-           holder = excluded.holder,
-           note = COALESCE(excluded.note, CASE WHEN claims.holder = excluded.holder THEN claims.note END),
-           board = COALESCE(excluded.board, CASE WHEN claims.holder = excluded.holder THEN claims.board END),
-           acquired_at = CASE WHEN claims.holder = excluded.holder AND claims.expires_at > ?
-                              THEN claims.acquired_at ELSE excluded.acquired_at END,
-           expires_at = excluded.expires_at
-         RETURNING *`,
-      )
-      .get(key, as, opts.note ?? null, board, now, expires, now) as Claim;
-    logEvent(db, renewed ? "renew" : "take", as, row, now);
-    const changed = !renewed
-      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts.session)
-      : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, as, row.board)
-        ? announce(db, as, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`, opts.session)
+      return { ...heldAnswer(cur, holderHidden(db, opts.session ?? handle, cur.holder), !!cur.board && !canSeeBoard(db, handle, cur.board)), ...lapsed };
+    };
+    const cur = claimRow(db, key);
+    const d = takeDecision(cur, addresses, handle, now, opts);
+    if (d.held) return held(cur!);
+    const row = takeClaim(db, { key, as: d.as, note: opts.note ?? null, board, now, expires: d.expires, user: opts.user ?? null });
+    if (!row) return held(claimRow(db, key)!);
+    const moved = moves(d.renewed, row, cur);
+    checkMove(d.renewed, row, cur, moved && !!getBoard(db, row.board!)?.archived_at, !moved || row.holder === handle || canSeeBoard(db, row.holder, row.board!));
+    logEvent(db, d.renewed ? "renew" : "take", d.as, row, now);
+    const changed = !d.renewed
+      ? announce(db, d.as, row.board, claimText(key, row.note), opts, false)
+      : renewAnnounces(opts.note, cur) && row.board && canSeeBoard(db, d.as, row.board)
+        ? announce(db, d.as, row.board, updateText(key, opts.note!, claimWatchers(db, key)), opts)
         : { wake: [], boards: [] };
     return {
-      ok: true, claim: row, renewed,
+      ok: true, claim: row, renewed: d.renewed,
       wake: [...new Set([...lapsed.wake, ...changed.wake])],
       boards: [...new Set([...lapsed.boards, ...changed.boards])],
     };
   }).immediate();
 }
 
-// When one of `addresses` released `key`, if nothing has happened to the key
-// since: its release is the key's latest event, or on a queue: key the one
-// its own redelivery directly followed. Otherwise undefined.
-function releasedBy(db: Database, key: string, addresses: string[]): number | undefined {
-  const [last, prev] = db.prepare(`SELECT handle, event, note, at FROM claim_events WHERE key = ? ORDER BY id DESC LIMIT 2`).all(key) as
-    { handle: string; event: ClaimEvent; note: string | null; at: number }[];
-  if (last?.event === "release" && addresses.includes(last.handle)) return last.at;
-  const redelivered = key.startsWith("queue:") && last?.event === "take" && last.note === REDELIVERED_NOTE;
-  if (redelivered && prev?.event === "release" && addresses.includes(prev.handle)) return prev.at;
-  return undefined;
+// A queue post's claim ended without an ack: offer the post to the next lane
+// that hasn't held it. With none left, the post stays readable on its board
+// unclaimed, and a reply in its thread, as the lane that held it last, tells
+// the poster and the claim's watchers (#220). The reply's author shows that
+// last lane, as `[expired]` posts show a holder; its text counts the lanes
+// rather than naming them. A decline's reply is the declining session's
+// (`ctx`); a lapse's is the claimant's user (#855). A holder that lost the
+// board ends it as release does (endReach, #1286): the reply is posted for the
+// claimant's user when that user still sees the board, never as the caller's
+// session. When neither can write it, or it's refused, the post's own author
+// writes it (#1175), else it ends quietly.
+function requeue(db: Database, c: ClaimRow, now: number, ctx: ClaimCtx = {}): ClaimChanges {
+  const cc = takeClaimWatchers(db, c.key);
+  const r = redeliverQueuePost(db, c.key, c.holder, now);
+  if (!r) return { wake: [], boards: [] };
+  if ("lane" in r) return { wake: [r.lane], boards: [] };
+  const text = systemBody(unclaimedText(c.key, r.held, cc));
+  const changes = (res: PostResult): ClaimChanges => ({ wake: res.wake, boards: [res.post.board] });
+  // Judged on the post's board, the key's, which claimQueuePost also recorded as the claim's. A human holder (a
+  // claim from before humans left the lanes) never writes it: system text never bears the human mark (#1175).
+  const end = isHuman(db, c.holder) ? null : endReach(db, { ...c, board: r.board });
+  if (end) {
+    // The system's reply for the claimant's user: no caller's session, via or name set reaches it.
+    const opts: PostOpts = end.user
+      ? { author_user: end.user.name, allowArchived: true, seenBy: end.user.sees }
+      : { author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, author_user: ctx.user ?? holderUser(db, c), allowArchived: true };
+    const res = refusedAsNull(() => post(db, c.holder, r.board, text, r.postId, opts));
+    if (res) return changes(res);
+  }
+  // No holder can write it (#1175): the post's own author, the reader it informs, writes it into its own thread as the
+  // post's writer (its session and user as the post records them), so post's own-exclusion keeps the post's address
+  // set (authorAddresses) out of the fan-out: it never wakes itself; the claim's watchers are told as before. Only while the author sees the board (the post's
+  // gate judges it), and never a declared human's: system text never bears the human mark (principle 10,
+  // docs/slack-bridge.md §3), so a human's post ends quietly.
+  if (isHuman(db, r.author.handle)) return { wake: [], boards: [] };
+  const res = refusedAsNull(() => post(db, r.author.handle, r.board, text, r.postId, {
+    author_id: r.author.id ?? undefined, author_user: r.author.user ?? undefined, allowArchived: true,
+  }));
+  return res ? changes(res) : { wake: [], boards: [] };
+}
+
+/** `f`'s result, or null when it's refused (a CoreError): a system post that can't land writes nothing. */
+function refusedAsNull<T>(f: () => T): T | null {
+  try {
+    return f();
+  } catch (e) {
+    if (e instanceof CoreError) return null;
+    throw e;
+  }
 }
 
 // releasedAt: this caller had already released the claim, at that time, and
@@ -161,33 +442,37 @@ export function release(
   note?: string,
   ctx: ClaimCtx = {},
 ): ClaimChanges & { releasedAt?: number } {
-  const key = validKey(keyInput);
+  const key = checkRelease(keyInput, note);
   const addresses = ctx.addresses ?? [handle];
   return db.transaction(() => {
-    const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
-    const active = !!cur && cur.expires_at > Date.now();
-    if (!active || !addresses.includes(cur.holder)) {
-      const releasedAt = releasedBy(db, key, addresses);
+    const now = Date.now();
+    const refuse = (cur: ClaimRow | undefined) => {
+      const releasedAt = releasedByRule(recentClaimEvents(db, key), key, addresses);
       if (releasedAt !== undefined) return { wake: [], boards: [], releasedAt };
-      if (!active) throw new CoreError(`no active claim on "${key}"`);
-      throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
-    }
-    const as = cur.holder;
-    db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
-    logEvent(db, "release", as, { ...cur, note: note ?? null }, Date.now());
+      if (cur && hiddenQueue(cur, (b) => canSeeBoard(db, handle, b))) throw releaseRefusal(key, undefined, now, false);
+      throw releaseRefusal(key, cur, now, !!cur && cur.expires_at > now && holderHidden(db, ctx.session ?? handle, cur.holder));
+    };
+    const cur = claimRow(db, key);
+    if (!releasable(cur, addresses, now)) return refuse(cur);
+    const gone = releaseClaim(db, key, cur!.holder, now);
+    if (!gone) return refuse(claimRow(db, key));
+    const as = gone.holder;
+    logEvent(db, "release", as, { ...gone, note: note ?? null }, now);
     if (key.startsWith("queue:")) {
       // A declined queue post goes to the next lane with the original post;
       // the decline post would itself rotate as a new work item, so it isn't
       // announced either (#192 review).
-      watchersCc(db, key, true);
-      const lane = redeliverQueuePost(db, key, cur.holder, Date.now());
-      return { wake: lane ? [lane] : [], boards: [] };
+      return requeue(db, gone, now, ctx);
     }
-    const cc = watchersCc(db, key, true);
-    // If the holder lost access to the board since claiming, release quietly;
-    // watchers too, since they're told through the board.
-    const board = cur.board && canSeeBoard(db, as, cur.board) ? cur.board : null;
-    return announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, ctx.session);
+    const cc = takeClaimWatchers(db, key);
+    // A holder who lost the board releases for its user, without the note, or quietly (endReach, #1286); watchers
+    // are consumed either way, since they're told through the board.
+    const end = endReach(db, gone);
+    if (!end) return { wake: [], boards: [] };
+    // The system's post for the claimant's user: no caller's session, note or name set reaches it.
+    if (end.user) return announce(db, as, end.board, releaseText(key, undefined, cc), { user: end.user.name }, true, end.user.sees);
+    // A release with no signed-in caller is the system's (a session end's): it posts as the claimant's user (#855).
+    return announce(db, as, end.board, releaseText(key, note, cc), { ...ctx, user: ctx.user ?? holderUser(db, gone) });
   }).immediate();
 }
 
@@ -196,12 +481,12 @@ export function release(
 // post. A decline, by contrast, is claim_release, which redelivers. Runs
 // inside the caller's transaction; returns whether one of `addresses` held it.
 export function ackQueueClaim(db: Database, addresses: string[], key: string, now = Date.now()): boolean {
-  const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
+  const cur = claimRow(db, key);
   // A lapsed row the sweep hasn't reached is still the holder's: the reply
   // handled the post, so redelivering it would duplicate the work (#234).
   if (!cur || !addresses.includes(cur.holder)) return false;
   db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
-  watchersCc(db, key, true);
+  takeClaimWatchers(db, key);
   logEvent(db, "release", cur.holder, { ...cur, note: cur.expires_at <= now ? "ack (late)" : "ack" }, now);
   return true;
 }
@@ -210,60 +495,92 @@ export function ackQueueClaim(db: Database, addresses: string[], key: string, no
 // its board: the update, release or expiry post @mentions you. Needs a claim with a board, which
 // is where that post goes. off: stop watching. A claim held by any of
 // `addresses` is yours.
-export function watch(db: Database, handle: string, keyInput: string, off = false, addresses: string[] = [handle]): string {
+export function watch(db: Database, handle: string, keyInput: string, off = false, addresses: string[] = [handle], seer: string = handle): string {
   const key = validKey(keyInput);
   if (off) {
-    db.prepare(`DELETE FROM claim_watches WHERE key = ? AND handle = ?`).run(key, handle);
-    return `ok: not watching ${key}`;
+    removeClaimWatch(db, key, handle);
+    return notWatching(key);
   }
-  const cur = db.prepare(`SELECT * FROM claims WHERE key = ? AND expires_at > ?`).get(key, Date.now()) as Claim | undefined;
-  if (!cur) throw new CoreError(`no active claim on "${key}"; claim_take it instead`);
-  if (addresses.includes(cur.holder)) throw new CoreError(`you hold "${key}"`);
-  if (!cur.board || !canSeeBoard(db, handle, cur.board)) {
-    throw new CoreError(
-      `"${key}" isn't announced on a board you can see, so its end can't reach you; ask ${cur.holder} to renew it with board=`,
-    );
-  }
-  db.prepare(`INSERT OR IGNORE INTO claim_watches (key, handle) VALUES (?, ?)`).run(key, handle);
-  return `ok: watching ${key}; its updates, release or expiry on #${cur.board} will mention you`;
+  const cur = liveClaim(db, key, Date.now());
+  if (!cur || hiddenQueue(cur, (b) => canSeeBoard(db, handle, b))) throw watchNoClaim(key);
+  if (addresses.includes(cur.holder)) throw watchOwn(key);
+  if (!cur.board || !canSeeBoard(db, handle, cur.board)) throw watchNoBoard(key, holderHidden(db, seer, cur.holder) ? null : cur.holder);
+  addClaimWatch(db, key, handle);
+  return watching(key, cur.board);
 }
 
 // Claims are visible to everyone on the bus. The announcing board's name is
-// hidden from handles that can't see that board.
-export function listClaims(db: Database, prefix?: string, viewer?: Viewer): Claim[] {
+// hidden from handles that can't see that board; with `seer` (a session ID or
+// handle), a holder it may not see is withheld with its note (#871). `now`: the clock live claims are judged at, the
+// server's store clock there (#1390).
+export function listClaims(db: Database, prefix?: string, viewer?: undefined, seer?: undefined, now?: number): Claim[];
+export function listClaims(db: Database, prefix: string | undefined, viewer: Viewer, seer?: string, now?: number): ClaimView[];
+export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?: string, now = Date.now()): ClaimView[] {
   const rows = db
     .prepare(
-      `SELECT * FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,
+      `SELECT ${CLAIM_COLS} FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,
     )
-    .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
+    .all(now, `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
-  return rows.map((c) => (c.board && !canSeeBoard(db, viewer, c.board) ? { ...c, board: null } : c));
+  return rows
+    .filter((c) => !isQueueKey(c.key) || (!!c.board && canSeeBoard(db, viewer, c.board)))
+    .map((c) => claimView(c, !c.board || canSeeBoard(db, viewer, c.board), seer === undefined || !holderHidden(db, seer, c.holder)));
+}
+
+/** A queue post's claim (claimQueuePost): its key names its board and post, so a reader who can't see the board
+ * isn't shown it, and claim_watch and claim_release answer it as no claim (#270 D5). */
+export function isQueueKey(key: string): boolean {
+  return key.startsWith("queue:");
+}
+
+/**
+ * `items` with its queue claims (keyed `queue:<board>:<post id>`) in post id order, each in a slot a queue claim held,
+ * and every other item where it was. A requeue locks its post (a claim of it, a reply under it), and a posts prune
+ * locks its batch by id: on Postgres, two requeues in another order deadlock against it (#1387). Every sweep and
+ * session end, local or server, runs them in this order.
+ */
+export function queuePostOrder<T>(items: T[], key: (item: T) => string): T[] {
+  const postId = (k: string) => Number(k.slice(k.lastIndexOf(":") + 1));
+  const queued = items.filter((i) => isQueueKey(key(i))).sort((a, b) => postId(key(a)) - postId(key(b)));
+  let next = 0;
+  return items.map((i) => (isQueueKey(key(i)) ? queued[next++]! : i));
+}
+
+/** Whether `c` is a queue post's claim on a board the caller (`sees`) can't see: it answers as no claim at all. */
+export function hiddenQueue(c: { key: string; board: string | null }, sees: (board: string) => boolean): boolean {
+  return isQueueKey(c.key) && !(c.board && sees(c.board));
+}
+
+/** A claim as a reader sees it: its board named only when `boardSeen`, its holder and note only when `holderSeen`. */
+export function claimView(c: Claim, boardSeen: boolean, holderSeen: boolean): ClaimView {
+  // A claim on a board the viewer can't see shows neither the board nor its note, written for that room (#1257).
+  const v: ClaimView = boardSeen ? c : { ...c, board: null, note: null };
+  return holderSeen ? v : { ...v, holder: null, note: null };
 }
 
 // Delete lapsed claims and say so on their boards. The holder never confirmed
 // the work was done, so the post says to check with them. Runs inside the
 // caller's transaction: the delete makes each lapse announce once, however
 // many sessions sweep.
-function sweepChanges(db: Database, now: number): ClaimChanges {
-  const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
+export function sweepChanges(db: Database, now: number): ClaimChanges {
   const wake = new Set<string>();
   const boards = new Set<string>();
-  for (const c of gone) {
+  for (const c of queuePostOrder(expireClaims(db, now), (c) => c.key)) {
     logEvent(db, "expire", c.holder, c, now);
     if (c.key.startsWith("queue:")) {
       // A queue post's claim lapsed: re-offer the original post to the next
       // lane instead of announcing - an expiry post on a queue board would
       // itself rotate as a new work item (#192 review).
-      watchersCc(db, c.key, true);
-      const lane = redeliverQueuePost(db, c.key, c.holder, now);
-      if (lane) wake.add(lane);
+      const changed = requeue(db, c, now);
+      for (const h of changed.wake) wake.add(h);
+      for (const board of changed.boards) boards.add(board);
       continue;
     }
-    const cc = watchersCc(db, c.key, true);
-    // As in release(): a holder who lost access to the board lapses quietly.
-    if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;
-    const text = `[expired] ${c.key}: not released by ${c.holder}; check with them before relying on it${cc}`;
-    const changed = announce(db, c.holder, c.board, text);
+    const cc = takeClaimWatchers(db, c.key);
+    // As in release(): a holder who lost the board lapses for its user, or quietly (endReach, #1286).
+    const end = endReach(db, c);
+    if (!end) continue;
+    const changed = announce(db, c.holder, end.board, expiredText(c.key, c.holder, cc), { user: end.user?.name ?? holderUser(db, c) }, true, end.user?.sees);
     for (const h of changed.wake) wake.add(h);
     for (const board of changed.boards) boards.add(board);
   }
@@ -278,6 +595,15 @@ export function sweepExpired(db: Database, now = Date.now()): ClaimChanges {
   return db.transaction(() => sweepChanges(db, now)).immediate();
 }
 
+// What an expiry timer reads and writes: the next expiry of a claim with a board, and the sweep, which reads the
+// clock inside its write. A server's store reads asynchronously (#807 P3 B2); local mode's reads are synchronous.
+export type ExpirySource = {
+  next(): number | null | Promise<number | null>;
+  sweep(): ClaimChanges | Promise<ClaimChanges>;
+  // The clock next() and the sweep read, which the timer's delay is measured against; Date.now when absent.
+  now?(): number;
+};
+
 // One timer, armed for the next expiry of a claim with a board, so a lapse is
 // announced when it happens. Call arm() after anything that may have added a
 // claim (a tool call, a wakeup); it only ever moves the timer earlier. stop() is terminal.
@@ -286,38 +612,66 @@ export function claimExpiryTimer(
   onWake: (handles: string[]) => void,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
 ): { arm(): void; stop(): void } {
+  return expiryTimer({
+    next: () => (db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as { next: number | null }).next,
+    sweep: () => immediateTx(db)((w) => sweepChanges(w, Date.now())),
+  }, onWake, onBoardsChanged);
+}
+
+// claimExpiryTimer over any source. An asynchronous next() resolves after the arm that asked: a read that started
+// before a commit may miss that commit's claim, but the commit's own arm reads after it; a stale earlier time only
+// fires an empty sweep, which re-arms. A failed sweep or read retries after `retryMs`: a transient store error
+// mustn't leave live claims' lapses unannounced until the next arm. stop() resolves once a sweep or read already
+// running has settled (#1489): a server awaits it before it closes the store.
+export function expiryTimer(
+  source: ExpirySource,
+  onWake: (handles: string[]) => void,
+  onBoardsChanged?: (boards: string[]) => void | Promise<void>,
+  retryMs = 5_000,
+): { arm(): void; stop(): Promise<void> } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let at = Infinity;
   let stopped = false;
+  const running = new Set<Promise<unknown>>();
+  const track = (p: Promise<unknown>) => {
+    const settled = p.then(() => {}, () => {}).finally(() => running.delete(settled));
+    running.add(settled);
+  };
+  const clock = () => (source.now ? source.now() : Date.now());
   const set = (when: number) => {
     if (stopped) return;
     clearTimeout(timer);
     at = when;
-    timer = setTimeout(fire, Math.max(0, when - Date.now()));
+    timer = setTimeout(() => track(fire().catch(e => console.error("[grayboard] claim expiry timer failed:", e))), Math.max(0, when - clock()));
     timer.unref?.();
   };
-  const fire = () => {
+  const fire = async () => {
     if (stopped) return;
     timer = undefined;
     at = Infinity;
     try {
-      const { wake, boards } = sweepExpired(db);
+      // A stop while the sweep waited still stops what follows.
+      const { wake, boards } = await source.sweep();
+      if (stopped) return;
       if (boards.length) {
         try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
       }
       if (!stopped && wake.length) onWake(wake);
     } catch (e) {
       console.error("[grayboard] claim expiry sweep failed:", e);
-      return set(Date.now() + 5_000);
+      return set(clock() + retryMs);
     }
     arm();
   };
+  const moveTo = (next: number | null) => {
+    if (next !== null && next < at) set(next);
+  };
   const arm = () => {
     if (stopped) return;
-    const row = db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as {
-      next: number | null;
-    };
-    if (row.next !== null && row.next < at) set(row.next);
+    const next = source.next();
+    if (!(next instanceof Promise)) return moveTo(next);
+    // set() checks stopped, so a stop while the read waited arms nothing.
+    track(next.then(moveTo, e => { console.error("[grayboard] claim expiry arm failed:", e); moveTo(clock() + retryMs); }));
   };
   arm();
   return {
@@ -327,6 +681,7 @@ export function claimExpiryTimer(
       clearTimeout(timer);
       timer = undefined;
       at = Infinity;
+      return Promise.all([...running]).then(() => {});
     },
   };
 }

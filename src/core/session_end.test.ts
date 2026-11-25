@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { storeAttachment } from "./attachments.ts";
 import { holdAlias } from "./bindings.ts";
 import { createBoard, ensureAlias, openAccess, post, registerId, setAccess, subscribe } from "./boards.ts";
-import { claim, sweepExpired, watch } from "./claims.ts";
+import { claim, listClaims, sweepExpired, watch } from "./claims.ts";
 import { CoreError } from "./errors.ts";
 import { assertDeliverableId, endSession } from "./session_end.ts";
 import { SqliteBlobs } from "../local/blobs.ts";
@@ -47,8 +47,30 @@ test("unread mail to an ended ID bounces to its senders; nothing else does", () 
   const r = end(db);
   expect(r).toEqual({ ended: true, held: ["fe"], wake: ["be"] });
   expect(JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail)).toMatchObject({ bounced: 1, unbounced: 1 });
-  expect(db.prepare(`SELECT sender, sender_id, recipient, parent_id, kind, body FROM messages WHERE kind IS NOT NULL`).all()).toEqual([
-    { sender: ID, sender_id: ID, recipient: "be", parent_id: unread, kind: "bounce", body: `${ID} ended at 1970-01-01T00:00:10.000Z before reading this; it held \`fe\`.` },
+  // A bounce is a system DM: it never bears the human mark (#1364).
+  expect(db.prepare(`SELECT sender, sender_id, recipient, parent_id, kind, body, human FROM messages WHERE kind IS NOT NULL`).all()).toEqual([
+    { sender: ID, sender_id: ID, recipient: "be", parent_id: unread, kind: "bounce", body: `\`${ID}\` ended at 1970-01-01T00:00:10.000Z before reading this; it held \`fe\`.`, human: 0 },
+  ]);
+});
+
+// #334: a sender with several unread messages gets one bounce, threaded under
+// the latest and naming the others; a sender ID whose row is gone (pruned)
+// gets none, counted in `unbounced`.
+test("bounces coalesce per sender; a sender ID with no row is skipped", () => {
+  const db = bus();
+  const first = send(db, "be", ID, "one");
+  const fromFe = send(db, "fe", ID, "hi");
+  const second = send(db, "be", ID, "two");
+  const third = send(db, "be", ID, "three");
+  send(db, "id:0123456789abf", ID, "from a pruned ID");
+  send(db, "id:0123456789abf", ID, "again");
+
+  const r = end(db);
+  expect(r.wake.sort()).toEqual(["be", "fe"]);
+  expect(JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail)).toMatchObject({ bounced: 4, unbounced: 2 });
+  expect(db.prepare(`SELECT recipient, parent_id, body FROM messages WHERE kind = 'bounce' ORDER BY recipient`).all()).toEqual([
+    { recipient: "be", parent_id: third, body: `\`${ID}\` ended at 1970-01-01T00:00:10.000Z before reading this or your earlier messages ${first}, ${second}; it held no alias.` },
+    { recipient: "fe", parent_id: fromFe, body: `\`${ID}\` ended at 1970-01-01T00:00:10.000Z before reading this; it held no alias.` },
   ]);
 });
 
@@ -115,6 +137,61 @@ test("a send to an ID is refused when it ended, has no row, is a viewer or recei
   expect(() => assertDeliverableId(db, OTHER)).toThrow(`no_delivery: ${OTHER} is a tools-only session and receives nothing; send to be`);
 });
 
+// #523: a child's ID is never an address, live or ended: the refusal names
+// the address its root writes as, whatever state the root is in.
+test("a send to a child session's ID is refused child_session, naming its root's primary", () => {
+  const db = bus();
+  const child = "id:0123456789abe";
+  registerId(db, { id: child, principal: null, launcher: false, rootId: ID }, 2);
+  expect(db.prepare(`SELECT delivery, root_id FROM ids WHERE id = ?`).get(child)).toEqual({ delivery: "none", root_id: ID });
+  const refused = (primary: string) => `child_session: ${child} is a subagent acting under session ${ID} and receives nothing; send to ${primary}`;
+  // An unbound root writes as its ID; a bound one as the hold it bound first (not the alphabetically first).
+  expect(() => assertDeliverableId(db, child)).toThrow(refused(ID));
+  holdAlias(db, "qa", ID, 7);
+  holdAlias(db, "fe", ID, 5);
+  expect(() => assertDeliverableId(db, child)).toThrow(refused("qa"));
+  // A tools-only root writes as its alias.
+  db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(ID);
+  db.prepare(`UPDATE ids SET writes_as = 'be' WHERE id = ?`).run(ID);
+  expect(() => assertDeliverableId(db, child)).toThrow(refused("be"));
+  db.prepare(`UPDATE ids SET writes_as = NULL WHERE id = ?`).run(ID);
+  // Ended, root and child: still child_session (not id_ended), naming the first alias the root held.
+  holdAlias(db, "fe", ID, 5);
+  end(db);
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(child)).toEqual({ ended_at: 10_000 });
+  expect(() => assertDeliverableId(db, child)).toThrow(refused("fe"));
+  // A mention is refused alike, and nothing is posted.
+  createBoard(db, "be", "work", "work items");
+  expect(() => post(db, "be", "work", `ping @${child}`, null, { strictIds: true })).toThrow(refused("fe"));
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM posts`).get()).toEqual({ n: 0 });
+});
+
+// #523: a root's end ends its live children in the same transaction, each
+// audited with why; the root's id.ended lists them; an ended child is left alone.
+test("a root's end ends its live child sessions, audited, and wakes what their ends wake", () => {
+  const db = bus();
+  const [live, gone, unrelated] = ["id:0123456789abe", "id:0123456789abf", "id:0123456789abg"];
+  registerId(db, { id: live, principal: null, launcher: false, rootId: ID }, 2);
+  registerId(db, { id: gone, principal: null, launcher: false, rootId: ID }, 2);
+  registerId(db, { id: unrelated, principal: null, launcher: false, rootId: OTHER }, 2);
+  db.prepare(`UPDATE ids SET ended_at = 3 WHERE id = ?`).run(gone);
+  // A claim the child took as itself is released by its end, waking the watcher.
+  createBoard(db, "be", "work", "work items");
+  claim(db, live, "ticket:ENG-6", { board: "work", ttl_minutes: 60 });
+  watch(db, "qa", "ticket:ENG-6");
+
+  const r = end(db, ID, Date.now());
+  expect(r.wake).toContain("qa");
+  const ended = (db.prepare(`SELECT id, ended_at FROM ids WHERE id IN (?, ?, ?) ORDER BY id`).all(live, gone, unrelated) as { id: string; ended_at: number | null }[]);
+  expect(ended.map((e) => [e.id, e.ended_at === null ? null : e.ended_at === 3 ? 3 : "now"])).toEqual([[live, "now"], [gone, 3], [unrelated, null]]);
+  const audits = (db.prepare(`SELECT target, detail FROM audit_log WHERE action = 'id.ended' ORDER BY rowid`).all() as { target: string; detail: string }[])
+    .map((a) => ({ target: a.target, detail: JSON.parse(a.detail) }));
+  expect(audits.map((a) => a.target)).toEqual([live, ID]);
+  expect(audits[0]!.detail).toMatchObject({ held: [], why: `its root ${ID} ended` });
+  expect(audits[1]!.detail).toMatchObject({ children: [live] });
+  expect(db.prepare(`SELECT key FROM claims`).all()).toEqual([]);
+});
+
 // Audit S1 (#329): a claim event quotes its key, so a key naming an ID that
 // later ended must not refuse the sweep, every other claim, or the holder's
 // end. An author's own post naming that ID is still refused.
@@ -152,4 +229,57 @@ test("a claim whose release post fails is freed and recorded in id.ended", () =>
   ]);
   const detail = JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail);
   expect(detail.release_failed).toEqual([{ key: "ticket:ENG-4", error: "mention refused" }]);
+});
+
+// #855: the system's own claim posts (an expiry, a session end's release) record the claimant's user as their
+// writer, so a server marks them other_user/ungranted for another user's agent like the holder's own posts; a
+// claim from before holder_user falls back to an ID holder's principal. The user never reaches a claim's reader.
+test("expiry and session-end release posts carry the claimant's user; claim rows don't show it", () => {
+  const db = bus();
+  createBoard(db, "be", "work", "work items");
+  const writer = (key: string) => (db.prepare(`SELECT author_user FROM posts WHERE body LIKE ? ORDER BY id DESC LIMIT 1`).get(`%${key}%`) as { author_user: string | null }).author_user;
+  // An alias's claim lapses: the [expired] post is the claimant's user's.
+  const taken = claim(db, "be", "x @qa run the deploy", { board: "work", ttl_minutes: 60, user: "bob@example.com" });
+  expect(taken.ok && Object.keys(taken.claim)).toEqual(["key", "holder", "note", "board", "acquired_at", "expires_at"]);
+  db.prepare(`UPDATE claims SET expires_at = 1 WHERE key = 'x @qa run the deploy'`).run();
+  sweepExpired(db);
+  expect(writer("[expired] x @qa")).toBe("bob@example.com");
+  // An ID's claim released by its session end: the [release] post is the claimant's user's.
+  claim(db, ID, "ticket:ENG-7", { board: "work", ttl_minutes: 60, user: "bob@example.com" });
+  expect(listClaims(db).map(c => Object.keys(c))).toEqual([["key", "holder", "note", "board", "acquired_at", "expires_at"]]);
+  end(db, ID, Date.now());
+  expect(writer("[release] ticket:ENG-7")).toBe("bob@example.com");
+  // A claim from before the column: an ID holder's principal stands in.
+  db.prepare(`UPDATE ids SET principal = 'carol@example.com' WHERE id = ?`).run(OTHER);
+  claim(db, OTHER, "ticket:ENG-8", { board: "work", ttl_minutes: 60 });
+  db.prepare(`UPDATE claims SET holder_user = NULL, expires_at = 1 WHERE key = 'ticket:ENG-8'`).run();
+  sweepExpired(db);
+  expect(writer("[expired] ticket:ENG-8")).toBe("carol@example.com");
+  // ... else a person alias's person.
+  claim(db, "dave@example.com/fe", "ticket:ENG-9", { board: "work", ttl_minutes: 60 });
+  db.prepare(`UPDATE claims SET holder_user = NULL, expires_at = 1 WHERE key = 'ticket:ENG-9'`).run();
+  sweepExpired(db);
+  expect(writer("[expired] ticket:ENG-9")).toBe("dave@example.com");
+});
+
+// #1387: an end releases its queue claims in post id order (queuePostOrder), whatever order the claims table gives.
+// Mutation: endSession without queuePostOrder (key order: queue:q:10 first).
+test("an end releases its queue claims in post id order", () => {
+  const db = bus();
+  createBoard(db, "be", "q", "p", null, { kind: "queue" });
+  for (let i = 0; i < 10; i++) post(db, "be", "q", `item ${i}`);
+  for (const n of [10, 9]) db.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, ?, 'queue post', 'q', 1, ?)`).run(`queue:q:${n}`, ID, 1e15);
+  end(db, ID, Date.now());
+  const released = db.prepare(`SELECT key FROM claim_events WHERE event = 'release' ORDER BY rowid`).all() as { key: string }[];
+  expect(released.map((e) => e.key)).toEqual(["queue:q:9", "queue:q:10"]);
+});
+
+// An end reads its live claims ORDER BY key (bytewise), as the server's heldBy does, so both release in one order.
+// Mutation: endSession's claims query without ORDER BY key (insertion order: ticket:b first).
+test("an end releases its other claims in key order, not the order they were taken", () => {
+  const db = bus();
+  for (const k of ["ticket:b", "ticket:a"]) db.prepare(`INSERT INTO claims (key, holder, note, acquired_at, expires_at) VALUES (?, ?, 'n', 1, ?)`).run(k, ID, 1e15);
+  end(db, ID, Date.now());
+  const released = db.prepare(`SELECT key FROM claim_events WHERE event = 'release' ORDER BY rowid`).all() as { key: string }[];
+  expect(released.map((e) => e.key)).toEqual(["ticket:a", "ticket:b"]);
 });

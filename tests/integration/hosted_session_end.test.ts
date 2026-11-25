@@ -8,19 +8,25 @@ import { startServer } from "../../src/server/app.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
-import { sessionContext } from "../../src/server/hosted.ts";
+import { MAX_CHILDREN } from "../../src/core/bindings.ts";
+import { sessionContext, sourceContext } from "../../src/server/hosted.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { withMeta } from "../helpers/hosted.ts";
+import { scratchDbPath } from "../support/scratch_db.ts";
+import { hostedRowCount } from "../support/hosted_rows.ts";
 
 let app: ReturnType<typeof startServer>, dir: string, base: string;
+// The hosted clock runs `skew` ahead of the wall clock, so a test can pass the idle window (#566).
+let skew = 0;
 const clients: Client[] = [];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-hosted-end-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
+  app = startServer({ store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, now: () => Date.now() + skew });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
+  skew = 0;
   await Promise.all(clients.splice(0).map(client => client.close()));
   await app.stop();
   expect(app.mcp.activeContexts).toBe(0);
@@ -30,11 +36,11 @@ afterEach(async () => {
 function issue(email = "alice@example.com") {
   return issueOAuth(app.repo, app.oauth.resource, email, ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
 }
-async function connect(version: string, token: string, source: string) {
+async function connect(version: string, token: string, source: string, headers: Record<string, string> = {}) {
   const client = new Client({ name: "session-end-test", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Client": "subscriber" } },
+    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Client": "subscriber", ...headers } },
     fetch: async (input, init) => fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, source)),
   }));
   return client;
@@ -51,7 +57,7 @@ async function bind(client: Client, name: string) {
 }
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: root ends actual registered child IDs without ending siblings or foreign ownership`, async () => {
-  const grant = issue(), foreignGrant = issue("bob@example.com");
+  const grant = await issue(), foreignGrant = await issue("bob@example.com");
   const root = await connect(version, grant.token, "root");
   await bind(root, "be");
   const first = await value(root, "session_register", { child: "first" });
@@ -67,42 +73,162 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: root ends actual 
   const foreign = await value(foreignRoot, "session_register", { child: "foreign-child" });
   for (const id of [other.root, other.child, foreign.root, foreign.child]) {
     expect((await root.callTool({ name: "session_end", arguments: { session: id } })).isError).toBe(true);
-    expect(app.repo.hosted.get(id)).toBeDefined();
+    expect(await app.repo.hosted.get(app.repo.read, id)).toBeDefined();
   }
   const child = await connect(version, grant.token, "first");
   for (const id of [first.root, sibling.child]) {
     expect((await child.callTool({ name: "session_end", arguments: { session: id } })).isError).toBe(true);
   }
   expect(await value(root, "session_end", { session: first.child })).toEqual({ ended: true });
-  expect(app.repo.hosted.get(first.child)).toBeUndefined();
-  expect(app.application.hostedHolds(first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
-  expect(app.repo.hosted.get(sibling.child)?.root_session_id).toBe(first.root);
+  expect(await app.repo.hosted.get(app.repo.read, first.child)).toBeUndefined();
+  expect((await app.application.hostedHolds(app.application.repo.read, first.root)).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
+  expect((await app.repo.hosted.get(app.repo.read, sibling.child))?.root_session_id).toBe(first.root);
   const siblingClient = await connect(version, grant.token, "sibling");
   expect(await value(siblingClient, "session_end")).toEqual({ ended: true });
-  expect(app.repo.hosted.get(sibling.child)).toBeUndefined();
-  expect(app.application.hostedHolds(first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
+  expect(await app.repo.hosted.get(app.repo.read, sibling.child)).toBeUndefined();
+  expect((await app.application.hostedHolds(app.application.repo.read, first.root)).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
   expect(await value(root, "session_end")).toEqual({ ended: true });
-  expect(app.repo.hosted.get(first.root)).toBeUndefined();
-  expect(app.repo.hosted.get(other.root)).toBeDefined();
-  expect(app.repo.hosted.get(foreign.root)).toBeDefined();
+  expect(await app.repo.hosted.get(app.repo.read, first.root)).toBeUndefined();
+  expect(await app.repo.hosted.get(app.repo.read, other.root)).toBeDefined();
+  expect(await app.repo.hosted.get(app.repo.read, foreign.root)).toBeDefined();
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: selective child end frees the existing child capacity`, async () => {
-  const grant = issue();
+  const grant = await issue();
   const root = await connect(version, grant.token, "capacity-root");
   await bind(root, "be");
   const first = await value(root, "session_register", { child: "first" });
-  const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   const context = sessionContext(principal, { "ai.opencode/sessionID": "capacity-root" });
   for (let i = 1; i < 128; i++) await app.mcp.sessions.register(principal, context, `child-${i}`);
-  const count = () => app.repo.hosted.all().filter(row => row.root_session_id === first.root).length;
-  expect(count()).toBe(128);
+  const count = async () => (await app.repo.hosted.all(app.repo.read)).filter(row => row.root_session_id === first.root).length;
+  expect(await count()).toBe(128);
   expect((await root.callTool({ name: "session_register", arguments: { child: "replacement" } })).isError).toBe(true);
   expect(await value(root, "session_end", { session: first.child })).toEqual({ ended: true });
-  expect(count()).toBe(127);
+  expect(await count()).toBe(127);
   const replacement = await value(root, "session_register", { child: "replacement" });
   expect(replacement.child).toMatch(SESSION_ID);
-  expect(count()).toBe(128);
-  expect(app.application.hostedHolds(first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
+  expect(await count()).toBe(128);
+  expect((await app.application.hostedHolds(app.application.repo.read, first.root)).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
+});
+
+// #566: a root past MAX_CHILDREN registrations keeps registering once its earlier children idle past the window,
+// and a parked child's next call runs as that root's child again.
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: idle children are parked, so registration MAX_CHILDREN + 1 succeeds and a parked child acts again`, async () => {
+  const grant = await issue();
+  const root = await connect(version, grant.token, "busy-root");
+  await bind(root, "be");
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const context = sessionContext(principal, { "ai.opencode/sessionID": "busy-root" });
+  for (let i = 0; i < MAX_CHILDREN; i++) await app.mcp.sessions.register(principal, context, `sub-${i}`);
+  expect((await root.callTool({ name: "session_register", arguments: { child: "late" } })).isError).toBe(true);
+  skew += 900_001;
+  const late = await value(root, "session_register", { child: "late" });
+  expect(late.child).toMatch(SESSION_ID);
+  const parked = app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.child_parked'").get()!.n;
+  expect(parked).toBe(MAX_CHILDREN);
+  const returning = await connect(version, grant.token, "sub-0");
+  expect(await value(returning, "whoami")).toMatchObject({ child: true, root: late.root });
+  expect(app.db.query("SELECT target FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([{ target: late.root }]);
+});
+
+// #566 audit 1: an exchange's selection doesn't wake a parked child, so its session_end over HTTP ends it even
+// with the root at full child capacity, and writes no unpark row.
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's session_end over HTTP ends it at full child capacity`, async () => {
+  const grant = await issue();
+  const root = await connect(version, grant.token, "full-root");
+  await bind(root, "be");
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const context = sessionContext(principal, { "ai.opencode/sessionID": "full-root" });
+  const { child } = await value(root, "session_register", { child: "sleeper" });
+  skew += 900_001;
+  await value(root, "whoami"); // its request sweeps, parking the sleeper
+  for (let i = 0; i < MAX_CHILDREN; i++) await app.mcp.sessions.register(principal, context, `busy-${i}`);
+  expect((await app.repo.hosted.get(app.repo.read, child))?.parked_at).not.toBeNull();
+  const sleeper = await connect(version, grant.token, "sleeper");
+  expect(await value(sleeper, "session_end")).toEqual({ ended: true });
+  expect(await app.repo.hosted.get(app.repo.read, child)).toBeUndefined();
+  expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([]);
+});
+
+// #1077: a child ID that is another principal's session is refused id_collision, and its id.collision row outlives
+// the refusal's rollback; the root keeps no child.
+test("session_register of another principal's session ID is refused id_collision and audited", async () => {
+  const grant = await issue();
+  await connect("2026-07-28", grant.token, "collide-root");
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const rootContext = sessionContext(principal, { "ai.opencode/sessionID": "collide-root" });
+  const taken = sourceContext(principal, "taken");
+  if (!("id" in taken)) throw new Error("fixture source failed");
+  await app.repo.write(tx => app.repo.bindings.registerId(tx, { id: taken.id, principal: "bob@example.com", launcher: false }));
+  await expect(app.mcp.sessions.register(principal, rootContext, "taken")).rejects.toMatchObject({ code: "id_collision" });
+  expect(app.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'id.collision'").all())
+    .toEqual([{ actor: "alice@example.com", target: taken.id, detail: JSON.stringify({ why: "is another principal's session" }) }]);
+  expect(await app.repo.hosted.get(app.repo.read, taken.id)).toBeUndefined();
+});
+
+// #1077: the same refusal at a session's start (rowFor admitting the caller's own ID) keeps its row too.
+test("a session whose own ID is another principal's is refused id_collision at its start and audited", async () => {
+  const grant = await issue();
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const planted = sessionContext(principal, { "ai.opencode/sessionID": "planted-root" });
+  if (!("id" in planted)) throw new Error("fixture source failed");
+  await app.repo.write(tx => app.repo.bindings.registerId(tx, { id: planted.id, principal: "bob@example.com", launcher: false }));
+  await expect(app.mcp.sessions.register(principal, planted, "a-child")).rejects.toMatchObject({ code: "id_collision" });
+  expect(app.db.query<{ actor: string; target: string }, []>("SELECT actor, target FROM access_log WHERE action = 'id.collision'").all())
+    .toEqual([{ actor: "alice@example.com", target: planted.id }]);
+  expect(hostedRowCount(app.db)).toBe(0);
+});
+
+// #1101: settle (inside end's gate) ends an idle root, and its child with it; end then reports ended: false and admits
+// neither ID again: no row, no new ownership. Once from the child's context, once from the root's.
+for (const from of ["child", "root"] as const) test(`session_end from the ${from} after settle ends the idle root reports ended: false and admits nothing`, async () => {
+  const grant = await issue();
+  await connect("2026-07-28", grant.token, "idle-root");
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const rootContext = sessionContext(principal, { "ai.opencode/sessionID": "idle-root" });
+  await app.mcp.sessions.register(principal, rootContext, "idle-child");
+  expect(hostedRowCount(app.db)).toBe(2);
+  const started = () => app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.ownership_started'").get()!.n;
+  const before = started();
+  skew += 900_001;
+  const context = from === "root" ? rootContext : sessionContext(principal, { "ai.opencode/sessionID": "idle-child" });
+  expect(await app.mcp.sessions.end(principal, context)).toEqual({ ended: false });
+  expect(hostedRowCount(app.db)).toBe(0);
+  expect(started()).toBe(before);
+  // The child ended with its root, not parked then evicted.
+  expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_parked'").all()).toEqual([]);
+});
+
+// #1097: an ending call (session_end, delivery_release) under an ID the server no longer holds ends nothing and starts
+// nothing: no row, no ownership, no audit but the stale lease's own refusal row. A connect that names an ID admits it as
+// any session start does, so this raw client's row ends after its connect (here the server releases it); hosted-core's
+// ending-only wires connect naming no session and admit nothing (#1099, tests/integration/hosted_core_root.test.ts). The
+// direct calls cover the tool gates for an ID never seen.
+test("ending calls under an unknown ID write nothing; session_end reports ended: false", async () => {
+  const grant = await issue();
+  const stranger = await connect("2026-07-28", grant.token, "gone-before-end", { "X-Grayboard-Lease": "a".repeat(43) });
+  const [admitted] = await app.repo.hosted.all(app.repo.read);
+  await app.mcp.sessions.release(admitted!.session_id, "closed");
+  expect(hostedRowCount(app.db)).toBe(0);
+  const audits = () => app.db.query<{ action: string }, []>("SELECT action FROM access_log ORDER BY rowid").all().map(a => a.action);
+  const before = audits();
+  expect((await stranger.callTool({ name: "delivery_release", arguments: {} })).isError).toBe(true);
+  expect(hostedRowCount(app.db)).toBe(0);
+  expect(audits()).toEqual([...before, "hosted.stale_capability"]);
+  expect(await value(stranger, "session_end")).toEqual({ ended: false });
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const unseen = sessionContext(principal, { "ai.opencode/sessionID": "never-seen" });
+  expect(await app.mcp.sessions.end(principal, unseen)).toEqual({ ended: false });
+  expect(await app.mcp.sessions.control(principal, unseen, true, () => "ran", () => "absent")).toBe("absent");
+  expect(await app.mcp.delivery.release(principal, unseen, "a".repeat(43))).toBeUndefined();
+  expect(hostedRowCount(app.db)).toBe(0);
+  expect(audits()).toEqual([...before, "hosted.stale_capability"]);
 });

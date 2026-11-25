@@ -1,9 +1,10 @@
 import type { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, renameSync, statSync, unlinkSync } from "node:fs";
 
 import { sweepBlobs } from "../core/attachments.ts";
 import { sockDir } from "../shared/sockdir.ts";
 import { SqliteBlobs } from "./blobs.ts";
+import { privateDir } from "./perms.ts";
 
 const SOCK_DIR = sockDir();
 
@@ -26,7 +27,7 @@ export type WakeupHandler = () => void;
  * removes the real path only while it's still this listener's.
  */
 export function listenForWakeup(identity: string, onWake: WakeupHandler): () => void {
-  if (!existsSync(SOCK_DIR)) mkdirSync(SOCK_DIR, { recursive: true });
+  privateDir(SOCK_DIR);
   const path = sockPath(identity);
   // Short: a unix socket path has a ~104-byte limit, and test dirs are deep.
   const own = `${SOCK_DIR}/.w${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
@@ -90,6 +91,10 @@ export async function poke(identity: string, dir = SOCK_DIR): Promise<boolean> {
 // process is busy can refuse too. Treating that as "dead" would let a second
 // session believe a live identity is free, or skip a wakeup. So retry briefly; a
 // stale socket file from a crashed session costs the full ~150ms.
+//
+// A reset is the opposite of a refusal: the listener ends each connection as it
+// opens, and when that beats this event loop to the connect, Bun rejects it with
+// ECONNRESET. The listener accepted and ran its wake, so the owner is live (#620).
 const RETRY_MS = [25, 50, 75];
 
 async function canConnect(path: string): Promise<boolean> {
@@ -108,7 +113,8 @@ async function canConnect(path: string): Promise<boolean> {
         },
       });
       return true;
-    } catch {
+    } catch (e) {
+      if ((e as { code?: string }).code === "ECONNRESET") return true;
       if (attempt >= RETRY_MS.length) return false;
       await Bun.sleep(RETRY_MS[attempt]!);
     }

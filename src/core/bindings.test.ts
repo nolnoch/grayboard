@@ -3,10 +3,22 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 
 import { aliasScope, addressParts } from "./addresses.ts";
-import { actingAs, asSessionId, holdAlias, holdsOf, idAddress, mintSessionKey, primaryOf, sessionAddresses } from "./bindings.ts";
+import { actingAs, addressSet, asSessionId, holdAlias, holdsOf, idAddress, localAddressSet, mintSessionKey, primaryOf, replyPeer, replySender, sessionAddresses } from "./bindings.ts";
+import { registerId } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 import { initCoreSchema } from "./schema.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
+
+// #524: a reply goes to the parent's other party; when one session holds both,
+// it goes from the recipient (replySender's default) back to the sender.
+test("replyPeer names the parent's other party, the sender when you hold both", () => {
+  const m = { sender: "a", recipient: "b" };
+  expect(replyPeer(m, ["b"])).toBe("a");
+  expect(replyPeer(m, ["a"])).toBe("b");
+  expect(replyPeer(m, ["a", "b"])).toBe("a");
+  expect(replySender(m, ["a", "b"])).toBe("b");
+  expect(replyPeer({ sender: "a", recipient: "a" }, ["a"])).toBe("a");
+});
 
 // #284 decision 2: the session ID is the same 64 bits, as 13 Crockford characters.
 test("crockford13 encodes 64 bits as 13 lowercase Crockford characters, big-endian", () => {
@@ -79,6 +91,25 @@ test("sessionAddresses and primaryOf follow bind order, even within one millisec
   const other = idAddress("f".repeat(64));
   holdAlias(db, "solo", other, 1);
   expect(holdsOf(db, other)).toEqual(["solo"]);
+});
+
+// #373 (S8): a null principal on the server never widens to a session's set;
+// local mode's form joins the session's addresses.
+test("addressSet joins a principal's own session's addresses; null reads one address; localAddressSet is local's", () => {
+  const db = new Database(":memory:");
+  initCoreSchema(db);
+  const local = idAddress("e".repeat(64)), mine = idAddress("f".repeat(64));
+  registerId(db, { id: local, principal: null, launcher: false });
+  registerId(db, { id: mine, principal: "you@example.com", launcher: false });
+  holdAlias(db, "a", local, 1);
+  holdAlias(db, "b", local, 2);
+  holdAlias(db, "you@example.com/c", mine, 1);
+  expect(localAddressSet(db, "a")).toEqual(["a", "b", local]);
+  expect(addressSet(db, "a", null)).toEqual(["a"]);
+  expect(addressSet(db, "you@example.com/c", "you@example.com")).toEqual(["you@example.com/c", mine]);
+  expect(addressSet(db, "you@example.com/c", "other@example.com")).toEqual(["you@example.com/c"]);
+  expect(addressSet(db, "you@example.com/c", null)).toEqual(["you@example.com/c"]);
+  expect(localAddressSet(db, "you@example.com/c")).toEqual(["you@example.com/c"]);
 });
 
 // #284 S3.

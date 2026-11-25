@@ -1,32 +1,46 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { createMcpAttachments } from "./mcp-attachments.ts";
+import { S3StoreError } from "./s3_blobs.ts";
+import { queueFor } from "./store/queue.ts";
 import { UploadGate } from "./uploads.ts";
 import { createApplication } from "./application.ts";
 import { createHostedSessions, sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
+import { sessionEndPort } from "./session_end.ts";
 
+// Run once, after the next hosted token check's await (the binding guard's `fence`, once armed past the route's own).
+let onCheck: (() => void) | undefined;
 let application: ReturnType<typeof createApplication>;
 let hosted: ReturnType<typeof createHostedSessions>;
-import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { issueOAuth, type IssuedOAuth } from "../../tests/helpers/oauth.ts";
 import { getAttachment, bindAttachments } from "../core/attachments.ts";
+import { stubAuthRead } from "../../tests/support/auth_stub.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let oauth: ReturnType<typeof createOAuthServer>;
 let router: ReturnType<typeof createMcpAttachments>;
 let gate: UploadGate;
-let issued: ReturnType<typeof issueOAuth>;
+let issued: IssuedOAuth;
 let dir: string;
 let now: number;
 const origin = "https://grayboard.example.com";
 const resource = `${origin}/hosted/mcp`;
 const bytes = new TextEncoder().encode("attachment bytes\n");
+// A body whose first read signals `entered` and waits for `resume`: highWaterMark 0 keeps the stream from
+// pulling before the handler reads it, so `entered` marks the handler at its body read, not the request's construction.
+function heldBody(entered: { resolve(): void }, resume: { promise: Promise<void> }) {
+  return new ReadableStream({ async pull(controller) { entered.resolve(); await resume.promise; controller.enqueue(bytes); controller.close(); } }, { highWaterMark: 0 });
+}
+
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>(r => { resolve = r; });
@@ -35,21 +49,21 @@ function deferred() {
 beforeEach(async () => {
   now = Date.now();
   dir = mkdtempSync(join(tmpdir(), "gb-oauth-attachments-"));
-  store = openDatabase(join(dir, "bus.db"), { blobDir: dir });
-  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: `${origin}:443/hosted`, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => now });
-  issued = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now, OPENCODE_CLIENT);
-  store.repo.aliases.create({ scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email);
+  store = openDatabase(join(dir, "bus.db"), { blobDir: dir, sessionEnd: sessionEndPort("team") });
+  oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: `${origin}:443/hosted`, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => now });
+  issued = await issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now, OPENCODE_CLIENT);
+  await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email));
   gate = new UploadGate(1024, 1024);
-  application = createApplication(store.repo, store.db);
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: p => oauth.isAuthorized(p) });
-  const principal = oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }), ["grayboard:tools"]);
+  application = createApplication(store.repo);
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: async (p, r) => { const valid = await oauth.isAuthorized(p, r); const hook = onCheck; onCheck = undefined; hook?.(); return valid; } }); await hosted.ready;
+  const principal = await oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }), ["grayboard:tools"]);
   if (principal instanceof Response) throw new Error("fixture auth failed");
   await hosted.bind(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "attachment-root" }), { name: "be" });
-  router = createMcpAttachments(store.repo, store.db, oauth, gate, { trustedOrigin: origin, sessions: hosted });
+  router = createMcpAttachments(store.repo, oauth, gate, { trustedOrigin: origin, sessions: hosted });
 });
 afterEach(async () => {
   await router.close();
-  hosted.close(); application.stopExpiry(); oauth.close();
+  await hosted.close(); await application.stopExpiry(); oauth.close();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -64,6 +78,11 @@ async function uploaded() {
 }
 const count = () => (store.db.query("SELECT COUNT(*) AS n FROM attachments").get() as { n: number }).n;
 
+// #807 P3 A7d2c: the OAuth server's synchronous checks are gone; every check awaits its token read.
+test("the OAuth server has no synchronous authorization forms", () => {
+  for (const key of ["authenticateNow", "isAuthorizedNow"]) expect(key in oauth).toBe(false);
+});
+
 test("precise routing, canonical challenge, strict query and existing identity only", async () => {
   for (const path of ["/api/attachments", "/hosted/mcp/attachments/1/extra", "/hosted/mcp/attachments-other"]) expect(router.fetch(request("GET", path))).toBeUndefined();
   expect(router.fetch(request("PUT"))).toBeUndefined();
@@ -77,19 +96,19 @@ test("precise routing, canonical challenge, strict query and existing identity o
     expect((await send(request("POST", `/mcp/attachments?${query}`))).status).toBe(query.includes("access_token") ? 401 : query.startsWith("identity=human&") || query.startsWith("identity=alice%40") ? 403 : 400);
   }
   expect((await send(request("POST", "/mcp/attachments?identity=missing&filename=x.txt"))).status).toBe(403);
-  expect(store.repo.aliases.find(`${issued.authed.user_email}/missing`)).toBeUndefined();
+  expect(await store.repo.aliases.find(store.repo.read, `${issued.authed.user_email}/missing`)).toBeUndefined();
   for (const id of ["0", "-1", "1e2", "01", "9007199254740992", "%31"]) expect((await send(request("GET", `/mcp/attachments/${id}?identity=be`))).status).toBe(400);
   expect(count()).toBe(0);
 });
 
-function principal() {
-  const p = oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
+async function principal() {
+  const p = await oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
   if (p instanceof Response) throw new Error("fixture unauthorized");
   return p;
 }
 
-function external(operation: "bind" | "end", rawSession: string) {
-  const p = principal();
+async function external(operation: "bind" | "end", rawSession: string) {
+  const p = await principal();
   const result = Bun.spawnSync([process.execPath, "tests/support/hosted-operation.ts", join(dir, "bus.db"), dir, JSON.stringify({ now, operation, principal: p, rawSession, name: "fe" })], { stdin: Buffer.from(""), env: { ...process.env, BUS_TEST_PAUSE: "", BUS_TEST_PAUSE_FILE: "" } });
   expect(result.exitCode).toBe(0);
   expect(JSON.parse(result.stdout.toString().trim().split("\n").at(-1)!).ok).toBe(true);
@@ -97,7 +116,7 @@ function external(operation: "bind" | "end", rawSession: string) {
 
 test("all private attachment methods require mapped bound context, not a name override", async () => {
   const id = await uploaded();
-  const unmapped = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now);
+  const unmapped = await issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now);
   for (const method of ["POST", "GET", "DELETE"]) {
     const path = method === "POST" ? "/mcp/attachments?identity=be&filename=report.txt" : `/mcp/attachments/${id}?identity=be`;
     for (const raw of [undefined, "never-bound", "%61ttachment-root", "%FF"]) {
@@ -111,7 +130,7 @@ test("all private attachment methods require mapped bound context, not a name ov
 });
 
 test("registered child attachments resolve the root; query name is only an assertion", async () => {
-  const p = principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
+  const p = await principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
   await hosted.register(p, root, "attachment-child");
   const upload = request("POST", "/mcp/attachments?filename=child.txt"); upload.headers.set("X-Grayboard-Session", "attachment-child");
   const response = await send(upload); expect(response.status).toBe(201);
@@ -123,8 +142,38 @@ test("registered child attachments resolve the root; query name is only an asser
   expect((await send(mismatch)).status).toBe(403);
 });
 
+// #807 P1c-14b: a download's read check reads the carrying message on the pool, and its guarded recheck on the download's body Tx.
+test("#807 P1c-14b: a download's message read runs on the pool, its recheck on the body's Tx", async () => {
+  const id = await uploaded();
+  await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: issued.authed.user_email, name: "fe" }, issued.authed.user_email));
+  const root = sessionContext(await principal(), { [OPENCODE_SESSION_META]: "attachment-root" });
+  await hosted.run(await principal(), root, "dm_send", (session, tx) => application.send(tx, session, "fe", "the file", { attachment_ids: [id] }));
+  const checks: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const original = store.repo.messages.getById.bind(store.repo.messages);
+  const spy = spyOn(store.repo.messages, "getById").mockImplementation((r, messageId) => {
+    if (new Error().stack?.includes("readRequest")) checks.push({ inTxn: store.db.inTransaction, handle: r === store.repo.read ? "pool" : "tx" });
+    return original(r, messageId);
+  });
+  try {
+    expect((await send(request("GET", `/mcp/attachments/${id}?identity=be`))).status).toBe(200);
+  } finally { spy.mockRestore(); }
+  expect(checks).toEqual([{ inTxn: false, handle: "pool" }, { inTxn: true, handle: "tx" }]);
+});
+
+// A registration's `via` names the ancestry for routing only: it never maps the intermediate. (The OpenCode
+// host suites can't show this since #535: there every subagent of an enrolled root registers on its own.)
+test("via ancestry is not registration or attachment mapping authority", async () => {
+  const p = await principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
+  await hosted.register(p, root, "attachment-grandchild", ["attachment-mid"]);
+  expect(store.db.query("SELECT 1 FROM hosted_sessions WHERE source_session_id = ?").get("attachment-mid")).toBeNull();
+  const upload = request("POST", "/mcp/attachments?filename=mid.txt"); upload.headers.set("X-Grayboard-Session", "attachment-mid");
+  expect((await send(upload)).status).toBe(403);
+  const own = request("POST", "/mcp/attachments?filename=grandchild.txt"); own.headers.set("X-Grayboard-Session", "attachment-grandchild");
+  expect((await send(own)).status).toBe(201);
+});
+
 for (const boundary of ["body", "store", "download"] as const) for (const operation of ["bind", "end"] as const) test(`external ${operation} during attachment ${boundary} fences root and child snapshots`, async () => {
-  const p = principal();
+  const p = await principal();
   await hosted.register(p, sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" }), "attachment-child");
   const entered = deferred(), resume = deferred();
   let id: number | undefined, req: Request;
@@ -134,7 +183,7 @@ for (const boundary of ["body", "store", "download"] as const) for (const operat
     store.repo.blobs.get = async hash => { const data = await get(hash); entered.resolve(); await resume.promise; return data; };
     req = request("GET", `/mcp/attachments/${id}`);
   } else if (boundary === "body") {
-    req = request("POST", undefined, new ReadableStream({ async start(controller) { entered.resolve(); await resume.promise; controller.enqueue(bytes); controller.close(); } }));
+    req = request("POST", undefined, heldBody(entered, resume));
   } else {
     const put = store.repo.blobs.put.bind(store.repo.blobs);
     store.repo.blobs.put = async (hash, data) => { entered.resolve(); await resume.promise; return put(hash, data); };
@@ -143,7 +192,7 @@ for (const boundary of ["body", "store", "download"] as const) for (const operat
   req.headers.set("X-Grayboard-Session", "attachment-child");
   const pending = send(req);
   await entered.promise;
-  external(operation, operation === "bind" ? "attachment-root" : "attachment-child");
+  await external(operation, operation === "bind" ? "attachment-root" : "attachment-child");
   resume.resolve();
   const response = await pending;
   expect(response.status).toBe(403);
@@ -158,8 +207,8 @@ test("Origin precedes authentication; scope and audience never fall back", async
     req.headers.set("Origin", value);
     expect((await send(req)).status).toBe(403);
   }
-  const delivery = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:delivery"], now);
-  const wrongResource = issueOAuth(store.repo, `${origin}/other/mcp`, "alice@example.com", ["grayboard:tools"], now);
+  const delivery = await issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:delivery"], now);
+  const wrongResource = await issueOAuth(store.repo, `${origin}/other/mcp`, "alice@example.com", ["grayboard:tools"], now);
   for (const method of ["POST", "GET", "DELETE"]) {
     const path = method === "POST" ? "/mcp/attachments?identity=be&filename=report.txt" : "/mcp/attachments/1?identity=be";
     expect((await send(request(method, path, bytes, delivery.token))).status).toBe(403);
@@ -204,17 +253,20 @@ for (const boundary of ["quota", "body", "store"] as const) for (const invalidat
   let req = request();
   if (boundary === "quota") {
     release = await gate.reserve(issued.authed.user_email, 1024, new AbortController().signal);
+    // The request's own reserve marks it waiting on the quota the test holds.
+    const reserve = gate.reserve.bind(gate);
+    gate.reserve = (...args) => { entered.resolve(); return reserve(...args); };
   } else if (boundary === "body") {
-    req = request("POST", undefined, new ReadableStream({ async start(controller) { entered.resolve(); await resume.promise; controller.enqueue(bytes); controller.close(); } }));
+    req = request("POST", undefined, heldBody(entered, resume));
   } else {
     store.repo.blobs.put = async (hash, data) => { entered.resolve(); await resume.promise; return originalPut(hash, data); };
   }
   const operation = send(req);
-  if (boundary === "quota") await Promise.resolve(); else await entered.promise;
-  if (invalidation === "revoke") store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now);
+  await entered.promise;
+  if (invalidation === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   if (invalidation === "expire") now += 60 * 60 * 1000;
-  if (invalidation === "disable") store.repo.users.setDisabled(issued.authed.user_id, true);
-  if (invalidation === "identity") store.repo.aliases.remove(`${issued.authed.user_email}/be`);
+  if (invalidation === "disable") await seed(store.repo, tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
+  if (invalidation === "identity") await seed(store.repo, tx => store.repo.aliases.remove(tx, `${issued.authed.user_email}/be`));
   resume.resolve(); release();
   const response = await operation;
   expect(response.status).toBe(invalidation === "identity" ? 404 : 401);
@@ -229,9 +281,12 @@ test("a concurrently bound upload survives fail-closed cleanup", async () => {
   const operation = send();
   await entered.promise;
   const row = store.db.query("SELECT id FROM attachments").get() as { id: number };
-  const message = store.repo.messages.insert("alice@example.com/be", "user", "alice@example.com/be", "sent", null);
-  bindAttachments(store.db, [row.id], { addresses: ["alice@example.com/be"], principal: "alice@example.com" }, { message_id: message.id }, store.repo.attachmentLimits);
-  store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now);
+  const message = await seed(store.repo, async tx => {
+    const inserted = await store.repo.messages.insert(tx, "alice@example.com/be", "user", "alice@example.com/be", "sent", null);
+    bindAttachments(store.db, [row.id], { addresses: ["alice@example.com/be"], principal: "alice@example.com" }, { message_id: inserted.id }, store.repo.attachmentLimits);
+    return inserted;
+  });
+  await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   resume.resolve();
   expect((await operation).status).toBe(401);
   expect(getAttachment(store.db, row.id)?.message_id).toBe(message.id);
@@ -244,11 +299,11 @@ for (const change of ["revoke", "expire", "disable", "identity", "retention", "f
   store.repo.blobs.get = async hash => { const data = await original(hash); entered.resolve(); await resume.promise; if (change === "fault") throw new Error("secret SQL /blob/path"); return data; };
   const operation = send(request("GET", `/mcp/attachments/${id}?identity=be`));
   await entered.promise;
-  if (change === "revoke") store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now);
+  if (change === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   if (change === "expire") now += 60 * 60 * 1000;
-  if (change === "disable") store.repo.users.setDisabled(issued.authed.user_id, true);
-  if (change === "identity") store.repo.aliases.remove(`${issued.authed.user_email}/be`);
-  if (change === "retention") store.db.query("DELETE FROM attachments WHERE id = ?").run(id);
+  if (change === "disable") await seed(store.repo, tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
+  if (change === "identity") await seed(store.repo, tx => store.repo.aliases.remove(tx, `${issued.authed.user_email}/be`));
+  if (change === "retention") await seed(store.repo, () => store.db.query("DELETE FROM attachments WHERE id = ?").run(id));
   resume.resolve();
   const response = await operation;
   expect(response.status).toBe(change === "fault" ? 500 : ["revoke", "expire", "disable"].includes(change) ? 401 : 404);
@@ -265,7 +320,7 @@ test("release rechecks authorization after the async sweep without resurrecting 
   store.repo.blobs.delete = async hash => { entered.resolve(); await resume.promise; await original(hash); };
   const releasing = send(request("DELETE", `/mcp/attachments/${id}?identity=be`));
   await entered.promise;
-  store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now);
+  await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   resume.resolve();
   expect((await releasing).status).toBe(401);
   expect(getAttachment(store.db, id)).toBeUndefined();
@@ -275,7 +330,7 @@ test("revocation does not disguise a simultaneous failed blob put as authenticat
   const entered = deferred(), resume = deferred();
   store.repo.blobs.put = async () => { entered.resolve(); await resume.promise; throw new Error("secret disk failure"); };
   const storing = send(); await entered.promise;
-  store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now);
+  await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   resume.resolve();
   const response = await storing;
   expect(response.status).toBe(500);
@@ -297,8 +352,36 @@ test("unexpected storage and authorization faults remain redacted 500", async ()
   expect(response.status).toBe(500);
   expect(await response.text()).not.toContain("secret disk path");
   expect(count()).toBe(0);
-  store.repo.oauth.findActiveAccess = () => { throw new Error("private SQL"); };
+  stubAuthRead(store.repo, "findActiveAccess", () => () => { throw new Error("private SQL"); });
   expect((await send()).status).toBe(500);
+});
+
+// #1608: the client's 500 stays bare; stderr gets one hosted diagnostic line (#386: class and code only, never the
+// message). Refusals log nothing. Other lines (a timer's) pass through to stderr and aren't counted.
+test("a storage fault's 500 logs exactly one diagnostic line without its message; a refusal logs none", async () => {
+  const lines: string[] = [];
+  const original = console.error.bind(console);
+  const log = spyOn(console, "error").mockImplementation((message: unknown, ...rest: unknown[]) => {
+    if (String(message).includes('"operation":"attachments.')) lines.push(String(message)); else original(message, ...rest);
+  });
+  const put = store.repo.blobs.put;
+  try {
+    store.repo.blobs.put = async () => { throw new S3StoreError("S3 put on s3://bucket/p/: InternalError: secret", "InternalError"); };
+    const response = await send();
+    expect(response.status).toBe(500);
+    expect(await response.text()).not.toContain("InternalError");
+    expect(lines).toEqual(['[grayboard] {"operation":"attachments.upload","category":"failure","level":"error","class":"S3StoreError","code":"InternalError"}']);
+    lines.length = 0;
+    store.repo.blobs.put = put;
+    const id = await uploaded();
+    store.repo.blobs.get = async () => { throw new Error("secret /blob/path"); };
+    expect((await send(request("GET", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(500);
+    expect(lines).toEqual(['[grayboard] {"operation":"attachments.download","category":"failure","level":"error","class":"Error"}']);
+    lines.length = 0;
+    expect((await send(request("POST", undefined, bytes, "not-a-token"))).status).toBe(401);
+    expect((await send(request("GET", "/hosted/mcp/attachments/999?identity=be"))).status).toBe(404);
+    expect(lines).toEqual([]);
+  } finally { log.mockRestore(); }
 });
 
 test("shutdown cancels quota and body waiters and settles before caller closes DB", async () => {
@@ -393,3 +476,141 @@ test("abort while reading and stop during blob put release resources", async () 
   expect((await upload).status).toBe(503);
   expect(count()).toBe(0);
 });
+
+// #1053: the byte routes' guard runs inside the store, audit, download and release transactions too. Every read it
+// makes there goes through that body's own handle, never the pool: on Postgres a pool read would take a second
+// connection while the body holds one (D2) and miss the body's own rows.
+test("#1053: the guard's reads inside a transaction body use that body's handle, not the pool", async () => {
+  const queue = queueFor(store.db);
+  const inBody: { what: string; pool: boolean }[] = [];
+  const record = (what: string, fn: (...args: never[]) => unknown) => function (this: unknown, ...args: unknown[]) {
+    if (queue.mine) inBody.push({ what, pool: args[0] === store.repo.read });
+    return (fn as (...a: unknown[]) => unknown).apply(this, args);
+  };
+  const find = store.repo.aliases.find, get = store.repo.hosted.get, lock = store.repo.hosted.lock;
+  store.repo.aliases.find = record("aliases.find", find) as typeof find;
+  store.repo.hosted.get = record("hosted.get", get) as typeof get;
+  store.repo.hosted.lock = record("hosted.lock", lock) as typeof lock;
+  const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", active => record("findActiveAccess", active) as typeof active);
+  try {
+    const id = await uploaded();
+    expect((await send(request("GET", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(200);
+    expect((await send(request("DELETE", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(200);
+  } finally {
+    store.repo.aliases.find = find; store.repo.hosted.get = get; store.repo.hosted.lock = lock; restoreAccess();
+  }
+  // Each of the three reads ran in a body (store, audit, download recheck, release), and none of them on the pool.
+  // In a body the guard reads its row with `lock` (#807 P3 C8a).
+  for (const what of ["aliases.find", "hosted.lock", "findActiveAccess"]) expect(inBody.some(c => c.what === what)).toBe(true);
+  expect(inBody.filter(c => c.pool)).toEqual([]);
+});
+
+// #807 P3 A7d2a: `start`'s request holds at the guard's `attachments:guard:checked` point (its token read done) on its
+// `hit`th guard call, then `during` runs, then the pause releases. Resolves with the response. `point` picks another
+// pause in the guard (A7f3: `attachments:guard:alias-read`, after its alias read).
+async function heldGuard(hit: number, start: () => Promise<Response>, during: () => Promise<void> | void, point = "attachments:guard:checked") {
+  const pause = mkdtempSync(join(tmpdir(), "gb-guard-pause-")), file = join(pause, "release");
+  let seen = 0;
+  const reached = Promise.withResolvers<void>();
+  // The spy runs inside the pause's own log line, before it first looks for the file: every hit but the `hit`th
+  // finds the file and passes at once, and the `hit`th finds none and holds until `during` is done.
+  const original = console.error.bind(console);
+  // Every other line still reaches stderr, so a failure's own error stays visible.
+  const log = spyOn(console, "error").mockImplementation((message: unknown, ...rest: unknown[]) => {
+    if (message !== `[grayboard] test pause hit: ${point}`) return original(message, ...rest);
+    if (++seen === hit) { rmSync(file, { force: true }); reached.resolve(); } else writeFileSync(file, "");
+  });
+  process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
+  const deadline = setTimeout(() => reached.reject(new Error(`guard pause hit ${seen} of ${hit} times in 5 s`)), 5_000);
+  try {
+    const response = start();
+    response.catch(() => {});
+    await reached.promise;
+    await during();
+    writeFileSync(file, "release");
+    const value = await response;
+    expect(seen).toBeGreaterThanOrEqual(hit);
+    return value;
+  } finally {
+    clearTimeout(deadline);
+    writeFileSync(file, "release");
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    log.mockRestore(); rmSync(pause, { recursive: true, force: true });
+  }
+}
+// Whether an `attachments` row was ever inserted (AUTOINCREMENT keeps the sequence after the row is deleted).
+const everStored = () => store.db.query("SELECT 1 FROM sqlite_sequence WHERE name = 'attachments'").get() !== null;
+
+// A token the pool still reads as live but every transaction body reads as revoked: what a body sees when a revoke
+// commits after the route's last pool check (the guard's own binding fence would refuse one seen at the pool).
+const revokedInBodies = () => stubAuthRead(store.repo, "findActiveAccess", active => ((r, ...rest) => r === store.repo.read ? active(r, ...rest) : undefined) as typeof active);
+
+test("#807 P3 A7d2a: the store body awaits the guard on its Tx and refuses before core inserts", async () => {
+  const restore = revokedInBodies();
+  try { expect((await send()).status).toBe(401); } finally { restore(); }
+  // Refused before core's insert, not inserted and then released by the audit body's check.
+  expect(everStored()).toBe(false);
+  expect(store.db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 0 });
+});
+
+test("#807 P3 A7d2a: the download's recheck body awaits the guard on its Tx", async () => {
+  const id = await uploaded();
+  const restore = revokedInBodies();
+  try { expect((await send(request("GET", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(401); } finally { restore(); }
+  expect(store.db.query("SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.downloaded'").get()).toEqual({ n: 0 });
+});
+
+test("#807 P3 A7d2a: the release body awaits the guard on its Tx", async () => {
+  const id = await uploaded();
+  const restore = revokedInBodies();
+  try { expect((await send(request("DELETE", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(401); } finally { restore(); }
+  expect(count()).toBe(1);
+});
+
+// The guard calls of one upload, in order: the router's (1), the route's before its quota wait (2), before its body
+// read (3) and after it (4), the store body's (5), the audit body's (6), the route's after the store (7) and the
+// router's after the route (8).
+for (const [stop, status] of [["abort", 499], ["close", 503]] as const) {
+  test(`#807 P3 A7d2a: a request ${stop === "abort" ? "aborted" : "closed"} while the store body's guard reads is refused there`, async () => {
+    const aborts = new AbortController();
+    let closing: Promise<void> | undefined;
+    const response = await heldGuard(5, () => send(request("POST", undefined, bytes, issued.token, { signal: aborts.signal })), () => {
+      if (stop === "abort") aborts.abort();
+      else closing = router.close();
+    });
+    await closing;
+    expect(response.status).toBe(status);
+    expect(everStored()).toBe(false);
+  });
+}
+
+// #807 P3 A7f3: the guard's alias read awaits, so a stop during it refuses there, before the store body inserts.
+for (const [stop, status] of [["abort", 499], ["close", 503]] as const) {
+  test(`#807 P3 A7f3: a request ${stop === "abort" ? "aborted" : "closed"} while the store body's guard reads its alias is refused there`, async () => {
+    const aborts = new AbortController();
+    let closing: Promise<void> | undefined;
+    const response = await heldGuard(5, () => send(request("POST", undefined, bytes, issued.token, { signal: aborts.signal })), () => {
+      if (stop === "abort") aborts.abort();
+      else closing = router.close();
+    }, "attachments:guard:alias-read");
+    await closing;
+    expect(response.status).toBe(status);
+    expect(everStored()).toBe(false);
+  });
+}
+
+// #1150 audit F3: the binding guard's token check awaits too, so the router's guard checks the close or abort again
+// after it. Armed at the router's last guard call (8, after the route has its response), the next token check is that
+// guard's `fence`; a stop during it refuses rather than returning the upload's response.
+for (const [stop, status] of [["abort", 499], ["close", 503]] as const) {
+  test(`a request ${stop === "abort" ? "aborted" : "closed"} while the binding guard's token check awaits is refused there`, async () => {
+    const aborts = new AbortController();
+    let closing: Promise<void> | undefined;
+    const response = await heldGuard(8, () => send(request("POST", undefined, bytes, issued.token, { signal: aborts.signal })), () => {
+      onCheck = () => { if (stop === "abort") aborts.abort(); else closing = router.close(); };
+    });
+    await closing;
+    expect(onCheck).toBeUndefined();
+    expect(response.status).toBe(status);
+  });
+}

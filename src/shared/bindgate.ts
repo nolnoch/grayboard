@@ -2,6 +2,8 @@
 // audit 11): a call picks the address it acts as from the session's holds
 // when it starts (#284 S3, S4, S14), so a change to them mid-call would let
 // it act as an alias the session no longer holds. Both modes use it.
+import { testPause } from "./testpause.ts";
+
 export class BindGate {
   private active = 0;
   private drained: (() => void) | null = null;
@@ -9,7 +11,9 @@ export class BindGate {
 
   /** Run a tool call once no bind is waiting or running. */
   async call<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.closed) await this.closed;
+    // A call or bind waiting behind a bind: a trace point for the hosted races' real-OpenCode test (#383),
+    // synchronous like bindgate:bind:drain below.
+    while (this.closed) { testPause("bindgate:wait"); await this.closed; }
     this.active++;
     try {
       return await fn();
@@ -20,12 +24,17 @@ export class BindGate {
 
   /** Run a bind or unbind alone: after the calls in flight finish, and before any that arrive meanwhile. */
   async bind<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.closed) await this.closed;
+    while (this.closed) { testPause("bindgate:wait"); await this.closed; }
     let open!: () => void;
     const closed = new Promise<void>((r) => { open = r; });
     this.closed = closed;
     try {
-      if (this.active) await new Promise<void>((r) => { this.drained = r; });
+      if (this.active) {
+        // A bind now waiting for the calls in flight: a trace point for the hosted races' real-OpenCode test
+        // (#383), synchronous so it adds no turn to the wait.
+        testPause("bindgate:bind:drain");
+        await new Promise<void>((r) => { this.drained = r; });
+      }
       this.drained = null;
       return await fn();
     } finally {

@@ -1,0 +1,20 @@
+{
+  "arguments": {
+    "board": "rec",
+    "body": "a post"
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"post_id\": 1,\n  \"board\": \"rec\",\n  \"notified\": []\n}"
+      }
+    ]
+  }
+}

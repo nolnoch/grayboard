@@ -1,28 +1,35 @@
 // The org Slack bridge: one Slack app for the whole server, enabled by
 // SLACK_APP_TOKEN + SLACK_BOT_TOKEN. Each linked user talks to the app in
 // their own DM with it, as their human identity "<email>/human". That identity
-// uses the hosted application directly, sharing delivery, cursors, canSend
-// and board access with agents. See docs/slack-bridge.md.
+// uses the hosted application directly, sharing delivery, cursors, policy.ts decide()
+// and board access with agents. See docs/slack-org-bridge.md.
 //
 // Linking proves both sides: `grayboard slack link` (a signed-in grayboard
 // user) gets a one-time code, and only the Slack account that sends it to the
 // app gets linked.
 import { randomInt } from "node:crypto";
 
-import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
+import { refOf } from "../core/boards.ts";
 import { boardNotification, dmNotification } from "../shared/notifications.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
-import { SlackWeb } from "../bridge/web.ts";
-import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
+import { SlackError, SlackWeb } from "../bridge/web.ts";
+import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import type { Repo, SlackLink } from "./db.ts";
+import type { Repo, SlackLink, SlackThread } from "./db.ts";
 import { onAliasCreated } from "./teams.ts";
-import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
+import { ApplicationError, type Application, type ApplicationSession, type DeliverySink, type RefusalRow } from "./application.ts";
 import { CoreError } from "../core/errors.ts";
 import { failureDiagnostic } from "./diagnostics.ts";
+import { detached } from "./request_context.ts";
+import { jsonSafe } from "./store/json_safe.ts";
+import type { Tx } from "./store/tx.ts";
+import { atSite } from "./store/queue.ts";
+
+/** users.info errors that mean Slack won't give this account's email, as opposed to Slack being unreachable. */
+const NO_EMAIL = new Set(["missing_scope", "user_not_found", "user_not_visible"]);
 
 const CODE_TTL_MS = 10 * 60_000;
 // Wrong codes a Slack account may send per CODE_TTL_MS; 8 chars from 31 make
@@ -40,7 +47,6 @@ const NOT_LINKED =
 
 export type SlackBridgeOptions = {
   repo: Repo;
-  db: CoreDb;
   application: Application;
   appToken: string;
   botToken: string;
@@ -55,8 +61,8 @@ export type SlackBridgeOptions = {
 export type SlackLinker = {
   // False once the bridge has stopped (failed to start, or Slack ended it).
   readonly running: boolean;
-  newCode(authed: AuthedUser): { code: string; expires_in_s: number; linked: boolean };
-  unlink(userId: number): boolean;
+  newCode(authed: AuthedUser): Promise<{ code: string; expires_in_s: number; linked: boolean }>;
+  unlink(userId: number): Promise<boolean>;
   // A user was disabled or enabled: take their human offline, or back.
   userChanged(userId: number): Promise<void>;
 };
@@ -82,7 +88,7 @@ export class SlackBridge implements SlackLinker {
   /** Connect to Slack and bring every linked user's human online. */
   async start(): Promise<void> {
     const me = await this.web.call<{ user_id: string; team?: string }>("auth.test");
-    for (const link of this.o.repo.slack.links()) await this.attach(link);
+    for (const link of await this.o.repo.slack.links(this.o.repo.read)) await this.attach(link);
     this.socket = new SocketMode({
       open: async () => (await this.app.call<{ url: string }>("apps.connections.open")).url,
       onEvent: (payload) => this.onEvent(payload),
@@ -121,59 +127,76 @@ export class SlackBridge implements SlackLinker {
     // exactly the death the owner must hear about (app.ts's catch). A
     // disabled user's human is offline by admin action, not the bridge's
     // death, so their row is skipped.
-    for (const link of this.o.repo.slack.links()) {
-      const user = this.o.repo.users.findById(link.user_id);
-      if (!user || user.disabled_at !== null) continue;
-      const target = `${link.email}/${HUMAN_NAME}`;
-      // Dedup against the last DELIVERED notice, not the last death: the
-      // unsuppressed row itself is what's owed, so a notice armed but not
-      // yet delivered survives a restart. `last()` before the insert and
-      // the clamp ride out clock skew in both directions.
-      const last = this.o.repo.audit.last("bridge.notified", target);
-      const prior = last && at - last.at >= 0 && at - last.at < BRIDGE_NOTIFY_DEDUP_MS;
-      writeAudit(this.o.repo, "bridge.stopped", null, target, {
-        reason: reason.detail,
-        at: new Date(at).toISOString(),
-        ...(prior ? { suppressed: true } : {}),
-      });
-    }
+    // One posted write (#807 D4): stop() is sync, called from startup's catch and Slack's close; the dedup read
+    // and the insert share its transaction. Its body awaits the links read (#807 P3 A6b), so it commits after stop()
+    // returns, even on an idle queue; a write queued after it (a session's bind draining the notice) waits for it.
+    const { repo } = this.o;
+    atSite("slack", () => repo.post(async tx => {
+      for (const link of await repo.slack.links(tx)) {
+        const user = await repo.users.findById(tx, link.user_id);
+        if (!user || user.disabled_at !== null) continue;
+        const target = `${link.email}/${HUMAN_NAME}`;
+        // Dedup against the last DELIVERED notice, not the last death: the
+        // unsuppressed row itself is what's owed, so a notice armed but not
+        // yet delivered survives a restart. `last()` before the insert and
+        // the clamp ride out clock skew in both directions. The lock owedBridgeNotice takes too (#807 P3 C7
+        // decision 5): a notice it delivers meanwhile is read here, and suppresses this row. links is by user_id, so
+        // two stops lock in one order.
+        await repo.audit.lock(tx, "bridge.notified", target);
+        const last = await repo.audit.last(tx, "bridge.notified", target);
+        const prior = last && at - last.at >= 0 && at - last.at < BRIDGE_NOTIFY_DEDUP_MS;
+        writeAudit(repo, tx, "bridge.stopped", null, target, {
+          reason: reason.detail,
+          at: new Date(at).toISOString(),
+          ...(prior ? { suppressed: true } : {}),
+        });
+      }
+    }, undefined, "bridge.stopped audit"));
   }
 
   // ── linking ────────────────────────────────────────────────────────────────
 
-  newCode(authed: AuthedUser): { code: string; expires_in_s: number; linked: boolean } {
+  async newCode(authed: AuthedUser): Promise<{ code: string; expires_in_s: number; linked: boolean }> {
     const now = Date.now();
     for (const [c, v] of this.codes) if (v.userId === authed.user_id || v.expires <= now) this.codes.delete(c);
     let code = "";
     for (let i = 0; i < 8; i++) code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
     this.codes.set(code, { userId: authed.user_id, expires: now + CODE_TTL_MS });
-    return { code, expires_in_s: CODE_TTL_MS / 1000, linked: !!this.o.repo.slack.linkFor(authed.user_id) };
+    return { code, expires_in_s: CODE_TTL_MS / 1000, linked: !!(await this.o.repo.slack.linkFor(this.o.repo.read, authed.user_id)) };
   }
 
   /** Remove a user's link and their human identity. False if they had none. */
-  unlink(userId: number): boolean {
-    const { repo, db } = this.o;
-    const link = repo.slack.linkFor(userId);
-    if (!link) return false;
-    this.detach(userId);
-    repo.slack.unlink(userId);
-    // Unread DMs to an identity nobody reads would only pile up; a later link
-    // starts from the newest message (see linkUser).
-    const handle = `${link.email}/${HUMAN_NAME}`;
-    repo.aliases.remove(handle);
-    forgetHandle(db, handle);
-    writeAudit(repo, "slack.unlinked", link.email, link.slack_user);
-    return true;
+  // One transaction through the write queue (#807 D4); the human goes offline after it commits, so a rolled-back
+  // unlink leaves it linked and attached.
+  // `slackUser`: only that Slack account's link (the Slack `unlink` command), re-checked inside the write, since a
+  // relink to another account may have committed while it waited.
+  unlink(userId: number, slackUser?: string): Promise<boolean> {
+    const { repo } = this.o;
+    return atSite("slack", () => repo.write(async (tx: Tx): Promise<boolean> => {
+      // Every link write's lock, before the read it decides on (#807 P3 C7 decision 4).
+      await repo.slack.lock(tx);
+      const link = await repo.slack.linkFor(tx, userId);
+      if (!link || (slackUser !== undefined && link.slack_user !== slackUser)) return false;
+      await repo.slack.unlink(tx, userId);
+      // Unread DMs to an identity nobody reads would only pile up; a later link
+      // starts from the newest message (see linkUser).
+      const handle = `${link.email}/${HUMAN_NAME}`;
+      await repo.aliases.lock(tx, handle, "delete");
+      await repo.aliases.remove(tx, handle);
+      await repo.boards.forget(tx, handle);
+      writeAudit(repo, tx, "slack.unlinked", link.email, link.slack_user);
+      return true;
+    }, unlinked => { if (unlinked) this.detach(userId); return unlinked; }));
   }
 
   async userChanged(userId: number): Promise<void> {
     this.detach(userId);
-    const link = this.o.repo.slack.linkFor(userId);
+    const link = await this.o.repo.slack.linkFor(this.o.repo.read, userId);
     if (link) await this.attach(link);
   }
 
   private async linkUser(slackUser: string, channel: string, ts: string, code: string): Promise<void> {
-    const { repo, db } = this.o;
+    const { repo } = this.o;
     const now = Date.now();
     const t = this.tries.get(slackUser);
     if (t && t.until > now && t.n >= MAX_TRIES) {
@@ -186,28 +209,71 @@ export class SlackBridge implements SlackLinker {
     }
     this.codes.delete(code.toLowerCase());
     this.tries.delete(slackUser);
-    const user = repo.users.findById(entry.userId);
+    const user = await repo.users.findById(repo.read, entry.userId);
     if (!user) return;
-    const other = repo.slack.linkBySlackUser(slackUser);
+    const other = await repo.slack.linkBySlackUser(repo.read, slackUser);
     if (other && other.user_id !== user.id) {
       return this.say(channel, ts, `This Slack account is linked to \`${other.email}\`. Send \`unlink\` first.`);
     }
-
-    this.detach(user.id);
-    repo.slack.link(user.id, slackUser, channel);
-    const handle = `${user.email}/${HUMAN_NAME}`;
-    if (!repo.aliases.find(handle)) {
-      // Start from now: drop what queued for an earlier link's alias.
-      forgetHandle(db, handle);
-      repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
-      writeAudit(repo, "alias.created", user.email, handle, { slack: true });
-      onAliasCreated(db, repo, user.id, handle);
-      const newest = repo.messages.history([handle], undefined, 1)[0];
-      if (newest) repo.cursors.advance(handle, "direct", handle, newest.id);
+    // A code proves the CLI's token, not who sends it: only the Slack account
+    // with the user's own email may redeem it (#805 F-05).
+    const email = await this.slackEmail(slackUser);
+    if (email === "unavailable") {
+      await atSite("slack", () => repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "slack_unavailable" })));
+      return this.say(channel, ts, "grayboard couldn't reach Slack to check this account's email, and the code is used up. Run `grayboard slack link` for a new one and try again.");
     }
-    markHuman(db, handle, true);
-    writeAudit(repo, "slack.linked", user.email, slackUser);
-    await this.attach(repo.slack.linkFor(user.id)!);
+    if (email === null) {
+      await atSite("slack", () => repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "no_email" })));
+      return this.say(channel, ts, "grayboard can't read your Slack account's email, so it can't check this link. Ask the server's admin to add the users:read and users:read.email scopes to the Slack app and reinstall it.");
+    }
+    if (email !== user.email) {
+      await atSite("slack", () => repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "email_mismatch" })));
+      return this.say(channel, ts, `This Slack account's email isn't \`${user.email}\`; link from that account. The code is used up.`);
+    }
+
+    // The link and its human identity commit in one transaction through the write queue (#807 D4). The Slack
+    // account is checked again inside it: the email check above awaited Slack. The old human goes offline and the
+    // new one's attach starts after the commit, with no await between them; attach's own awaits (its user read,
+    // #807 P3 A7u2, and attachHuman's queued write) are covered by the link check inside attachHuman's write, so a
+    // concurrent unlink can't leave it attached without its link.
+    type Linked = { taken: SlackLink } | { moved: SlackLink | undefined; link: SlackLink };
+    const done = await atSite("slack", () => repo.write(async (tx: Tx): Promise<Linked> => {
+      // Every link write's lock, before its reads (#807 P3 C7 decision 4): of two links of one Slack account, the
+      // second reads the first's row and answers taken.
+      await repo.slack.lock(tx);
+      const taken = await repo.slack.linkBySlackUser(tx, slackUser);
+      if (taken && taken.user_id !== user.id) return { taken };
+      const previous = await repo.slack.linkFor(tx, user.id);
+      await repo.slack.link(tx, user.id, slackUser, channel);
+      const moved = previous && previous.slack_user !== slackUser ? previous : undefined;
+      if (moved) writeAudit(repo, tx, "slack.relinked", user.email, slackUser, { from: moved.slack_user });
+      const handle = `${user.email}/${HUMAN_NAME}`;
+      // Null when it exists (#807 P3 C5 decision 3): a concurrent attach may have made it.
+      if (await repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email)) {
+        // Start from now: drop what queued for an earlier link's alias.
+        await repo.boards.forget(tx, handle);
+        writeAudit(repo, tx, "alias.created", user.email, handle, { slack: true });
+        await onAliasCreated(repo, tx, user.id, handle);
+        const newest = (await repo.messages.history(tx, [handle], undefined, 1))[0];
+        if (newest) await repo.cursors.advance(tx, handle, "direct", handle, newest.id);
+      }
+      await repo.aliases.markHuman(tx, handle, true);
+      writeAudit(repo, tx, "slack.linked", user.email, slackUser);
+      return { moved, link: (await repo.slack.linkFor(tx, user.id))! };
+    }, (r): Linked & { attached?: Promise<void> } => {
+      if ("taken" in r) return r;
+      this.detach(user.id);
+      return { ...r, attached: this.attach(r.link) };
+    }));
+    if ("taken" in done) {
+      return this.say(channel, ts, `This Slack account is linked to \`${done.taken.email}\`. Send \`unlink\` first.`);
+    }
+    await done.attached;
+    const { moved } = done;
+    if (moved) {
+      // Moving a link is never silent: the account it leaves hears so.
+      await this.say(moved.dm_channel, undefined, `\`${user.email}\` is now linked to another Slack account; this one no longer gets its agents' messages.`);
+    }
     await this.say(
       channel,
       ts,
@@ -215,28 +281,52 @@ export class SlackBridge implements SlackLinker {
     );
   }
 
+  /**
+   * The Slack account's email, lowercased; null if Slack won't say (missing
+   * scope, unknown user, no email); "unavailable" if Slack couldn't be asked.
+   */
+  private async slackEmail(slackUser: string): Promise<string | null | "unavailable"> {
+    try {
+      const r = await this.web.call<{ user?: { profile?: { email?: string } } }>("users.info", { user: slackUser }, { form: true });
+      const email = r.user?.profile?.email?.trim().toLowerCase();
+      return email ? email : null;
+    } catch (e) {
+      this.log(`users.info for ${slackUser} failed: ${e instanceof Error ? e.message : String(e)}`);
+      if (e instanceof SlackError && NO_EMAIL.has(e.code)) return null;
+      return "unavailable";
+    }
+  }
+
   // ── a linked user's human ──────────────────────────────────────────────────
 
   private async attach(link: SlackLink): Promise<void> {
-    const { repo, db } = this.o;
-    const user = repo.users.findById(link.user_id);
+    const { repo } = this.o;
+    // Read first, then the stop flag (#807 P3 A7u2): a stop during the read refuses here.
+    const user = await repo.users.findById(repo.read, link.user_id);
     if (!user || user.disabled_at !== null || this.stopped) return;
     const prefix = `${link.email}/`;
     const handle = `${prefix}${HUMAN_NAME}`;
-    const authed: AuthedUser = { user_id: link.user_id, user_email: link.email, session_id: 0 };
+    const authed: AuthedUser = { user_id: link.user_id, user_email: link.email, kind: user.kind, session_id: 0 };
 
     let relay!: Relay;
     const application = this.o.application;
     let session!: ApplicationSession;
     const sink: DeliverySink = {
-      probe: async () => true,
       closed: () => this.detach(link.user_id),
       deliver(m) {
-        if (m.kind === "direct") relay.notify(dmNotification(m.message));
+        // The relay's one drain loop carries every queued item, whoever's
+        // request started it: detached, so its rows carry no request's
+        // address (security audit F-19).
+        if (m.kind === "direct") detached(() => relay.notify(dmNotification(m.message)));
         else if (m.item.kind === "digest") {
-          try { application.receiptBoards(session, [refOf(m.item)]); } catch {}
+          // A queued write, not a post (#807 P3 A7u1): receiptBoards is async, and this sink also runs from the write
+          // queue's holder (a commit's wake drains the human's digests), where an async post throws. A refusal (the
+          // human detached meanwhile) is expected; anything else is logged.
+          void atSite("slack", () => repo.write(tx => application.receiptBoards(tx, session, [refOf(m.item)]))).catch(error => {
+            if (!(error instanceof ApplicationError)) console.error("[grayboard] Slack digest receipt failed:", error);
+          });
         }
-        else relay.notify(boardNotification(m.item));
+        else detached(() => relay.notify(boardNotification(m.item)));
       },
     };
 
@@ -249,45 +339,124 @@ export class SlackBridge implements SlackLinker {
       const m = outbox.get(id)?.meta ?? {};
       return m.board && m.post_id ? `post:${m.post_id}` : `dm:${m.message_id}`;
     };
+    // The store's writes are posted (#807 D4), not awaited: the relay awaits each call (#807 P3 A5), but these still
+    // answer before their write commits. A post waits behind another body's hold, and its reads go to committed
+    // state, so a read could miss the relay's own earlier write (#1016): a second item in a new thread posted
+    // unthreaded, a stale peer, a retry's stale progress. Until its last write commits, a row's value as those
+    // writes leave it is kept here, and reads take it first. An entry is
+    // dropped by the commit of the write that last set it. One whose write failed stays, best effort, until a later
+    // write on that row commits: the relay did what it records.
+    let seq = 0;
+    const pendingThreads = new Map<string, { row: SlackThread; seq: number }>();
+    const pendingProgress = new Map<string, { value: unknown; seq: number }>();
+    // The committed row is read with an await (#807 P3 A6b), and only when the overlay has none. A caller awaits it,
+    // then reads the overlay (`current`) and, for a write, calls postThread in the same synchronous step: a row
+    // another call set while it awaited wins, and two calls resolving in one drain each build on the other's row.
+    // An async helper that returned the overlay's row would hand back one read before the await, which a sibling
+    // call's postThread could overtake.
+    const committedThread = (ts: string): Promise<SlackThread | undefined> | undefined =>
+      pendingThreads.has(ts) ? undefined : repo.slack.threadByTs(repo.read, link.user_id, ts);
+    const current = (ts: string, committed: SlackThread | undefined) => pendingThreads.get(ts)?.row ?? committed;
+    const postThread = (row: SlackThread, write: (tx: Tx) => Promise<void>, what: string) => {
+      const mine = ++seq;
+      pendingThreads.set(row.thread_ts, { row, seq: mine });
+      atSite("slack", () => repo.post(write, () => { if (pendingThreads.get(row.thread_ts)?.seq === mine) pendingThreads.delete(row.thread_ts); }, what));
+    };
     const store: RelayStore = {
-      thread: (kind, board, root) => repo.slack.thread(link.user_id, kind, board, root),
-      byTs: (ts) => repo.slack.threadByTs(link.user_id, ts),
-      addThread: (row) => repo.slack.addThread(link.user_id, row),
-      advance: (ts, id) => repo.slack.advanceThread(link.user_id, ts, id),
+      thread: (kind, board, root) => {
+        for (const { row } of pendingThreads.values()) if (row.kind === kind && (row.board ?? null) === (board ?? null) && row.root_id === root) return row;
+        return repo.slack.thread(repo.read, link.user_id, kind, board, root);
+      },
+      byTs: async (ts) => current(ts, await committedThread(ts)),
+      // INSERT OR IGNORE: a row already there stays as it is.
+      addThread: async (row) => {
+        const committed = await committedThread(row.thread_ts);
+        if (current(row.thread_ts, committed)) { atSite("slack", () => repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row")); return; }
+        postThread({ ...row, board: row.board ?? null }, tx => repo.slack.addThread(tx, link.user_id, row), "Slack thread row");
+      },
+      // As advanceThread's UPDATE: last_id only moves forward, and peer follows only a newer id.
+      advance: async (ts, id, peer) => {
+        const write = (tx: Tx) => repo.slack.advanceThread(tx, link.user_id, ts, id, peer);
+        const committed = await committedThread(ts);
+        const row = current(ts, committed);
+        if (!row) { atSite("slack", () => repo.post(write, undefined, "Slack thread advance")); return; }
+        postThread({ ...row, peer: peer != null && id > row.last_id ? peer : row.peer, last_id: Math.max(row.last_id, id) }, write, "Slack thread advance");
+      },
       enqueue: (params) => {
         outbox.set(++next, params as ChannelParams);
         return next;
       },
       pending: () => [...outbox].map(([id, p]) => ({ id, params: JSON.stringify(p) })),
-      progress: (id) => repo.slack.progress(link.user_id, ref(id)),
-      setProgress: (id, progress) => repo.slack.setProgress(link.user_id, ref(id), progress),
+      progress: (id) => {
+        const r = ref(id), pending = pendingProgress.get(r);
+        return pending ? structuredClone(pending.value) : repo.slack.progress(repo.read, link.user_id, r);
+      },
+      setProgress: (id, progress) => {
+        // A copy: the relay keeps mutating its progress object after saving it, as the stored JSON doesn't see. Made
+        // safe as the store stores it (#807 P3 C7 decision 3), so a read before the write lands answers the same.
+        const r = ref(id), mine = ++seq, value = jsonSafe(structuredClone(progress));
+        pendingProgress.set(r, { value, seq: mine });
+        atSite("slack", () => repo.post(tx => repo.slack.setProgress(tx, link.user_id, r, value), () => { if (pendingProgress.get(r)?.seq === mine) pendingProgress.delete(r); }, "Slack progress"));
+      },
       done: (id) => {
         const p = outbox.get(id);
         const m = p?.meta ?? {};
         if (!session.active) throw new Error("Slack delivery session ended before receipt");
-        // Receipt is synchronous and validates the live session; retain progress on any refusal.
-        if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
-        else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)]);
-        repo.slack.clearProgress(link.user_id, ref(id));
-        outbox.delete(id);
+        // The receipt validates the live session; it and the progress clear are one posted write (#807 D4). Its body
+        // awaits the cursor write (#807 P3 A6a), so it commits after post returns, even on an idle queue: the item
+        // leaves the outbox now so the drain doesn't post it again; a refusal then rolls both back and is logged, and
+        // the unacked item is resent at the next start.
+        const r = ref(id);
+        const now = atSite("slack", () => repo.post(async tx => {
+          // A message Slack refused (msg_too_long) is given up, never posted: its cursor moves but it isn't stamped
+          // delivered (#470). Read in the body, after the progress writes queued before it.
+          const posted = (await repo.slack.progress(tx, link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
+          if (m.board && m.post_id) await application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
+          else if (m.message_id) await application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
+          await repo.slack.clearProgress(tx, link.user_id, r);
+        }, () => { outbox.delete(id); pendingProgress.delete(r); }, "Slack receipt"));
+        if (!now) outbox.delete(id);
       },
     };
 
+    // A Slack user's tool call runs in one transaction through the write queue (#807 D4), as a hosted call does
+    // (hosted.run): its refusal rows, which the rollback would drop, are written after it in a body of their own.
+    // Bodies hold the write queue one at a time, so the shared session's afterRollback is set only inside one, and
+    // cleared once fn (an application operation, async since #807 P1c-3) settles.
+    const inWrite = async <T>(fn: (tx: Tx) => Promise<T>): Promise<T> => {
+      const rows: RefusalRow[] = [];
+      try {
+        return await atSite("slack", () => repo.write(async tx => {
+          rows.length = 0;
+          session.afterRollback = write => { rows.push(write); };
+          try { return await fn(tx); } finally { session.afterRollback = undefined; }
+        })) as T;
+      } catch (error) {
+        if (rows.length) {
+          await atSite("slack", () => repo.write(async tx => {
+            for (const write of rows) {
+              try { await tx.savepoint(write); } catch (failure) { console.error("[grayboard slack] refusal row failed:", failure); }
+            }
+          })).catch(failure => console.error("[grayboard slack] refusal rows failed:", failure));
+        }
+        throw error;
+      }
+    };
     const bus: Bus = {
       async call(name, args) {
         try {
           if (name === "dm_send") {
-            return { ok: true, value: application.send(session, String(args.to), String(args.body), {
+            return { ok: true, value: await inWrite(tx => application.send(tx, session, String(args.to), String(args.body), {
               ...(args.parent_id !== undefined ? { parent_id: Number(args.parent_id) } : {}),
               ...(args.attachment_ids !== undefined ? { attachment_ids: args.attachment_ids as number[] } : {}),
-            }) };
+            })) };
           }
           if (name === "dm_thread") {
-            return { ok: true, value: application.thread(session, Number(args.thread)) };
+            return { ok: true, value: await inWrite(tx => application.thread(tx, session, Number(args.thread))) };
           }
-          return { ok: true, value: application.call(session, name, args) };
+          return { ok: true, value: await inWrite(tx => application.call(tx, session, name, args)) };
         } catch (e) {
-          if (e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError) return { ok: false, error: e.message };
+          if (e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError) return { ok: false, error: e.message, ...(typeof (e as { code?: unknown }).code === "string" ? { code: (e as { code: string }).code } : {}) };
           console.error(`[grayboard slack] bus call failed: ${JSON.stringify({ principal: link.user_id, identity: handle, session: session.sessionId, tool: name, protocol: "slack", ...failureDiagnostic("slack-bus", e) })}`);
           return { ok: false, error: "internal error" };
         }
@@ -295,11 +464,9 @@ export class SlackBridge implements SlackLinker {
       // In process: the read check the download route makes, and the store an
       // upload makes, audited the same way.
       async attachment(id) {
-        const row = readableAttachment(repo, db, handle, id, null, link.email);
-        if (!row) {
-          writeAudit(repo, "attachment.download_refused", link.email, `attachment:${id}`, { identity: handle, via: "slack" });
-          throw new Error(`no attachment ${id} on a message or post you can read`);
-        }
+        const read = await requestAttachment(repo, repo.read, handle, String(id), null, { user: link.email, address: handle }, { via: "slack" });
+        if ("refused" in read) throw new Error(read.refused);
+        const { row } = read;
         return { id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, data: await repo.blobs.get(row.sha256) };
       },
       // Files the relay checked (checkFile), stored as the HTTP upload route
@@ -308,12 +475,12 @@ export class SlackBridge implements SlackLinker {
         const ids: number[] = [];
         let sent = false;
         try {
-          for (const f of files) ids.push((await storeUpload(repo, db, link.email, handle, f, { slack_file: f.slack_file })).id);
+          for (const f of files) ids.push((await storeUpload(repo, link.email, handle, f, { slack_file: f.slack_file })).id);
           const r = await send({ attachment_ids: ids });
           sent = (r as { ok?: boolean }).ok !== false;
           return r;
         } finally {
-          if (!sent) for (const id of ids) await releaseStored(repo, db, link.email, handle, id, { via: "slack" });
+          if (!sent) for (const id of ids) await releaseStored(repo, link.email, handle, id, { via: "slack" });
         }
       },
     };
@@ -332,22 +499,32 @@ export class SlackBridge implements SlackLinker {
       retryMs: this.o.retryMs,
       label: (h) => (h.startsWith(prefix) ? h.slice(prefix.length) : h),
       attachmentLimits: repo.attachmentLimits,
-      onFileSent: (f) =>
-        writeAudit(repo, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
+      onFileSent: (f) => void atSite("slack", () => repo.post(tx =>
+        writeAudit(repo, tx, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file, sha256: f.sha256,
-        }),
-      onFileRefused: (f) =>
-        writeAudit(repo, "attachment.slack_refused", link.email, f.attachment === null ? null : `attachment:${f.attachment}`, {
+        }), undefined, "Slack file audit")),
+      onFileRefused: (f) => void atSite("slack", () => repo.post(tx =>
+        writeAudit(repo, tx, "attachment.slack_refused", link.email, f.attachment === null ? null : `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, filename: f.name, reason: f.why, ...(f.sha256 ? { sha256: f.sha256 } : {}),
-        }),
+        }), undefined, "Slack file audit")),
     });
     try {
-      ({ session } = await application.attachHuman(authed, sink));
+      // Checked again inside attachHuman's write: an unlink, relink, disable or stop may have committed while it
+      // waited in the queue.
+      // The stop flag is read after the link's await (#807 P3 A7i), so a stop that lands during that read is seen.
+      ({ session } = await application.attachHuman(authed, sink, async tx => {
+        const now = await repo.slack.linkFor(tx, link.user_id);
+        if (this.stopped) return "the Slack bridge stopped";
+        return now && now.slack_user === link.slack_user && now.dm_channel === link.dm_channel ? null : "the Slack link changed";
+      }, true));
       this.linked.set(link.user_id, { link, session, relay });
-      application.replay(session);
+      await application.replay(session);
     } catch (e) {
       this.log(`${link.email}: couldn't bring the human online: ${(e as Error).message}`);
-      this.detach(link.user_id);
+      // Undo this attempt only (#385): a replay that threw after the set is
+      // this attempt's entry; anything else in `linked` is another live one.
+      if (this.linked.get(link.user_id)?.relay === relay) this.detach(link.user_id);
+      else relay.stop();
     }
   }
 
@@ -376,18 +553,22 @@ export class SlackBridge implements SlackLinker {
       const code = /^link\s+([a-z0-9]{4,16})$/i.exec(text);
       if (code) return this.linkUser(user, channel, ts, code[1]!);
       if (/^unlink$/i.test(text)) {
-        const link = this.o.repo.slack.linkBySlackUser(user);
-        if (link) this.unlink(link.user_id);
-        return this.say(channel, ts, link ? `Unlinked from \`${link.email}\`. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
+        const link = await this.o.repo.slack.linkBySlackUser(this.o.repo.read, user);
+        const unlinked = link ? await this.unlink(link.user_id, user) : false;
+        return this.say(channel, ts, link && unlinked ? `Unlinked from \`${link.email}\`. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
       }
     }
-    const link = this.o.repo.slack.linkBySlackUser(user);
+    // The relay is found in memory, with no await before onEvent: the socket calls this in arrival order without
+    // awaiting it, and the relay's queue keeps that order only if each event reaches it synchronously (#807 P3 A6b).
+    // Otherwise the store is read to word the refusal, and a relay that attached while it read still takes the event.
+    for (const l of this.linked.values()) if (l.link.slack_user === user) return l.relay.onEvent(payload);
+    const link = await this.o.repo.slack.linkBySlackUser(this.o.repo.read, user);
     const l = link && this.linked.get(link.user_id);
-    if (!l) return this.say(channel, threaded ? String(e.thread_ts) : ts, link ? "Your link is offline; the server log says why." : NOT_LINKED);
-    await l.relay.onEvent(payload);
+    if (l) return l.relay.onEvent(payload);
+    return this.say(channel, threaded ? String(e.thread_ts) : ts, link ? "Your link is offline; the server log says why." : NOT_LINKED);
   }
 
-  private async say(channel: string, threadTs: string, text: string): Promise<void> {
+  private async say(channel: string, threadTs: string | undefined, text: string): Promise<void> {
     try {
       await this.web.call("chat.postMessage", { channel, thread_ts: threadTs, markdown_text: text });
     } catch (e) {

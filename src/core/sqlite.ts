@@ -1,6 +1,11 @@
 import { Database, SQLiteError } from "bun:sqlite";
 
-const BUSY_TIMEOUT_MS = 5000;
+// Test-only (#1589): BUS_TEST_BUSY_TIMEOUT_MS raises the wait for forced-overlap children under load; it can't lower it.
+export function busyTimeoutMs(value = process.env.BUS_TEST_BUSY_TIMEOUT_MS): number {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 5000 ? Math.min(n, 60_000) : 5000;
+}
+const BUSY_TIMEOUT_MS = busyTimeoutMs();
 
 type CommitEffect = () => void | Promise<void>;
 const effects = new WeakMap<Database, CommitEffect[][]>();
@@ -10,14 +15,39 @@ function flush(effect: CommitEffect): void {
   catch (error) { console.error("postcommit effect failed", error); }
 }
 
+// A connection's writer (the server's write queue, #807 D4). Core stays off the server's queue: the server registers
+// it on its own connection; local mode registers none. `holds`: whether the calling task is the writer, so the open
+// transaction, if any, is its own (an async body's stays open across its awaits while other tasks run). `check`:
+// throws unless it is, before a top-level transaction or a write opens.
+export type Writer = { holds(): boolean; check(): void };
+const writers = new WeakMap<Database, Writer>();
+export function ownWriter(db: Database, writer: Writer): void { writers.set(db, writer); }
+
+// Whether the caller is inside the connection's open transaction: one is open and, on a connection with a writer,
+// the caller holds it. Another task, while the holder awaits, is outside it: it reads committed state on the reader
+// and its post-commit effects run now.
+export function ownsTx(db: Database): boolean {
+  return db.inTransaction && (writers.get(db)?.holds() ?? true);
+}
+
+// Called after each outermost commit on the connection, before its effects (#996: the server's committed auth
+// generation). One per connection; it must not throw.
+const commitHooks = new WeakMap<Database, () => void>();
+export function onCommit(db: Database, hook: () => void): void { commitHooks.set(db, hook); }
+
 export function afterCommit(db: Database, effect: CommitEffect): void {
+  if (!ownsTx(db)) { flush(effect); return; }
   const frame = effects.get(db)?.at(-1);
-  if (frame) frame.push(effect);
-  else {
-    // Raw BEGIN/COMMIT is not a supported effect-bearing transaction boundary.
-    if (db.inTransaction) throw new Error("postcommit effect requires db.transaction");
-    flush(effect);
-  }
+  // Raw BEGIN/COMMIT is not a supported effect-bearing transaction boundary.
+  if (!frame) throw new Error("postcommit effect requires db.transaction");
+  frame.push(effect);
+}
+
+// A top-level boundary's checks: the writer's, then that no transaction is open (one opened by raw BEGIN, or by a
+// task the writer check passed for: a holder's suspended body).
+function topLevel(db: Database): void {
+  writers.get(db)?.check();
+  if (db.inTransaction) throw new Error("transaction requires a tracked outer boundary");
 }
 
 function trackCommits(db: Database): void {
@@ -27,17 +57,20 @@ function trackCommits(db: Database): void {
   db.transaction = <A extends any[], T>(fn: (...args: A) => T) => {
     const native = transaction(fn);
     const wrap = (invoke: (...args: A) => T) => (...args: A): T => {
-      if (!frames.length && db.inTransaction) throw new Error("transaction requires a tracked outer boundary");
+      if (!(frames.length && ownsTx(db))) topLevel(db);
       const frame: CommitEffect[] = [];
       frames.push(frame);
+      // By identity, with any frame left above it (a savepoint its body started and didn't await, #999): the
+      // transaction or savepoint's end ends those too.
+      const drop = () => { const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i); };
       let value: T;
       try { value = invoke(...args); }
-      catch (error) { frames.pop(); throw error; }
-      frames.pop();
+      catch (error) { drop(); throw error; }
+      drop();
       // A released savepoint is not durable until its outer transaction commits.
       const parent = frames.at(-1);
       if (parent) parent.push(...frame);
-      else for (const effect of frame) flush(effect);
+      else { commitHooks.get(db)?.(); for (const effect of frame) flush(effect); }
       return value;
     };
     return Object.assign(wrap(native), {
@@ -46,9 +79,236 @@ function trackCommits(db: Database): void {
   };
 }
 
+// A top-level IMMEDIATE transaction whose body awaits (#807 P1b-4e): db.transaction can't hold one open across an
+// await, so the boundary is explicit. Its post-commit effects collect as db.transaction's do (a nested db.transaction
+// is a savepoint inside it) and run after commit() succeeds; rollback() drops them. Each settles it once.
+export type Boundary = { commit(): void; rollback(): void };
+export function openBoundary(db: Database): Boundary {
+  const frames = effects.get(db);
+  if (!frames) throw new Error("openBoundary: the connection doesn't track commits (openSqlite)");
+  topLevel(db);
+  db.run("BEGIN IMMEDIATE");
+  const frame: CommitEffect[] = [];
+  frames.push(frame);
+  let open = true;
+  // Drops any savepoint frame left above it too (a body that returned without awaiting its savepoint): the
+  // transaction's end ends them.
+  const pop = () => { open = false; const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i); };
+  return {
+    commit() {
+      if (!open) throw new Error("boundary already settled");
+      try { db.run("COMMIT"); } catch (error) {
+        pop();
+        if (db.inTransaction) db.run("ROLLBACK");
+        throw error;
+      }
+      pop();
+      commitHooks.get(db)?.();
+      for (const effect of frame) flush(effect);
+    },
+    rollback() {
+      if (!open) return;
+      pop();
+      if (db.inTransaction) db.run("ROLLBACK");
+    },
+  };
+}
+
+// A savepoint inside the caller's own open transaction whose body may await (#807 P1c, the server's `Tx.savepoint`):
+// db.transaction's nested form can't stay open across an await. Its effects collect in their own frame: commit()
+// releases it and hands them to the enclosing frame (they run at the outer commit, not before); rollback() undoes the
+// savepoint's writes and drops them. Each settles it once.
+let savepoints = 0;
+export function openSavepoint(db: Database): Boundary {
+  const frames = effects.get(db);
+  if (!frames) throw new Error("openSavepoint: the connection doesn't track commits (openSqlite)");
+  if (!ownsTx(db) || !frames.length) throw new Error("openSavepoint: no open transaction of the caller's");
+  const name = `gb_sp_${++savepoints}`;
+  db.run(`SAVEPOINT ${name}`);
+  const frame: CommitEffect[] = [];
+  frames.push(frame);
+  let open = true;
+  // False when its transaction already ended (and dropped its frame): the savepoint went with it. Drops any frame
+  // left above it too: an inner savepoint still open ends with this one.
+  const pop = () => { open = false; const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i); return i >= 0; };
+  return {
+    commit() {
+      if (!open) throw new Error("savepoint already settled");
+      if (!frames.includes(frame)) { open = false; throw new Error("savepoint outlived its transaction"); }
+      // Rolled back rather than left open: the caller's later writes and effects would otherwise land inside it.
+      if (frames.at(-1) !== frame) { this.rollback(); throw new Error("savepoint commit out of order: an inner one is still open"); }
+      try { db.run(`RELEASE ${name}`); } catch (error) { this.rollback(); throw error; }
+      pop();
+      frames.at(-1)!.push(...frame);
+    },
+    rollback() {
+      if (!open) return;
+      if (pop() && db.inTransaction) { db.run(`ROLLBACK TO ${name}`); db.run(`RELEASE ${name}`); }
+    },
+  };
+}
+
+// Compiled statements per connection that `db.query` keeps, least recently used evicted. Bun's default
+// of 20 thrashed: the tree has ~250 prepare sites, and recompiling a statement on every call was ~15%
+// of server CPU at 1000 sessions (#912). The cap is Bun's static, read on every `query` call. The cast
+// is for older `@types/bun` (opencode-v2 pins one) that don't declare the static.
+export const STATEMENT_CACHE_SIZE = 512;
+(Database as unknown as { MAX_QUERY_CACHE_SIZE: number }).MAX_QUERY_CACHE_SIZE = STATEMENT_CACHE_SIZE;
+
+// `db.prepare(sql)` returns the connection's cached statement for `sql` (Bun's `db.query`), so call
+// sites keep writing `prepare`. Sharing one statement between call sites is safe here because every
+// use runs to completion synchronously (`all`/`get`/`run`) and none sets per-statement modes
+// (`as`, `safeIntegers`, `iterate`, `finalize`). `prepare(sql, params)` binds, so it stays uncached.
+// `db.run(sql, ...params)` compiles natively per call too, so with bindings it runs the cached statement,
+// unless `sql` has a second statement: a statement compiles only its first, where `db.run` runs them all.
+// (A `;` inside a string literal also takes the uncached path, which is only slower.) Without bindings
+// `db.run` is `exec`: schema scripts, run once.
+const multiStatement = /;\s*\S/;
+function cacheStatements(db: Database): void {
+  const prepare = db.prepare.bind(db), run = db.run.bind(db);
+  db.prepare = ((sql: string, params?: unknown) => params === undefined ? db.query(sql) : prepare(sql, params as never)) as Database["prepare"];
+  db.run = ((sql: string, ...params: unknown[]) =>
+    params.length && !multiStatement.test(sql) ? db.query(sql).run(...(params as never[])) : run(sql, ...(params as never[]))) as Database["run"];
+}
+
+// The server's read-only second connection (#807 P1b-3, docs/future/postgres-server.md). After this, a
+// statement `db.query`/`db.prepare` returns picks its connection on each call, not when it was made: the
+// writer inside a transaction (a body reads its own uncommitted writes), the reader outside one. So a
+// statement hoisted at construction follows the transaction state of each use. Some SQL always runs on
+// the writer: writes (an autocommit write is its own transaction there; a write the pattern misses reaches
+// the read-only reader and throws SQLITE_READONLY, never a silent misroute) and connection-local SQL:
+// `temp.` objects (the auth generation counter), pragmas (data_version is per connection) and transaction
+// control. A connection with a writer (ownWriter) refuses a write from any other task, and routes reads by whether the
+// caller is inside the open transaction, not whether one is open: another task, while an async body awaits, reads
+// committed state.
+const writes = /\b(INSERT|UPDATE|DELETE|REPLACE)\b/i, ddl = /^\s*(CREATE|DROP|ALTER)\b/i;
+
+// The top-level statements of a script, with string literals, quoted identifiers, comments and trigger bodies blanked:
+// a trigger's body runs only when its trigger fires, as part of the write that fires it, which the check sees then.
+// A trigger body ends at the END that closes its BEGIN, counting CASE … END inside it (a body nests no BEGIN). A comment
+// is whitespace, as SQLite reads it (`DELETE/**/FROM`). Null when a trigger body never closes: the caller can't tell
+// what follows it, so it fails closed.
+export function scriptStatements(sql: string): string[] | null {
+  const out: string[] = [];
+  let cur = "", i = 0;
+  const word = /[A-Za-z_]\w*/y;
+  // The current statement's state: inside a CREATE … TRIGGER header (a BEGIN starts its body), then the body's depth.
+  let trigger = false, depth = 0;
+  while (i < sql.length) {
+    const ch = sql[i]!;
+    if (ch === "'" || ch === '"' || ch === "`" || ch === "[") {
+      const close = ch === "[" ? "]" : ch;
+      let j = i + 1;
+      for (; j < sql.length; j++) if (sql[j] === close) { if (close !== "]" && sql[j + 1] === close) j++; else break; }
+      cur += " "; i = j + 1; continue;
+    }
+    if (ch === "-" && sql[i + 1] === "-") { const j = sql.indexOf("\n", i); i = j < 0 ? sql.length : j; continue; }
+    if (ch === "/" && sql[i + 1] === "*") { const j = sql.indexOf("*/", i + 2); i = j < 0 ? sql.length : j + 2; cur += " "; continue; }
+    word.lastIndex = i;
+    const m = word.exec(sql);
+    if (m) {
+      const w = m[0].toUpperCase();
+      if (depth > 0) {
+        if (w === "CASE") depth++;
+        else if (w === "END" && --depth === 0) trigger = false;
+      } else {
+        // TRIGGER as the object CREATE names, not a column or table called trigger.
+        if (w === "TRIGGER" && /^\s*CREATE\s+((TEMP|TEMPORARY)\s+)?$/i.test(cur)) trigger = true;
+        else if (w === "BEGIN" && trigger) depth = 1;
+        cur += m[0];
+      }
+      i += m[0].length; continue;
+    }
+    if (ch === ";" && depth === 0) { if (cur.trim()) out.push(cur); cur = ""; trigger = false; i++; continue; }
+    if (depth === 0) cur += ch;
+    i++;
+  }
+  if (depth > 0) return null;
+  if (cur.trim()) out.push(cur);
+  return out;
+}
+
+// Whether `sql` writes as the writer (D4) and so needs the write check. Schema SQL is exempt (startup's, and a test's DDL),
+// but only a script whose every statement is DDL (#995): `CREATE TEMP TABLE x(a); DELETE FROM users` writes. The common
+// non-DDL statement takes the regex alone.
+export function checksWrite(sql: string): boolean {
+  if (!writes.test(sql)) return false;
+  if (!ddl.test(sql)) return true;
+  const statements = scriptStatements(sql);
+  return statements === null || statements.some(statement => !ddl.test(statement) && writes.test(statement));
+}
+const writerOnly = /\btemp\.|^\s*(PRAGMA|BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
+type Routed = Pick<ReturnType<Database["query"]>, "get" | "all" | "run" | "values">;
+export function routeReads(db: Database, reader: Database): void {
+  // Looked up per call, not bound once: a spy on Database.prototype.query (tests count SQL) sees routed calls.
+  const proto = Object.getPrototypeOf(db) as Database;
+  const onWriter = (sql: string) => proto.query.call(db, sql), onReader = (sql: string) => reader.query(sql);
+  // Routers by SQL, least recently used evicted at the statement cache's cap: dynamic SQL (IN lists) varies.
+  const routers = new Map<string, Routed>();
+  db.query = ((sql: string) => {
+    let r = routers.get(sql);
+    if (r) { routers.delete(sql); routers.set(sql, r); return r; }
+    if (checksWrite(sql)) {
+      // A write runs only as the writer (D4): the check precedes each use, not the statement's making.
+      const w = onWriter(sql), check = () => writers.get(db)?.check();
+      r = {
+        get: (...a: never[]) => { check(); return w.get(...a); }, all: (...a: never[]) => { check(); return w.all(...a); },
+        run: (...a: never[]) => { check(); return w.run(...a); }, values: (...a: never[]) => { check(); return w.values(...a); },
+      } as Routed;
+    } else if (writerOnly.test(sql) || writes.test(sql)) r = onWriter(sql);
+    else {
+      const pick = () => (ownsTx(db) ? onWriter : onReader)(sql);
+      r = {
+        get: (...a: never[]) => pick().get(...a), all: (...a: never[]) => pick().all(...a),
+        run: (...a: never[]) => pick().run(...a), values: (...a: never[]) => pick().values(...a),
+      } as Routed;
+    }
+    routers.set(sql, r);
+    if (routers.size > STATEMENT_CACHE_SIZE) routers.delete(routers.keys().next().value!);
+    return r;
+  }) as Database["query"];
+  // db.run without bindings is exec and never reaches db.query: its writes are checked here, and db.exec's (Bun's
+  // prototype exec is its native run, past both instance overrides). Schema SQL is exempt (checksWrite).
+  const run = db.run.bind(db);
+  db.run = ((sql: string, ...params: unknown[]) => {
+    if (checksWrite(sql)) writers.get(db)?.check();
+    return run(sql, ...(params as never[]));
+  }) as Database["run"];
+  db.exec = db.run;
+  // prepare(sql) is query(sql) (cacheStatements), routed above. prepare(sql, params) would compile a native statement
+  // with its bindings, past the routing and the write check (#995): refused; bind at the call (`.run(...params)`).
+  const prepare = db.prepare.bind(db);
+  db.prepare = ((sql: string, params?: unknown) => {
+    if (params !== undefined) throw new Error("prepare(sql, params) on a routed connection: pass the bindings to the statement's run/get/all (#995)");
+    return prepare(sql);
+  }) as Database["prepare"];
+  const close = db.close.bind(db);
+  // Reader first: only the last connection to close checkpoints the WAL into the file, and a read-only one can't.
+  db.close = ((throwOnError?: boolean) => { try { reader.close(); } finally { close(throwOnError); } }) as Database["close"];
+}
+
+// Opens the read-only second connection on a file a writer already opened (WAL set, schema made).
+export function openReader(path: string): Database {
+  const reader = new Database(path, { readonly: true });
+  reader.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};`);
+  return reader;
+}
+
 // SQLITE_BUSY and its extended codes (_RECOVERY, _SNAPSHOT, _TIMEOUT): Bun's
 // `code` names the extended code, the primary code is errno's low byte.
 const isBusy = (e: unknown) => e instanceof SQLiteError && (e.errno & 0xff) === 5;
+
+// `PRAGMA journal_mode = WAL` doesn't throw when it can't switch: it returns
+// the mode the file stayed in (#178). Rollback-journal mode still works, but
+// readers then block a writer, so an open that asked for WAL and didn't get it
+// says so. An in-memory or temporary database reports `memory` or `delete`
+// and has no other process to share with.
+export function journalModeWarning(path: string, pragmas: string, actual: string | undefined): string | undefined {
+  const wanted = /journal_mode\s*=\s*(\w+)/i.exec(pragmas)?.[1]?.toLowerCase();
+  if (!wanted || path === "" || path === ":memory:") return undefined;
+  if (actual?.toLowerCase() === wanted) return undefined;
+  return `${path} is in journal_mode ${actual ?? "unknown"}, not ${wanted}: SQLite couldn't switch it (a filesystem without shared-memory locking, such as a network mount, can't use WAL)`;
+}
 
 // Opens a SQLite file that other processes may be opening at the same moment
 // (a session and the Slack bridge starting together, sessions after an
@@ -68,6 +328,7 @@ const isBusy = (e: unknown) => e instanceof SQLiteError && (e.errno & 0xff) === 
 export function openSqlite(path: string, pragmas: string, schema: (db: Database) => void): Database {
   const db = new Database(path);
   trackCommits(db);
+  cacheStatements(db);
   const start = Date.now();
   let retries = 0;
   let step = "pragmas";
@@ -84,6 +345,8 @@ export function openSqlite(path: string, pragmas: string, schema: (db: Database)
         Bun.sleepSync(5 + Math.random() * 20);
       }
     }
+    const warning = journalModeWarning(path, pragmas, db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode);
+    if (warning) console.error(`[grayboard] ${warning}`);
     step = "schema";
     db.transaction(() => schema(db)).immediate();
   } catch (e) {
@@ -92,4 +355,36 @@ export function openSqlite(path: string, pragmas: string, schema: (db: Database)
   }
   if (retries) console.error(`[grayboard] opened ${path} after ${retries} busy retries (${Date.now() - start} ms)`);
   return db;
+}
+
+// Free pages returned to the filesystem per retention run: 64 MiB at the default
+// 4 KiB page, so one run is bounded; a larger backlog drains over later runs (#137).
+export const RECLAIM_PAGES_PER_RUN = 16_384;
+
+export type Reclaimed = { reclaimed: number; remaining: number; incremental: boolean };
+
+// Returns up to `maxPages` (> 0) free pages to the filesystem with
+// `PRAGMA incremental_vacuum`. auto_vacuum=INCREMENTAL is set only when a file
+// is created, before its first page write; a file created without it
+// reclaims nothing until a one-time VACUUM converts it. Both modes (#137, #148).
+export function reclaimFreePages(db: Database, maxPages: number): Reclaimed {
+  // incremental_vacuum(0) would mean every free page: never unbounded.
+  const pages = Math.floor(maxPages);
+  if (!(pages > 0)) throw new RangeError(`reclaimFreePages needs a positive page count, not ${maxPages}`);
+  const free = () => db.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!.freelist_count;
+  const incremental = db.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()!.auto_vacuum === 2;
+  const before = free();
+  if (incremental && before > 0) db.run(`PRAGMA incremental_vacuum(${pages})`);
+  const remaining = free();
+  return { reclaimed: before - remaining, remaining, incremental };
+}
+
+// A retention run's log of what `reclaimFreePages` did: the pages reclaimed,
+// and, while a file that can't reclaim has free pages, the fix (`guide`, the
+// doc section that gives it).
+export function logReclaimed(r: Reclaimed, guide: string): void {
+  if (r.reclaimed) console.error(`[grayboard] retention: reclaimed ${r.reclaimed} free database pages (${r.remaining} left)`);
+  if (!r.incremental && r.remaining) {
+    console.error(`[grayboard] retention: the database has ${r.remaining} free pages it can't reclaim (auto_vacuum is not INCREMENTAL); a one-time VACUUM converts it (${guide})`);
+  }
 }

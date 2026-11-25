@@ -7,6 +7,9 @@ import pkg from "../../package.json" with { type: "json" };
 import type { Config } from "../../src/server/config.ts";
 import { ROOT } from "../support/paths.ts";
 import { TestServer } from "../support/server.ts";
+import { drained, exec, row, rows } from "../support/repo_sql.ts";
+import { seed } from "../support/seed.ts";
+import { GOOGLE_ISSUER } from "../../src/server/idp_google.ts";
 
 const SERVER = join(ROOT, "src/server/main.ts");
 
@@ -15,30 +18,60 @@ let srv: TestServer;
 // A test that needs other config replaces the server.
 const restart = async (overrides: Partial<Config> = {}) => {
   await srv.stop();
-  srv = new TestServer(overrides);
+  srv = await TestServer.open(overrides);
 };
 
-beforeEach(() => {
-  srv = new TestServer();
+beforeEach(async () => {
+  srv = await TestServer.open();
 });
 
 afterEach(() => srv.stop());
 
 const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
+// access_log rows once the writes queued before the call have committed (an audit row is a post, always queued on
+// Postgres), detail parsed: Postgres keeps it as jsonb, which doesn't keep the written text's key order.
+const audits = async (where: string) => {
+  await drained(srv);
+  return (await rows<{ actor: string; action: string; target: string | null; detail: string }>(srv, `SELECT actor, action, target, detail FROM access_log WHERE ${where} ORDER BY id`))
+    .map((r) => ({ ...r, detail: JSON.parse(r.detail) as Record<string, unknown> }));
+};
+
+// #1667: GRAYBOARD_TEAM_CREATE=admins limits team creation to org admins, GRAYBOARD_ADMINS and org_admin holders alike;
+// boards stay open to everyone.
+test("with team creation limited to admins, a member is refused and makes nothing; admins and org_admin holders create", async () => {
+  await restart({ admins: ["root@example.com"], teamCreate: "admins" });
+  const [root, alice, bob] = [await login("root@example.com"), await login("alice@example.com"), await login("bob@example.com")];
+
+  const refused = await api(alice, "POST", "/api/teams", { name: "everyone" });
+  expect(refused).toMatchObject({ status: 403, body: { code: "forbidden", message: expect.stringContaining("only org admins create teams") } });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM teams WHERE name = 'everyone'`)).toEqual({ n: 0 });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM boards WHERE name = 'everyone'`)).toEqual({ n: 0 });
+  expect((await audits(`action = 'authz.decision' AND actor = 'alice@example.com'`)).at(-1)?.detail).toMatchObject({ verb: "admin", allow: false, route: "/api/teams" });
+
+  expect((await api(root, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await api(root, "POST", "/api/admin/roles/grant", { role: "org_admin", principal: "bob@example.com" })).status).toBe(201);
+  expect((await api(bob, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
+  expect(await rows(srv, `SELECT name FROM teams ORDER BY name`)).toEqual([{ name: "eng" }, { name: "ops" }]);
+});
+
+test("team creation stays open to anyone by default", async () => {
+  const alice = await login("alice@example.com");
+  expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+});
 
 // #284 decision 5 (audit W8): a team can't take another principal's name.
 test("team create on another principal's name is a 409, and no team or board is made", async () => {
   const alice = await login("alice@example.com");
-  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  await exec(srv, `INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`);
   const r = await api(alice, "POST", "/api/teams", { name: "ingest" });
   expect(r.status).toBe(409);
   expect(JSON.stringify(r.body)).toContain("ingest");
-  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM teams WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
-  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM boards WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM teams WHERE name = 'ingest'`)).toEqual({ n: 0 });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM boards WHERE name = 'ingest'`)).toEqual({ n: 0 });
 });
 
-test("teams are invite-only: members add and remove; outsiders can't join, add, or see the roster", async () => {
+test("teams are invite-only: owners add and remove; outsiders can't join, add, or see the roster", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
   const carol = await login("carol@example.com");
@@ -55,38 +88,177 @@ test("teams are invite-only: members add and remove; outsiders can't join, add, 
 
   const never = await api(alice, "POST", "/api/teams/eng/add", { email: "dave@example.com" });
   expect(never).toMatchObject({ status: 404, body: { message: expect.stringContaining("never signed in") } });
+  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "admin" })).status).toBe(400);
 
-  // Any member can add; the added member can add others and remove.
+  // The creator owns the team and adds; members read the roster with roles.
   expect((await api(alice, "POST", "/api/teams/eng/add", { email: "Bob@Example.com" })).status).toBe(200);
-  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "carol@example.com" })).status).toBe(200);
+  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" })).status).toBe(200);
   const members = await api(carol, "GET", "/api/teams/eng/members");
-  expect(members.body.map((m: { email: string }) => m.email).sort()).toEqual([
-    "alice@example.com", "bob@example.com", "carol@example.com",
+  expect(members.body.map((m: { email: string; role: string }) => [m.email, m.role]).sort()).toEqual([
+    ["alice@example.com", "owner"], ["bob@example.com", "member"], ["carol@example.com", "member"],
   ]);
-  expect((await api(carol, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
-  expect((await api(carol, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(404);
+  expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
+  expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(404);
   expect((await api(bob, "GET", "/api/whoami")).body.teams).toEqual([]);
 
-  const audit = srv.app.db
-    .query("SELECT actor, action, detail FROM access_log WHERE action = 'team.member_removed'")
-    .all();
-  expect(audit).toEqual([{ actor: "carol@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com"}' }]);
+  const audit = (await audits("action = 'team.member_removed'")).map(({ actor, action, detail }) => ({ actor, action, detail }));
+  expect(audit).toEqual([{ actor: "alice@example.com", action: "team.member_removed", detail: { member: "bob@example.com" } }]);
+});
+
+// Security audit F-02 (POC2): membership was flat, so any member could add
+// anyone or remove anyone, the creator included, then bind the team names
+// the removed member lost.
+test("a member who isn't an owner can't add, remove or change roles; the creator stays", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  await login("carol@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
+
+  const rm = await api(bob, "POST", "/api/teams/eng/remove", { email: "alice@example.com" });
+  expect(rm).toMatchObject({ status: 403, body: { code: "forbidden", message: expect.stringContaining("only an owner of team \"eng\"") } });
+  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "carol@example.com" })).status).toBe(403);
+  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "owner" })).status).toBe(403);
+  const members = await api(bob, "GET", "/api/teams/eng/members");
+  expect(members.body.map((m: { email: string }) => m.email).sort()).toEqual(["alice@example.com", "bob@example.com"]);
+  // A member may still leave.
+  expect((await api(bob, "POST", "/api/teams/eng/leave")).status).toBe(200);
+});
+
+// Security audit F-02 (TOCTOU): the ownership check runs after the body is
+// read, so an owner demoted while their request body is still arriving
+// can't finish the add on the stale check.
+test("an owner demoted while their add's body streams in is refused", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  await login("carol@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "owner" });
+
+  const body = JSON.stringify({ email: "carol@example.com" });
+  let push!: ReadableStreamDefaultController<Uint8Array>;
+  const stream = new ReadableStream<Uint8Array>({ start: (c) => { push = c; } });
+  const pending = fetch(`${srv.base}/api/teams/eng/add`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${bob}`, "Content-Type": "application/json" },
+    body: stream,
+  });
+  push.enqueue(new TextEncoder().encode(body.slice(0, 5)));
+  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "member" })).status).toBe(200);
+  push.enqueue(new TextEncoder().encode(body.slice(5)));
+  push.close();
+  expect((await pending).status).toBe(403);
+  const members = (await api(alice, "GET", "/api/teams/eng/members")).body.map((m: { email: string }) => m.email).sort();
+  expect(members).toEqual(["alice@example.com", "bob@example.com"]);
+});
+
+test("owners promote and demote; the last owner can't leave, be removed or demoted while others remain", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
+
+  const leave = await api(alice, "POST", "/api/teams/eng/leave");
+  expect(leave).toMatchObject({ status: 409, body: { message: expect.stringContaining("--role owner") } });
+  expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "alice@example.com" })).status).toBe(409);
+  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "alice@example.com", role: "member" })).status).toBe(409);
+
+  // Re-adding an existing member without a role changes nothing.
+  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
+  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "owner" })).status).toBe(403);
+  // Promoted, bob owns too, and the creator stays an owner.
+  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "owner" })).status).toBe(200);
+  const roles = async () => (await api(alice, "GET", "/api/teams/eng/members")).body.map((m: { email: string; role: string }) => [m.email, m.role]).sort();
+  expect(await roles()).toEqual([["alice@example.com", "owner"], ["bob@example.com", "owner"]]);
+  // Bob demotes alice, then alice can't manage.
+  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "alice@example.com", role: "member" })).status).toBe(200);
+  expect(await roles()).toEqual([["alice@example.com", "member"], ["bob@example.com", "owner"]]);
+  expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(403);
+  expect((await api(bob, "POST", "/api/teams/eng/remove", { email: "alice@example.com" })).status).toBe(200);
+  // A sole owner who is the sole member may leave.
+  expect((await api(bob, "POST", "/api/teams/eng/leave")).status).toBe(200);
+
+  // Ownership changes are role bindings' rows (#927 R6), the creator's grant first.
+  const changes = (await audits("action LIKE 'role.%'")).map(({ actor, action, target, detail }) => ({ actor, action, target, role: detail.role, scope: detail.scope }));
+  expect(changes).toEqual([
+    { actor: "alice@example.com", action: "role.granted", target: "alice@example.com", role: "team_owner", scope: "eng" },
+    { actor: "alice@example.com", action: "role.granted", target: "bob@example.com", role: "team_owner", scope: "eng" },
+    { actor: "bob@example.com", action: "role.revoked", target: "alice@example.com", role: "team_owner", scope: "eng" },
+    { actor: "bob@example.com", action: "role.revoked", target: "bob@example.com", role: "team_owner", scope: "eng" },
+  ]);
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM access_log WHERE action = 'team.role_changed'")).toEqual({ n: 0 });
 });
 
 test("admin routes: refused for non-admins and when no admins are configured", async () => {
   const alice = await login("alice@example.com");
   await login("bob@example.com");
   const none = await api(alice, "POST", "/api/admin/disable-user", { email: "bob@example.com" });
-  expect(none).toMatchObject({ status: 403, body: { code: "forbidden", message: expect.stringContaining("GRAYBOARD_ADMINS") } });
+  expect(none).toMatchObject({ status: 403, body: { code: "forbidden", message: "alice@example.com is not an org admin" } });
 
   await restart({ admins: ["alice@example.com"] });
   const admin = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  for (const path of ["/api/admin/disable-user", "/api/admin/enable-user", "/api/admin/revoke-session"]) {
+  for (const path of ["/api/admin/disable-user", "/api/admin/enable-user", "/api/admin/revoke-session", "/api/admin/unlink-idp"]) {
     expect((await api(bob, "POST", path, { email: "alice@example.com" })).status).toBe(403);
   }
   expect((await api(admin, "POST", "/api/admin/disable-user", { email: "bob@example.com" })).status).toBe(200);
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
+});
+
+// Security audit F-13, #928: an admin frees an email from its IdP account, issuer and subject, so the next account to
+// present it, from any provider, signs in.
+test("admin unlink-idp clears a user's IdP issuer and subject and audits them", async () => {
+  await restart({ admins: ["root@example.com"] });
+  const root = await login("root@example.com");
+  const okta = "https://example.okta.com";
+  const signIn = (issuer: string, subject: string) => seed(srv.app.repo, tx => srv.app.repo.users.signIn(tx, issuer, subject, "bob@example.com", null));
+  expect((await signIn(GOOGLE_ISSUER, "google-bob")).status).toBe("ok");
+  expect((await signIn(GOOGLE_ISSUER, "google-new")).status).toBe("subject_mismatch");
+  expect((await signIn(okta, "okta-bob")).status).toBe("issuer_mismatch");
+  expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "Bob@Example.com" })).status).toBe(200);
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "bob@example.com"))).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect(await signIn(okta, "okta-bob")).toMatchObject({ status: "ok", linked: true, user: { idp_issuer: okta } });
+  expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "nobody@example.com" })).status).toBe(404);
+  expect((await audits("action = 'auth.subject_cleared'")).map(({ actor, target, detail }) => ({ actor, target, detail })))
+    .toEqual([{ actor: "root@example.com", target: "bob@example.com", detail: { had_subject: true, provider: "google", issuer: GOOGLE_ISSUER } }]);
+});
+
+// Security audit F-14: the server's GRAYBOARD_CLI_TOKEN_IDLE_DAYS reaches the token check.
+test("a CLI token idle past cliTokenIdleDays is refused; a fresh sign-in works", async () => {
+  await restart({ cliTokenIdleDays: 1 });
+  const bob = await login("bob@example.com");
+  expect((await api(bob, "GET", "/api/whoami")).status).toBe(200);
+  // The request's last-used touch runs on a later setImmediate (TouchQueue); let it land first, or it overwrites the backdate.
+  await new Promise((resolve) => setImmediate(resolve));
+  await exec(srv, `UPDATE sessions SET last_used_at = ?`, Date.now() - 2 * 86_400_000);
+  expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
+  expect((await api(await login("bob@example.com"), "GET", "/api/whoami")).status).toBe(200);
+});
+
+// Security audit F-14: disable revokes the user's CLI tokens, so enable
+// doesn't revive them, and a disabled user can't sign in for a new one.
+test("disable-user revokes CLI tokens for good; a disabled user gets no new token", async () => {
+  await restart({ admins: ["root@example.com"] });
+  const root = await login("root@example.com");
+  const bob = await login("bob@example.com");
+  expect((await api(root, "POST", "/api/admin/disable-user", { email: "bob@example.com" })).status).toBe(200);
+  const live = () => row(srv,
+    `SELECT COUNT(*) AS n FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = 'bob@example.com' AND s.revoked_at IS NULL`);
+  expect(await live()).toEqual({ n: 0 });
+
+  const refused = await fetch(`${srv.base}/api/auth/dev-login`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "bob@example.com" }),
+  });
+  expect(refused.status).toBe(403);
+  expect(await refused.json()).toMatchObject({ code: "forbidden", message: expect.stringContaining("disabled") });
+  expect(await live()).toEqual({ n: 0 });
+  expect((await audits("action = 'auth.user_refused'")).map(({ actor, detail }) => ({ actor, dev: detail.dev })))
+    .toEqual([{ actor: "bob@example.com", dev: true }]);
+
+  expect((await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" })).status).toBe(200);
+  expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
+  const again = await login("bob@example.com");
+  expect((await api(again, "GET", "/api/whoami")).status).toBe(200);
 });
 
 test("admin revoke-session signs a user out of every session, ignoring an old CLI's all", async () => {
@@ -118,12 +290,10 @@ test("an admin can manage a team they're not in, e.g. after its last member left
   expect((await api(root, "GET", "/api/whoami")).body.teams).toEqual([]);
   expect((await api(root, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
 
-  const audit = srv.app.db
-    .query("SELECT actor, action, detail FROM access_log WHERE action LIKE 'team.member_%' AND actor = 'root@example.com'")
-    .all();
+  const audit = (await audits("action LIKE 'team.member_%' AND actor = 'root@example.com'")).map(({ actor, action, detail }) => ({ actor, action, detail }));
   expect(audit).toEqual([
-    { actor: "root@example.com", action: "team.member_added", detail: '{"member":"bob@example.com","as_admin":true}' },
-    { actor: "root@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com","as_admin":true}' },
+    { actor: "root@example.com", action: "team.member_added", detail: { member: "bob@example.com", as_admin: true } },
+    { actor: "root@example.com", action: "team.member_removed", detail: { member: "bob@example.com", as_admin: true } },
   ]);
 });
 

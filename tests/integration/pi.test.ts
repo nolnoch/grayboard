@@ -7,9 +7,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeSessions } from "../support/mcp.ts";
+import { localAdapterExcludedScenario } from "../support/local_adapter_exclusions.ts";
+import { startPi } from "../support/pi.ts";
 import {
-  piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedTwiceScenario,
-  piMissingBinaryScenario, piReenabledScenario, piScenario, piStdinClosedScenario, piUnboundScenario,
+  piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedStaticScenario, piHostedTwiceScenario,
+  piExcludedForegroundChildScenario, piForegroundChildScenario, piLocalCarryScenario, piLocalInitFailScenario, piLocalRestartScenario, piLocalRestartShutdownScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piLocalStopsReadingScenario, piUnboundScenario,
 } from "../support/pi.ts";
 
 let dir: string;
@@ -25,11 +27,30 @@ afterEach(async () => {
 
 test("pi: a DM wakes the session, which replies with dm_send; a digest rides along as context", () => piScenario(dir), 90_000);
 test("pi unbound: the session acts as its ID; two binds and an unbind through the extension's tools move the session's one grayboard onto its second name", () => piUnboundScenario(dir), 90_000);
+test("pi local: a killed grayboard restarts with its bound name; calls wait through all three backoffs, delivery resumes, another exit gives up, and /new resets the count (#559)", () => piLocalRestartScenario(dir), 90_000);
+test("pi local: a grayboard process that never answers initialize is killed at the deadline and restarted; after the last restart a call fails with the deadline reason (#559)", () => piLocalInitFailScenario(dir, "deadline"), 90_000);
+test("pi local: a grayboard process that answers initialize with an error is restarted at once; after the last restart a call fails with that error (#1142)", () => piLocalInitFailScenario(dir, "refused"), 90_000);
+test("pi local: /new during a pending 5 s restart cancels the outgoing timer without a tool call and leaves only the new child's name hold (#559)", () => piLocalRestartShutdownScenario(dir), 60_000);
+test("pi local: /new aborts a tool awaiting the pending restart instead of waiting out the backoff (#559)", () => piLocalRestartShutdownScenario(dir, true), 60_000);
+test("pi local: /new and /fork use actual minted IDs; /resume restores the selected ordered holds rather than outgoing carry, including a remembered empty snapshot (#195)", () => piLocalCarryScenario(dir), 120_000);
+for (const kind of ["keyed", "human", "runner"] as const) {
+  test(`pi excluded local ${kind}: tools and /new retain excluded provenance (#195 audit 2)`, () =>
+    localAdapterExcludedScenario(dir, kind, "mcp__grayboard__", (port, procs, identity, env) =>
+      startPi(dir, port, procs, { identity, entry: { env: { BUS_PUSH: "off", ...env } } })), 90_000);
+}
+for (const kind of ["keyed", "human"] as const) {
+  test(`pi local ${kind} root: a foreground child is ${kind === "keyed" ? "the root's child" : "refused a session, never the human handle"}, with no crash loop, after /new too and for a runner its bash launches, and no subagent leaves a name record (#897, #1075, #1078)`, () => piExcludedForegroundChildScenario(dir, kind), 180_000);
+}
+test("pi detached runner (#523 step 5): with no live parent it is its own session; with one it acts as the parent's child, writing as the parent's name with via, until a bind promotes it to its own session that receives, or the parent exits while it runs on", () => piRunnerScenario(dir), 180_000);
+test("pi foreground subagent (#557 3): a session the root's pi opens in-process with the grayboard extension, whose header names the root's file, acts as the root's child (its name, via, no second root) and ends at its shutdown; a header naming no live session and a /fork of the root are roots", () => piForegroundChildScenario(dir), 120_000);
 test("pi: an enabled grayboard MCP entry makes the extension register nothing and say why", () => piReenabledScenario(dir), 60_000);
 test("pi: no grayboard at the entry's command fails the extension load with the reason", () => piMissingBinaryScenario(dir), 60_000);
 test("pi: a grayboard that stops reading makes the next write fail with EPIPE, which pi survives and reports", () => piStdinClosedScenario(dir), 60_000);
+test("pi local: a grayboard that stops reading while it holds the name is killed on EPIPE and gone before the replacement starts, which takes the name back; no stale process remains (#599)", () => piLocalStopsReadingScenario(dir), 120_000);
+test("pi local: one that also ignores SIGTERM is SIGKILLed, reported, and gone before the replacement starts (#604)", () => piLocalStopsReadingScenario(dir, { ignoreSigterm: true }), 120_000);
 test("pi hosted load smoke: the embedded bundle loads under Node signed in; session_start sees pi's session id, the MCP client connects, the node:sqlite delivery lock is taken; no grayboard process runs and quit leaves nothing leased", () => piHostedLoadSmoke(dir), 60_000);
 test("pi hosted: signed out it says how to sign in; /grayboard login walks the consent page; bind takes the lease; a DM is one turn whose receipt moves the cursor; files go out with dm_send and come in with attachment_get; no grayboard process runs", () => piHostedScenario(dir), 120_000);
 test("pi hosted: /fork is a new root with its own lease that carries the name, /new carries it, /resume of the first session rebinds its remembered name", () => piHostedCarryScenario(dir), 120_000);
 test("pi hosted: two processes with an expired token refresh it once; /grayboard logout in one pauses both", () => piHostedRefreshLogoutScenario(dir), 120_000);
 test("pi hosted: the same session opened twice leaves one lease holder; the second takes over when the first quits", () => piHostedTwiceScenario(dir), 120_000);
+test("pi hosted static (#1243): a launcher's run token binds the service's BUS_IDENTITY name and receives; a subagent registers as a child under the svc_ root, writes as its name and ends with its run (#1303); status names the static run; login and logout refuse; a revoked credential ends the run with no sign-in offer, browser or token request", () => piHostedStaticScenario(dir), 120_000);

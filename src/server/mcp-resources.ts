@@ -5,10 +5,23 @@ import { SESSION_ID } from "../core/session_id.ts";
 import { ApplicationError, type ApplicationSession } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { Delivery } from "./delivery.ts";
-import type { HostedSessions, SessionContext } from "./hosted.ts";
+import type { HostedSessions, SessionContext, Verdict } from "./hosted.ts";
+import type { HostedSession } from "./hosted-types.ts";
 import { parseBoardResourceUri, type Resources } from "./resources.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
+
+// bind and unbind inputs for both hosted roles, the native agent's and the subscriber's (#454): BIND_TOOL's and
+// UNBIND_TOOL's fields (src/core/bindings.ts) plus hosted's `where`, the place the session reports.
+export const HOSTED_BIND_INPUT = z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() });
+export const HOSTED_UNBIND_INPUT = z.strictObject({ name: z.string().max(160) });
+// The subscriber role's tool schemas, built once per process: zod schema construction per request was
+// ~6% of server CPU at 1000 sessions (#912), since every hosted request builds its own McpServer.
+const EMPTY_INPUT = z.strictObject({});
+const REGISTER_INPUT = z.strictObject({ child: z.string().min(1).max(1024), via: z.array(z.string().min(1).max(1024)).max(16).optional() });
+const END_INPUT = z.strictObject({ session: z.string().regex(SESSION_ID).optional() });
+const OPEN_INPUT = z.strictObject({ context: z.boolean().optional() });
+const RECEIPT_INPUT = z.strictObject({ ids: z.array(z.string().min(1).max(128)).max(100).refine(ids => new Set(ids).size === ids.length, "IDs must be distinct") });
 
 export type HostedRole = "native" | "subscriber";
 export function hostedRole(request: Request): HostedRole {
@@ -27,7 +40,9 @@ const domainCode = (error: unknown) => error instanceof ApplicationError && erro
 // A holder names another session of the same account (bind only searches the caller's own); it reaches the
 // subscriber so a refused rebind can say who holds the name. Free text: bounded, and no control or bidi characters.
 const holderText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
-function domainData(error: unknown): { code: string; known?: string[]; holder?: string } {
+// A refusal's wire data, the same on every role's tool and resource errors (#806): its code, and for
+// identity_unknown/alias_held the sanitized known names or holder.
+export function domainData(error: unknown): { code: string; known?: string[]; holder?: string } {
   const result: { code: string; known?: string[]; holder?: string } = { code: domainCode(error) };
   if (!(error instanceof ApplicationError) || (result.code !== "identity_unknown" && result.code !== "alias_held")) return result;
   try {
@@ -82,22 +97,26 @@ function boardRead(uri: string) {
 
 export function registerHostedResources(server: McpServer, context: {
   role: HostedRole;
-  current(ctx?: ServerContext): { principal: OAuthPrincipal; sessionContext: SessionContext; session: ApplicationSession; request: Request };
+  // `verdict`: the exchange's selection (#907), which the subscriber's renew, receipt, pending, open and bind reuse in
+  // place of a second gate body (#1537 C5, C7: hosted.ts withPrior).
+  current(ctx?: ServerContext): { principal: OAuthPrincipal; sessionContext: SessionContext; session: ApplicationSession; request: Request; verdict?: Verdict };
   issuer: string; resource: string; resources: Resources; delivery: Delivery; hosted: HostedSessions;
-  authorize(): void;
+  authorize(): Promise<{ row: HostedSession | undefined }>;
   leaseHooks?: () => { changed(): void; closed(): void; bind(capability: string): void };
+  // A tool's refusal, before it becomes the result: an `unauthenticated` one may answer the exchange's 401 (#1312).
+  refused?: (error: unknown) => void;
 }) {
   const { role, resources, delivery, hosted } = context;
-  const authorize = (signal?: AbortSignal) => {
+  const authorize = async (signal?: AbortSignal) => {
     if (signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
-    context.authorize();
+    return context.authorize();
   };
-  const leaseCapability = (signal: AbortSignal) => {
-    authorize(signal);
+  // `checked`: the authorization its caller awaited with no await since (#881), so it isn't made twice.
+  const leaseCapability = (checked: { row: HostedSession | undefined }) => {
     const { principal, sessionContext, session, request } = context.current();
     const capability = request.headers.get("X-Grayboard-Lease");
     if (!capability || !/^[A-Za-z0-9_-]{43}$/.test(capability) ||
-        delivery.describe(principal, sessionContext, capability).identity.identity_full !== session.identityFull) {
+        delivery.identityFull(principal, sessionContext, capability, checked) !== session.identityFull) {
       throw new ApplicationError("not_found", "delivery lease or item not found");
     }
     return capability;
@@ -106,12 +125,12 @@ export function registerHostedResources(server: McpServer, context: {
     const params = request.params ?? {};
     const { principal, sessionContext } = context.current(ctx);
     try {
-      authorize(ctx.mcpReq.signal);
+      await authorize(ctx.mcpReq.signal);
       if (role === "subscriber") {
         if (params.cursor !== undefined) throw new ApplicationError("bad_request", "invalid catalog cursor");
         return { resources: [metadata(inboxUri, "inbox")] };
       }
-      const page = await hosted.run(principal, sessionContext, "board_list", session => resources.list(session, params.cursor));
+      const page = await hosted.run(principal, sessionContext, "board_list", (session, tx) => resources.list(tx, session, params.cursor));
       return {
         resources: page.resources.map(r => ({ ...metadata(r.uri, r.board.name), description: r.board.purpose })),
         ...(page.next_after === null ? {} : { nextCursor: page.next_after }),
@@ -120,7 +139,7 @@ export function registerHostedResources(server: McpServer, context: {
   });
   server.server.setRequestHandler("resources/templates/list", async (request, ctx) => {
     try {
-      authorize(ctx.mcpReq.signal);
+      await authorize(ctx.mcpReq.signal);
       if (request.params?.cursor !== undefined) throw new ApplicationError("bad_request", "invalid catalog cursor");
       return { resourceTemplates: [] };
     } catch (error) { throw resourceError(error); }
@@ -128,13 +147,13 @@ export function registerHostedResources(server: McpServer, context: {
   server.server.setRequestHandler("resources/read", async ({ params }, ctx) => {
     const { principal, sessionContext, session } = context.current(ctx);
     try {
-      authorize(ctx.mcpReq.signal);
+      const checked = await authorize(ctx.mcpReq.signal);
       if (role === "subscriber") {
         if (params.uri !== inboxUri) throw new ApplicationError("not_found", "resource not found");
-        return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(ctx.mcpReq.signal), 100) });
+        return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(checked), 100, context.current(ctx).verdict) });
       }
       const read = boardRead(params.uri);
-      return json(params.uri, await hosted.run(principal, sessionContext, "board_read", session => resources.read(session, read.uri, read.options)));
+      return json(params.uri, await hosted.readResource(principal, sessionContext, (session, tx) => resources.read(tx, session, read.uri, read.options)));
     } catch (error) {
       if (role === "subscriber") throw resourceError(error);
       if (error instanceof CoreError || error instanceof ApplicationError && error.code === "not_found") throw new ResourceNotFoundError(params.uri, "resource not found");
@@ -142,59 +161,62 @@ export function registerHostedResources(server: McpServer, context: {
     }
   });
   if (role !== "subscriber") return;
-  const run = async (ctx: ServerContext, call: () => unknown | Promise<unknown>) => {
+  const refused = (error: unknown) => { context.refused?.(error); return toolError(error); };
+  // `call` runs synchronously up to its first await, so it may use `checked` there (#881): `checked` was awaited
+  // just before it.
+  const run = async (ctx: ServerContext, call: (checked: { row: HostedSession | undefined }) => unknown | Promise<unknown>) => {
     try {
       context.current(ctx);
-      authorize(ctx.mcpReq.signal);
-      const value = await call();
+      const value = await call(await authorize(ctx.mcpReq.signal));
       return { content: [{ type: "text" as const, text: JSON.stringify(value ?? { ok: true }) }] };
     } catch (error) {
-      return toolError(error);
+      return refused(error);
     }
   };
-  server.registerTool("whoami", { description: "Current session binding and ownership.", inputSchema: z.strictObject({}) }, (_, ctx) => run(ctx, () => hosted.whoami(context.current().principal, context.current().sessionContext)));
+  server.registerTool("whoami", { description: "Current session binding and ownership.", inputSchema: EMPTY_INPUT }, (_, ctx) => run(ctx, () => hosted.whoami(context.current().principal, context.current().sessionContext)));
   server.registerTool("bind", {
     description: "Add a name to this root's holds; never enrolls it for host admission.",
-    inputSchema: z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() }),
+    inputSchema: HOSTED_BIND_INPUT,
   }, async (args, ctx) => {
-    try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.bind(context.current().principal, context.current().sessionContext, args); }
-    catch (error) { return toolError(error); }
+    try { context.current(ctx); await authorize(ctx.mcpReq.signal); const c = context.current(); return await hosted.bind(c.principal, c.sessionContext, args, undefined, undefined, c.verdict); }
+    catch (error) { return refused(error); }
   });
   server.registerTool("unbind", {
-    description: "Release one of this root's holds.", inputSchema: z.strictObject({ name: z.string().max(160) }),
+    description: "Release one of this root's holds.", inputSchema: HOSTED_UNBIND_INPUT,
   }, async (args, ctx) => {
-    try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.unbind(context.current().principal, context.current().sessionContext, args); }
-    catch (error) { return toolError(error); }
+    try { context.current(ctx); await authorize(ctx.mcpReq.signal); return await hosted.unbind(context.current().principal, context.current().sessionContext, args); }
+    catch (error) { return refused(error); }
   });
   server.registerTool("session_register", {
     description: "Register a descendant under this top-level root before its native calls.",
-    inputSchema: z.strictObject({ child: z.string().min(1).max(1024), via: z.array(z.string().min(1).max(1024)).max(16).optional() }),
+    inputSchema: REGISTER_INPUT,
   }, (args, ctx) => run(ctx, () => hosted.register(context.current().principal, context.current().sessionContext, args.child, args.via)));
   server.registerTool("session_end", {
     description: "End this ownership, or remove one registered child without ending its root.",
-    inputSchema: z.strictObject({ session: z.string().regex(SESSION_ID).optional() }),
+    inputSchema: END_INPUT,
   }, (args, ctx) => run(ctx, () => hosted.end(context.current().principal, context.current().sessionContext, args.session)));
   server.registerTool("delivery_open", {
-    description: "Explicitly acquire delivery ownership for this identity. Reads do not acknowledge items.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx, async () => {
-    const { principal, sessionContext } = context.current();
+    description: "Explicitly acquire delivery ownership for this identity. Reads do not acknowledge items. context: false for a host that starts a turn for every item: non-waking items then wait for a waking one.",
+    inputSchema: OPEN_INPUT,
+  }, (args, ctx) => run(ctx, async () => {
+    const { principal, sessionContext, verdict } = context.current();
     const hooks = context.leaseHooks?.();
-    const lease = await delivery.open(principal, sessionContext, hooks);
+    const lease = await delivery.open(principal, sessionContext, hooks, args.context === undefined ? {} : { context: args.context }, verdict);
     hooks?.bind(lease.capability);
-    try { authorize(ctx.mcpReq.signal); delivery.accept(lease); return lease; }
+    try { await authorize(ctx.mcpReq.signal); delivery.accept(lease); return lease; }
     catch (error) {
       try { await delivery.cancel(lease); } catch {}
       throw error;
     }
   }));
   server.registerTool("delivery_renew", {
-    description: "Renew this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx, () => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal))));
+    description: "Renew this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: EMPTY_INPUT,
+  }, (_args, ctx) => run(ctx, checked => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(checked), undefined, context.current().verdict)));
   server.registerTool("delivery_receipt", {
     description: "Receipt issued delivery IDs only after durable host admission; not a DM handling acknowledgment.",
-    inputSchema: z.strictObject({ ids: z.array(z.string().min(1).max(128)).max(100).refine(ids => new Set(ids).size === ids.length, "IDs must be distinct") }),
-  }, (args, ctx) => run(ctx, () => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal), args.ids)));
+    inputSchema: RECEIPT_INPUT,
+  }, (args, ctx) => run(ctx, checked => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(checked), args.ids, context.current().verdict)));
   server.registerTool("delivery_release", {
-    description: "Release this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx, () => delivery.release(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal))));
+    description: "Release this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: EMPTY_INPUT,
+  }, (_args, ctx) => run(ctx, checked => delivery.release(context.current().principal, context.current().sessionContext, leaseCapability(checked))));
 }

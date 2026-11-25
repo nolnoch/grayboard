@@ -15,5 +15,9 @@ export const captureLogger = Effect.gen(function* () {
         : Effect.logInfo("Grayboard subscriber state", fields);
       await run(entry);
     },
+    // A debug line (lifecycle's per-request instructions plan, #531); never throws.
+    debug(message: string, fields: Record<string, unknown>) {
+      if (!closed) void run(Effect.logDebug(message, fields)).catch(() => {});
+    },
   };
 });

@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquire, LockTimeout, tryAcquire } from "../src/lock.ts";
+import { waitDelivery } from "../src/storage.ts";
 
 const HOLDER = join(import.meta.dir, "fixtures/lock-holder.ts");
 let dir: string;
@@ -87,4 +88,52 @@ test("one connection per lock file per process; release is idempotent; abort sto
   const again = tryAcquire(path);
   expect(again).toBeDefined();
   again!.release();
+});
+
+test("onBusy runs after each attempt that found the lock held, never once it is taken; what it throws ends the wait", async () => {
+  const path = join(dir, "busy.lock");
+  const lock = tryAcquire(path)!;
+  let busy = 0;
+  const waiting = acquire(path, { deadlineMs: 10_000, onBusy: () => { if (++busy === 2) lock.release(); } });
+  const taken = await waiting;
+  expect(busy).toBe(2);
+  taken.release();
+  const again = tryAcquire(path)!;
+  await expect(acquire(path, { deadlineMs: 10_000, onBusy: () => { throw new Error("stop"); } })).rejects.toThrow("stop");
+  again.release();
+});
+
+// #438-36: a poll on a lock another process holds must not block the event
+// loop for the busy wait on every try. The largest gap between 1 ms ticks over
+// a second of polling stays well under the 50 ms one-shot busy wait.
+async function largestGap(poll: (signal: AbortSignal) => Promise<unknown>): Promise<number> {
+  const stop = new AbortController();
+  const polling = poll(stop.signal).catch(() => undefined);
+  let last = performance.now(), gap = 0;
+  const tick = setInterval(() => { const now = performance.now(); gap = Math.max(gap, now - last); last = now; }, 1);
+  await new Promise(resolve => setTimeout(resolve, 1_000));
+  clearInterval(tick);
+  stop.abort();
+  await polling;
+  return gap;
+}
+
+test("a one-shot attempt waits its busy time on a held lock; busyMs 0 returns at once", async () => {
+  const path = join(dir, "busyms.lock");
+  const holder = spawn("node", path, "hold");
+  expect(await holder.line()).toBe("held");
+  let started = performance.now();
+  expect(tryAcquire(path)).toBeUndefined();
+  expect(performance.now() - started).toBeGreaterThanOrEqual(45);
+  started = performance.now();
+  expect(tryAcquire(path, 0)).toBeUndefined();
+  expect(performance.now() - started).toBeLessThan(20);
+});
+
+test("acquire and waitDelivery polling a held lock never stall the event loop for the busy wait", async () => {
+  const path = join(dir, "poll.lock");
+  const holder = spawn("node", path, "hold");
+  expect(await holder.line()).toBe("held");
+  expect(await largestGap(signal => acquire(path, { deadlineMs: 10_000, signal }))).toBeLessThan(35);
+  expect(await largestGap(signal => waitDelivery(path, signal, 10))).toBeLessThan(35);
 });

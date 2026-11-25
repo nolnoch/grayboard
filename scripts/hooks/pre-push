@@ -12,7 +12,11 @@
 # Bypass everything (sparingly): git push --no-verify
 set -u
 
-HOOK_SCRIPTS="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# readlink -f follows a symlinked install (.git/hooks/pre-push -> scripts/hooks/pre-push). BSD
+# readlink before macOS 12.3 has no -f and prints nothing: fall back to $0, which core.hooksPath
+# (the documented install) runs directly (#93).
+self="$(readlink -f "$0" 2>/dev/null)" || self=""
+HOOK_SCRIPTS="$(cd "$(dirname "${self:-$0}")/.." && pwd -P)"
 
 # One line per ref on stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>.
 # An all-zero local_sha is a deletion; skip it.
@@ -45,8 +49,10 @@ for i in "${!shas[@]}"; do
   fi
 done
 
-if [[ "$(bun --version)" != "1.4.4" ]]; then
-  echo "[pre-push] Use Bun 1.4.4, matching CI and the package fixtures; push aborted." >&2
+# .bun-version is the one Bun pin (#379); CI installs it from there.
+want_bun="$(tr -d '[:space:]' 2>/dev/null < "$HOOK_SCRIPTS/../.bun-version")"
+if [[ -z "$want_bun" || "$(bun --version)" != "$want_bun" ]]; then
+  echo "[pre-push] Use Bun ${want_bun:-from .bun-version}, matching CI and the package fixtures; push aborted." >&2
   exit 1
 fi
 

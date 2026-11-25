@@ -126,8 +126,8 @@ export class SlackWeb {
 
   /**
    * A shared file's bytes, from its url_private_download. Without files:read,
-   * Slack answers with a sign-in page instead, so a size other than `size`
-   * (the file's, from Slack) is refused. The bot token goes only to the API's
+   * Slack answers 403 (`forbidden`), or, as it once did, a sign-in page with
+   * status 200, so a size other than `size` (the file's, from Slack) is refused. The bot token goes only to the API's
    * own host or a subdomain of it (files.slack.com for slack.com), over the
    * API's scheme, whatever URL an event names.
    */
@@ -141,6 +141,7 @@ export class SlackWeb {
       throw new SlackUnavailable(`slack file download: ${describeFetchError(e, ms)}`);
     }
     if (res.status >= 500 || res.status === 429) throw new SlackUnavailable(`slack file download: HTTP ${res.status}`);
+    if (res.status === 401 || res.status === 403) throw new SlackError("file download", "forbidden");
     if (res.status !== 200) throw new SlackError("file download", `HTTP ${res.status}`);
     let data: Uint8Array;
     try {

@@ -6,25 +6,29 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { version } from "../../package.json" with { type: "json" };
 import { piAgentDir } from "../../src/shared/pi.ts";
 import type { Level } from "../hosted-core/src/client.ts";
-import { COMMAND, createGrayboard, toolArgs, toolResult } from "./extension.ts";
+import { COMMAND, createGrayboard, factReader, toolArgs, toolResult, type Marker } from "./extension.ts";
+import { modelName } from "./omp-instructions.ts";
 
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
 // MCP call renderer treat these as they treat any MCP server's tools.
 const SERVER = "grayboard";
 const PREFIX = `mcp__${SERVER}__`;
 
+// pi-subagents' detached runner sets PI_SUBAGENT_CHILD=1 and passes the
+// top-level parent's session id (src/runs/background/subagent-runner.js).
+export const piMarker = (env: Record<string, string | undefined> = process.env): Marker => env.PI_SUBAGENT_CHILD === "1"
+  ? { child: true, ...(env.PI_SUBAGENT_PARENT_SESSION ? { root: env.PI_SUBAGENT_PARENT_SESSION } : {}) }
+  : { child: false };
+
 export default function grayboard(pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
+  const readFacts = factReader(message => { if (ctx?.hasUI) ctx.ui.notify(message, "warning"); else console.error(message); });
   const ext = createGrayboard({
     name: "pi",
     clientId: "grayboard-pi",
     version,
     agentDir: piAgentDir(),
-    // pi-subagents' detached runner sets PI_SUBAGENT_CHILD=1 and passes the
-    // top-level parent's session id (src/runs/background/subagent-runner.js).
-    marker: () => process.env.PI_SUBAGENT_CHILD === "1"
-      ? { child: true, ...(process.env.PI_SUBAGENT_PARENT_SESSION ? { root: process.env.PI_SUBAGENT_PARENT_SESSION } : {}) }
-      : { child: false },
+    marker: () => piMarker(),
     register: (tools, call) => {
       for (const tool of tools) {
         pi.registerTool({
@@ -34,7 +38,7 @@ export default function grayboard(pi: ExtensionAPI) {
           // Plain JSON Schema: pi-ai validates by it when the schema isn't TypeBox.
           parameters: { ...tool.inputSchema, properties: tool.inputSchema.properties ?? {} } as never,
           namespace: { name: `mcp__${SERVER}`, aliases: [SERVER] },
-          execute: async (_id, params) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params))),
+          execute: async (_id, params, signal) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params), signal)),
         });
       }
     },
@@ -45,6 +49,13 @@ export default function grayboard(pi: ExtensionAPI) {
       if (ctx?.hasUI) ctx.ui.notify(message, level);
       else console.error(message);
     },
+    record: data => pi.appendEntry("grayboard-delivery", data),
+    // tui and rpc outlive a sign-in's browser round trip; print and json exit after one run.
+    interactive: () => ctx?.mode === "tui" || ctx?.mode === "rpc",
+    facts: sessionID => ctx?.sessionManager.getSessionId() === sessionID ? readFacts(sessionID, {
+      model: () => ctx?.model ? modelName(ctx.model) : null,
+      effort: () => pi.getThinkingLevel(),
+    }) : undefined,
   });
 
   pi.on("session_start", async (event, context) => {

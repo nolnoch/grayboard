@@ -12,7 +12,8 @@
 import { createHash } from "node:crypto";
 
 import { writeAudit } from "./audit.ts";
-import type { Repo, Sync } from "./db.ts";
+import type { Repo } from "./db.ts";
+import type { Tx } from "./store/tx.ts";
 import { canonicalJson, WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import type { Replayed, WriteRef } from "../shared/protocol.ts";
 
@@ -54,41 +55,69 @@ export type DedupOutcome<W extends Written> =
 // replayed, nothing else is written but a request.replayed audit row, and the
 // caller must push, wake and audit nothing; `onReplay` runs in the replay's
 // transaction, for what the repeat brought that nothing will use (its fresh
-// uploads). The lookup, the write, the
-// receipt and the audit row are one IMMEDIATE transaction (a savepoint inside
-// an open one): two calls can't interleave, and a write that throws leaves no
-// receipt. `now` is the hub's clock.
+// uploads). The receipt is claimed before the write by one statement (D3,
+// #807 P2-2), so of two identical calls under READ COMMITTED (D3) one writes
+// and the other replays; the claim, the write, the receipt and the audit row are
+// one savepoint inside the caller's transaction, and a write that throws
+// leaves no receipt. `now` is the hub's clock. `recheck` runs on a hit, in the same
+// transaction, before anything is answered or audited: it throws the refusal a
+// fresh call would get when authority over what the first call wrote has gone
+// since, so no replay outlives a revocation (docs/vision.md principle 11, #806).
 export function dedupWrite<W extends Written>(
-  repo: Repo, now: number, call: DedupCall, write: () => Sync<W>, onReplay: () => void = () => {},
-): DedupOutcome<W> {
+  repo: Repo, parent: Tx, now: number, call: DedupCall, write: (tx: Tx) => W | Promise<W>, onReplay: (tx: Tx) => void | Promise<void> = () => {},
+  recheck: (stored: W["payload"], tx: Tx) => void | Promise<void> = () => {},
+): Promise<DedupOutcome<W>> {
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
   const since = now - WRITE_DEDUP_WINDOW_MS;
-  return repo.atomic((): DedupOutcome<W> => {
+  // write, onReplay and recheck run in the savepoint, on its Tx: the parent's refuses statements while it's open.
+  return parent.savepoint(async (tx): Promise<DedupOutcome<W>> => {
     const receipts = repo.writeReceipts;
-    // Bounds one session's rows by what it wrote in the window.
-    receipts.pruneSession(call.session, since);
-    if (!call.resend) {
-      const hit = receipts.find(call.session, call.sender, fp, since);
-      // A receipt whose row is gone (retracted, pruned) is a miss: the upsert below replaces it.
-      if (hit && receipts.refExists(hit.ref_kind, hit.ref_id)) {
-        const ref: WriteRef = { kind: hit.ref_kind, id: hit.ref_id };
-        const first_at = new Date(hit.at).toISOString();
-        const stored = JSON.parse(hit.result_json) as W["payload"];
-        writeAudit(repo, "request.replayed", call.actor, call.sender, {
-          tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
-        });
-        onReplay();
-        return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
+    const key = { session: call.session, sender: call.sender, fp };
+    // Bounds one session's rows by what it wrote in the window, so a receipt the claim meets is inside it. The first
+    // claim is sent beside it (#1537 C6: one round trip on Postgres): a connection runs its statements in the order
+    // they're sent, and each store function sends its one statement before its first await, so the claim still runs
+    // after the prune, as SQLite's synchronous statements do.
+    const [, claimed] = await Promise.all([receipts.pruneSession(tx, call.session, since), call.resend ? false : receipts.claim(tx, key, call.tool, now)]);
+    // A lost claim reads the receipt that beat it. A pass that neither claims nor answers saw another transaction
+    // change that receipt in between (pruned it, replaced a stale one first, or committed one already outside the
+    // window after this call's prune), which a single writer never allows; three passes bound it.
+    for (let pass = 0; !call.resend; pass++) {
+      if (pass === 3) throw new Error(`write receipt for ${call.tool} by ${call.sender} kept changing under this call; retry it`);
+      if (pass === 0 ? claimed : await receipts.claim(tx, key, call.tool, now)) break;
+      const hit = await receipts.find(tx, call.session, call.sender, fp, since);
+      if (!hit) {
+        // A receipt committed after the prune can already be outside the window (a long transaction, a skewed
+        // clock): prune again so the next claim isn't refused by a receipt the lookup can't see.
+        await receipts.pruneSession(tx, call.session, since);
+        continue;
       }
+      // A receipt whose row is gone (retracted, pruned) is a miss: this call takes it over, unless another call
+      // replaced it first, and the audit says why this repeat wrote fresh (#306).
+      if (!(await receipts.refExists(tx, hit.ref_kind, hit.ref_id))) {
+        if (!(await receipts.reclaim(tx, key, hit, now))) continue;
+        writeAudit(repo, tx, "request.receipt_stale", call.actor, call.sender, {
+          tool: call.tool, fp, ref_kind: hit.ref_kind, ref_id: hit.ref_id, first_at: new Date(hit.at).toISOString(), session: call.session,
+        });
+        break;
+      }
+      const ref: WriteRef = { kind: hit.ref_kind, id: hit.ref_id };
+      const first_at = new Date(hit.at).toISOString();
+      const stored = JSON.parse(hit.result_json) as W["payload"];
+      await recheck(stored, tx);
+      writeAudit(repo, tx, "request.replayed", call.actor, call.sender, {
+        tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
+      });
+      await onReplay(tx);
+      return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
     }
-    const w = write() as W;
-    receipts.upsert({
+    const w = await write(tx);
+    await receipts.upsert(tx, {
       session: call.session, sender: call.sender, fp, tool: call.tool,
       ref_kind: w.ref.kind, ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at: now,
     });
     // A deliberate repeat, told apart from a fresh first call.
     if (call.resend) {
-      writeAudit(repo, "request.resent", call.actor, call.sender, { tool: call.tool, fp, ref_kind: w.ref.kind, ref_id: w.ref.id, session: call.session });
+      writeAudit(repo, tx, "request.resent", call.actor, call.sender, { tool: call.tool, fp, ref_kind: w.ref.kind, ref_id: w.ref.id, session: call.session });
     }
     return { fresh: w };
   });

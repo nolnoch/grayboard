@@ -1,17 +1,29 @@
+import { adminPage } from "./admin_page.ts";
 import { MAX_BODY_BYTES } from "../core/boards.ts";
-import { openDatabase } from "./db.ts";
-import { createWsRefusal, type RefusalData } from "./ws_refusal.ts";
+import { openDatabase, type Repo } from "./db.ts";
+import { sessionEndPort } from "./session_end.ts";
 import { createApplication, type ApplicationOptions } from "./application.ts";
-import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
-import { AuthGate } from "./auth_gate.ts";
-import { createHostedMcp } from "./mcp.ts";
+import { handleHttp, healthz, isJsonRequest, signInRoute } from "./http.ts";
+import type { AdminOverview } from "./admin_api.ts";
+import pkg from "../../package.json" with { type: "json" };
+import { AuthGate, type Caller } from "./auth_gate.ts";
+import { userAgent } from "./audit.ts";
+import { inRequest } from "./request_context.ts";
+import { createHostedMcp, IDLE_TIMEOUT_S } from "./mcp.ts";
 import { createMcpAttachments } from "./mcp-attachments.ts";
 import { createOAuthServer, type OAuthOptions } from "./oauth.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { createTouchQueue } from "./auth.ts";
-import type { Config } from "./config.ts";
+import { writeAudit } from "./audit.ts";
+import { checkIdpConfig, recheckConfig, type Config } from "./config.ts";
+import { defaultProviders } from "./idp.ts";
+import { createIdpRecheck } from "./idp_recheck.ts";
 import { SlackBridge } from "./slack.ts";
+import { lagWindow, queueWaitersNow, refusalCount, REFUSAL_KINDS, serveMetrics, startLagSampler, type Gauges } from "./metrics.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
+import { settleAll } from "./settle.ts";
+import { atSite } from "./store/queue.ts";
 
 export type StartOptions = ApplicationOptions & {
   hostname?: string;
@@ -20,17 +32,73 @@ export type StartOptions = ApplicationOptions & {
   retentionFirstDelayMs?: number;
   // Trusted test dependency injection; never populated from configuration.
   oauth?: OAuthOptions;
+  // The opened store to serve (openRepo in open_repo.ts, or a test's own makePgRepo); stop() closes it. Without one, startServer opens
+  // config.store's SQLite file itself, which only tests rely on: they read the raw handle it exposes as `db`.
+  repo?: Repo;
+  // How long stop() waits for the requests in flight to finish before it closes the store anyway (#218).
+  stopDrainMs?: number;
 };
+
+// stop()'s default drain deadline: inside a supervisor's usual stop grace (systemd's 90 s, Kubernetes' 30 s).
+export const STOP_DRAIN_MS = 10_000;
+
+// A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
+export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "hostedSubscriberLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps" | "aliasScopeCap" | "serviceLimits">, opts: StartOptions) {
+  return {
+    ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit,
+    hostedSubscriberLimit: opts.hostedSubscriberLimit ?? config.hostedSubscriberLimit, serviceLimits: opts.serviceLimits ?? config.serviceLimits,
+    delegateLimit: opts.delegateLimit ?? config.delegateLimit, delegateOpenCap: opts.delegateOpenCap ?? config.delegateOpenCap,
+    observerCap: opts.observerCap ?? config.hostedCaps?.watches.global,
+    // The config's alone, no start option: HTTP's identity create reads the
+    // config too, so the two would otherwise disagree (#347).
+    aliasScopeCap: config.aliasScopeCap,
+  };
+}
+
+function sqlitePath(config: Config): string {
+  if (config.store.kind !== "sqlite") throw new Error("startServer: a Postgres store is opened with openRepo, then passed as `repo`");
+  // The S3 store's module stays off app.ts's import graph (open_repo.ts says why), and its startup check is async.
+  if (config.blobS3) throw new Error("startServer: an S3 attachment store is opened with openRepo, then passed as `repo`");
+  return config.store.path;
+}
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
-  const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
+  const { db: testDb, repo } = opts.repo
+    // No SQLite handle behind an injected Repo: `db` (tests only) is undefined there, typed as SQLite's until C11c-d
+    // move the tests that read it onto the Repo. The injected Repo's own attachment limits and session-end reach apply,
+    // not config's: openRepo sets them from the same config.
+    ? { db: undefined as unknown as ReturnType<typeof openDatabase>["db"], repo: opts.repo }
+    : openDatabase(sqlitePath(config), { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
-  const application = createApplication(repo, db, {
-    humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, hostedRequestLimit: config.hostedRequestLimit, ...opts,
-  });
+  // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
+  // server started without dev auth revokes them, so a re-enable doesn't revive them.
+  // Queued first (#807 P3 A4), so it commits before any other startup write and any request.
+  const devRevoked = config.devAuth ? Promise.resolve() : atSite("startup", () => repo.write(async tx => {
+    const revoked = await repo.sessions.revokeDev(tx);
+    if (revoked > 0) writeAudit(repo, tx, "auth.dev_sessions_revoked", null, null, { count: revoked });
+  }));
+  // The background passes running when stop() began (a revalidate tick, the retention pass, a claim expiry sweep), by
+  // name: stop() waits for them too, or one resumes from an await onto a closed database (#1489). None starts once
+  // `stopping` is set. Declared before the application, whose startup ends may start background work.
+  const passes = new Map<Promise<void>, string>();
+  let stopping = false;
+  const pass = (what: string, running: Promise<unknown>) => {
+    const settled = running.then(() => {}, () => {});
+    passes.set(settled, what);
+    void settled.then(() => passes.delete(settled));
+  };
+  // The work a commit or a pass starts and nobody awaits (a wake's drains, a board change's fan-out, a blob sweep),
+  // tracked as a pass (#1493). Once stopping it doesn't start: a fan-out then has nobody to reach, and the next start's
+  // sweep finishes a skipped blob sweep. `run` logs its own failure; one that escapes is logged here.
+  const background = (what: string, run: (stopped: () => boolean) => Promise<unknown>) => {
+    if (stopping) return;
+    let running: Promise<unknown>;
+    try { running = run(() => stopping); } catch (e) { running = Promise.reject(e); }
+    pass(what, running.catch(e => console.error(`[grayboard] ${what} failed:`, e)));
+  };
+  const application = createApplication(repo, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts), runBackground: background });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
-  const refusal = createWsRefusal();
 
   const authGate = new AuthGate(repo, {
     trustedProxies: config.trustedProxies, limit: config.authFailLimit,
@@ -41,13 +109,21 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // The deferred session-touch queue this server owns; stop() cancels it
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
-  const oauth = createOAuthServer(repo, config, opts.oauth);
-  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits });
+  // The IdP re-check (#930 A2) over the providers the AS signs in with, shared by refresh and CLI-token auth: one
+  // process-wide record of which providers answered positive, one breaker, one in-flight call per user.
+  if (!opts.oauth?.providers) checkIdpConfig(config);
+  const providers = opts.oauth?.providers ?? defaultProviders(config);
+  const recheck = createIdpRecheck(repo, providers, recheckConfig(config), {
+    disconnectUser, userChanged: id => slack?.userChanged(id), background: (what, run) => background(what, () => run()),
+  }, opts.oauth?.now ?? (() => repo.now()));
+  const oauth = createOAuthServer(repo, config, { ...opts.oauth, providers, recheck });
+  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, stopping: () => stopping, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
   const mcpPath = new URL(oauth.resource).pathname;
+  const adminPrefix = new URL(oauth.issuer).pathname.replace(/\/$/, "");
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   slack = config.slack ? new SlackBridge({
-    repo, db, application, ...config.slack,
+    repo, application, ...config.slack,
     ...(process.env.GRAYBOARD_SLACK_DEBUG ? { debug: (msg: string) => console.error(`[grayboard slack] debug: ${msg}`) } : {}),
   }) : undefined;
   const slackReady = slack?.start().catch((e) => {
@@ -60,47 +136,138 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   // Room for four messages' worth of upload bodies at once, one per user.
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
-  const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
+  const attachments = createMcpAttachments(repo, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
+  // The startup writes, each through the write queue in the order queued (#807 P3 A4): the dev-session revocation,
+  // the leftover sessions' ends, OAuth's built-in client cutovers, and hosted's downtime credit and first sweep. The listener serves nothing until
+  // all have settled; a failure then rejects it, and every request fails, so the caller (main.ts) exits on it.
+  const ready: Promise<void> = settleAll([devRevoked, application.ready, oauth.ready, mcp.sessions.ready]).then(() => testPauseAsync("server:ready"));
+  let started = false;
+  ready.then(() => { started = true; }, () => {});
 
-  const server = Bun.serve<RefusalData>({
+  // Every request the listener has taken and not yet answered, by its method and path (never the query: it can
+  // carry a token). server.stop(true) closes their connections, but their handlers run on; stop() waits for them
+  // before it closes the store, or one resumes from an await onto a closed database (#218).
+  const inFlight = new Map<Promise<Response>, string>();
+  const track = (what: string, response: Promise<Response>): Promise<Response> => {
+    inFlight.set(response, what);
+    void response.then(() => inFlight.delete(response), () => inFlight.delete(response));
+    return response;
+  };
+  // The revalidate tick, and the one tests call by hand; its promise is revalidate's own.
+  const runRevalidate = (): Promise<void> => {
+    if (stopping) return Promise.resolve();
+    let running: Promise<void>;
+    try { running = revalidate(); } catch (e) { running = Promise.reject(e); }
+    pass("revalidate pass", running);
+    return running;
+  };
+  // One deadline for all of it: the requests and passes, then the writes they (and the touch queue, the OAuth sweep)
+  // posted and nobody awaits, which a final write queued behind them outlasts (the queue is FIFO).
+  async function drain(ms: number): Promise<void> {
+    const count = (suffix: string) => [
+      inFlight.size ? `${inFlight.size} request${inFlight.size === 1 ? "" : "s"}${suffix}` : "",
+      passes.size ? `${passes.size} background pass${passes.size === 1 ? "" : "es"}` : "",
+    ].filter(Boolean).join(" and ");
+    // Bounded: unauthenticated requests are tracked too, so the list and each path are capped.
+    const named = () => { const all = [...inFlight.values(), ...passes.values()].map(w => w.length > 120 ? `${w.slice(0, 120)}…` : w); return all.length > 10 ? `${all.slice(0, 10).join(", ")} +${all.length - 10} more` : all.join(", "); };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<"expired">(resolve => { timer = setTimeout(() => resolve("expired"), ms); });
+    const fail = (what: string): never => {
+      // Said here as well: main.ts redacts a failed stop's error, and a method and path or a pass's name carry no secret.
+      const message = `stop: ${what}`;
+      console.error(`[grayboard] ${message}`);
+      throw new Error(message);
+    };
+    try {
+      if (inFlight.size || passes.size) {
+        console.error(`[grayboard] stopping: waiting for ${count(" in flight")}: ${named()}`);
+        while (inFlight.size || passes.size) {
+          if (await Promise.race([Promise.allSettled([...inFlight.keys(), ...passes.keys()]), expired]) === "expired") {
+            fail(`${count("")} never finished within ${ms} ms: ${named()}`);
+          }
+        }
+      }
+      if (await Promise.race([atSite("startup", () => repo.write(() => {})).then(() => {}, () => {}), expired]) === "expired") fail(`the queued writes never finished within ${ms} ms`);
+    } finally { clearTimeout(timer); }
+  }
+
+  async function route(req: Request, caller: Caller): Promise<Response> {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    // A token already refused here gets the same 401 again, uncharged and
+    // without a lookup, even from a limited address (#923).
+    const replayed = authGate.replayRefused(req, url);
+    if (replayed) return replayed;
+    const limited = authGate.refuse(caller, path);
+    if (limited) return limited;
+
+    const response = await atSite("oauth", () => oauth.fetch(req, { key: caller.key, site: caller.site }));
+    if (response) return response;
+    // The OAuth byte routes charge a refused bearer as /mcp does (#401).
+    // The AS routes above authenticate clients by secret, not bearer, and
+    // stay under the OAuth limiters alone.
+    const attachmentResponse = atSite("attachments", () => attachments.fetch(req));
+    if (attachmentResponse) return attachmentResponse.then(res => authGate.chargeRefusedToken(caller, req, path, res));
+    if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
+    // The dashboard's page reads nothing and takes no token; its data comes from the /api/admin/ read routes.
+    const page = adminPage(req, path, adminPrefix);
+    if (page) return page;
+
+    // A sign-in costs a token up front, before its body is read. Only a
+    // JSON body is accepted, uncharged otherwise: a cross-origin page can
+    // post a form without a preflight, but not application/json.
+    if (signInRoute(req.method, path, config)?.charged) {
+      if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
+      authGate.charge(caller, req, path, "sign-in");
+    }
+    return atSite("admin", () => handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged, recheck, adminBearer: oauth.authenticateAdmin, adminOverview }, caller.ip, application.boardsChanged, url)).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+  }
+
+  // Every value an O(1) getter (vision P13): no row count, no walk over sessions.
+  const gauges = (): Gauges => {
+    const used = mcp.capacityUsed;
+    return {
+      mcp_admissions: { help: "Hosted MCP admissions held, by capacity kind.", values: (["listen", "legacy", "post", "dormant"] as const).map(kind => ({ value: used[kind], labels: { kind } })) },
+      mcp_exchanges_in_flight: { help: "Hosted MCP exchanges being handled.", values: [{ value: mcp.pendingExchanges }] },
+      hosted_sessions_holding: { help: "Bound hosted sessions this process holds a name for.", values: [{ value: mcp.sessions.holderCount }] },
+      delivery_leases: { help: "Open delivery leases.", values: [{ value: mcp.activeLeases }] },
+      resource_watches: { help: "Open board resource watches.", values: [{ value: mcp.activeWatches }] },
+      board_observers: { help: "Board observers server-wide (the resource watch global cap bounds them).", values: [{ value: application.observerCount }] },
+      hosted_refusal_rows_lost: { help: "Refusal audit rows that failed to write.", values: [{ value: mcp.sessions.refusalRowsLost }] },
+    };
+  };
+
+  // The dashboard Overview (#1651 D6): the same O(1) getters, plus /healthz's cached verdict.
+  const startedAt = Date.now();
+  async function adminOverview(): Promise<AdminOverview> {
+    const health = await healthz(repo, performance.now(), config.healthzLag);
+    const code = health.ok ? null : ((await health.json()) as { code?: string }).code ?? String(health.status);
+    return {
+      version: pkg.version, started_at: startedAt, uptime_s: Math.round((Date.now() - startedAt) / 1000),
+      health: { ok: health.ok, code }, lag: lagWindow() ?? null, queue_waiters: queueWaitersNow(),
+      refusals: Object.fromEntries(REFUSAL_KINDS.map(k => [k, refusalCount(k)])),
+      gauges: Object.entries(gauges()).map(([name, g]) => ({ name, help: g.help, values: g.values })),
+      slack: !config.slack ? "off" : slack?.running ? "up" : "down",
+    };
+  }
+
+  const server = Bun.serve({
     hostname: opts.hostname,
     port: config.httpPort,
-    idleTimeout: 75,
+    idleTimeout: IDLE_TIMEOUT_S,
     // The largest body is an attachment upload (src/server/http.ts); the
     // margin covers a JSON request carrying a full message body.
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
     async fetch(req, server) {
-      // First, before anything reads the database (#240).
-      const caller = authGate.caller(req, server.requestIP(req)?.address);
-      const path = new URL(req.url).pathname;
-      const limited = authGate.refuse(caller, path);
-      if (limited) return limited;
-
-      const response = await oauth.fetch(req, { key: caller.key });
-      if (response) return response;
-      const attachmentResponse = attachments.fetch(req);
-      if (attachmentResponse) return attachmentResponse;
-      if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
-      // A pre-removal `grayboard mcp --mode server` (#282): no auth, no session; the handler answers its hello with a refusal.
-      if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-        if (!refusal.admit(caller.key)) return Response.json({ code: "rate_limited", message: "too many open connections from this address" }, { status: 429 });
-        if (server.upgrade(req, { data: { key: caller.key } })) return;
-        refusal.release(caller.key);
-        return new Response("WebSocket upgrade failed", { status: 500 });
-      }
-
-      // A sign-in costs a token up front: the exchange awaits Google. Only a
-      // JSON body is accepted, uncharged otherwise: a cross-origin page can
-      // post a form without a preflight, but not application/json.
-      if (signInRoute(req.method, path, config)?.charged) {
-        if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
-        authGate.charge(caller, req, path, "sign-in");
-      }
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      return track(`${req.method} ${new URL(req.url).pathname}`, (async () => {
+        if (!started) await ready;
+        // First, before anything reads the database (#240).
+        const caller = authGate.caller(req, server.requestIP(req)?.address);
+        // Every audit row this request writes carries where it came from (security audit F-19).
+        return inRequest({ ip: caller.ip, ua: userAgent(req) }, () => route(req, caller));
+      })());
     },
-
-    websocket: refusal.handlers,
 
     // A route that throws something other than a refusal it maps itself. Bun's
     // default answer, without NODE_ENV=production, is a dev page carrying the
@@ -111,13 +278,25 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     },
   });
 
+  // Before the timers and the lag sampler: a metrics port in use fails startup with only the main listener to unwind.
+  let metrics: ReturnType<typeof serveMetrics> | undefined;
+  try { metrics = config.metricsAddr ? serveMetrics(config.metricsAddr, gauges) : undefined; }
+  catch (e) { void server.stop(true); throw e; }
+
   const timers: ReturnType<typeof setInterval>[] = [];
-  let stopRetention: (() => void) | undefined;
+  let stopRetention: (() => Promise<void>) | undefined;
   let stopPromise: Promise<void> | undefined;
   if (opts.background !== false) {
-    timers.push(setInterval(sweepLimits, 30_000), setInterval(revalidate, 30_000));
-    stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
+    timers.push(setInterval(sweepLimits, 30_000), setInterval(() => {
+      // A throw here would surface as an unhandled error every 30 s with no context; log it and let the next tick retry.
+      // Async since #807 P3 A7u2: a rejection is logged the same way, never left unhandled (Bun exits on one).
+      const failed = (e: unknown) => console.error(`[grayboard] revalidate failed: ${(e as Error).stack ?? e}`);
+      runRevalidate().catch(failed);
+    }, 30_000));
+    stopRetention = startRetentionJobs(repo, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
+  // The lag sampler runs with or without a listener: /healthz's lag gate reads it (#805).
+  const stopLag = opts.background !== false ? startLagSampler() : undefined;
 
   return {
     server,
@@ -125,29 +304,46 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     mcp,
     oauth,
     repo,
-    db,
-    refusal,
+    // Exposed for tests only (their spies read `db.inTransaction`): no server code holds the raw connection (#807 P1c-15c-2).
+    db: testDb,
     // Exposed for tests: the bridge instance, to drive fatal stops directly.
     slack,
-    // The auth re-check and limiter sweep, for tests that run without it.
-    revalidate,
+    // The auth re-check and limiter sweep, for tests that run without it. Tracked as the timer's is: stop() waits for it.
+    revalidate: runRevalidate,
     sweepLimits,
     authGate,
+    // Settles once the startup writes have committed (the listener waits for it); rejects when one failed.
+    ready,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
     touches,
+    // The metrics listener, when GRAYBOARD_METRICS_ADDR configured one.
+    metrics,
     stop() {
       if (stopPromise) return stopPromise;
+      stopping = true;
       slack?.stop();
       for (const t of timers) clearInterval(t);
-      stopRetention?.();
-      stopExpiry();
+      if (stopRetention) pass("retention pass", stopRetention());
+      stopLag?.();
+      void metrics?.stop(true);
+      pass("claim expiry pass", stopExpiry());
       touches.cancelAll();
-      server.stop(true);
-      stopPromise = Promise.allSettled([mcp.close(), attachments.close()]).then(outcomes => {
+      void server.stop(true);
+      // After the startup writes settle: closing the database under a queued one would fail it mid-flight. Then the
+      // requests still in flight, once hosted MCP and the attachment routes have refused theirs (#218), and the
+      // background passes already running (#1489).
+      stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(async outcomes => {
+        const drained = await drain(opts.stopDrainMs ?? STOP_DRAIN_MS).then(() => undefined, (error: unknown) => error);
         const failure = outcomes.find(outcome => outcome.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
-      }).finally(() => { oauth.close(); db.close(); });
+        if (drained) throw drained;
+      }).finally(async () => {
+        // Awaited (#807 P3 C11a): a Postgres Repo's pool and LISTEN connection close over the network, and a caller
+        // that exits once stop() settles would otherwise cut them off and leave its database in use. The Repo closes
+        // even if oauth's close throws.
+        try { oauth.close(); } finally { await repo.close(); }
+      });
       return stopPromise;
     },
   };

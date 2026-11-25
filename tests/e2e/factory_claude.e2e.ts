@@ -1,0 +1,228 @@
+// The factory's Claude Code runner (#293, docs/factory-children.md §1) against the
+// pinned Claude Code (tests/support/claude_code.ts) and a scripted fake
+// Anthropic API: the agent runs headless with the prompt on stdin, and the
+// operator's own settings never widen a child. Run it through
+// `scripts/e2e.sh claude-local`; outside `bun test`'s discovery, so the
+// pre-push hook never fetches Claude Code for it (#456).
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ClaudeRunner } from "../../adapters/factory/claude/runner.ts";
+import { DATA_NOTE, RELAY_TOOLS, Relay, shimCommand, type Reader } from "../../adapters/factory/relay.ts";
+import { resolvePersona } from "../../adapters/factory/runner.ts";
+import { claudeCodeBin, claudeHome } from "../support/claude_code.ts";
+import { called, startFakeAnthropic, systemText, toolResults, userTexts } from "../support/fake_anthropic.ts";
+
+let dir: string;
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "grayboard-factory-claude-")); });
+afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+test("claude runner: runs the named agent headless, prompt on stdin, and returns its result", async () => {
+  const bin = claudeCodeBin();
+  const model = startFakeAnthropic([
+    (q) => (userTexts(q).some((t) => t.includes("-- FACTORY-TASK")) ? { text: systemText(q).includes("AGENT-PROMPT-7") ? "RESULT-42" : "wrong agent" } : undefined),
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "researcher.md"), "---\nname: researcher\ndescription: researches\n---\nAGENT-PROMPT-7: you research.\n");
+    const runner = new ClaudeRunner({ bin, cwd: h.work, env: h.env });
+    expect(runner.roster().map((a) => a.name)).toEqual(["researcher"]);
+    const agent = resolvePersona("a researcher", runner.roster())!;
+    // A task starting with "-" would be a flag in argv; on stdin it's text.
+    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, join(dir, "t.jsonl"));
+    expect(out).toMatchObject({ ok: true, text: "RESULT-42", run: { code: 0, turns: 1 } });
+    expect(typeof out.run?.session).toBe("string");
+    expect(model.unhandled).toEqual([]);
+    // The transcript (#649): the child's stream-json events, 0600, ending in its result.
+    expect(statSync(join(dir, "t.jsonl")).mode & 0o777).toBe(0o600);
+    const events = readFileSync(join(dir, "t.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(events.at(-1)).toMatchObject({ type: "result", subtype: "success", result: "RESULT-42", session_id: out.run?.session });
+  } finally {
+    model.stop();
+  }
+}, 120_000);
+
+// The operator's own settings must not widen a child. The fake model has the
+// agent run `touch MARKER` in the working directory; the marker shows whether
+// the shell ran. Measured on the pinned Claude Code: without --restricted, a
+// user rule allowing Bash lets the child's shell run.
+async function shellTrial(user: string[], o: { tools?: string[]; allowedTools: string[] }): Promise<{ marker: boolean; result: string; agentPrompt: boolean }> {
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("FACTORY-SHELL")) ? undefined
+      : called(q, "toolu_sh") ? { text: "ended" } : { tool: "Bash", id: "toolu_sh", input: { command: "touch MARKER", description: "touch a file" } },
+  ]);
+  try {
+    const h = claudeHome(dir, model.url, user);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal, o, { cwd: h.work, addDirs: [] }, join(dir, "t.jsonl"));
+    expect(out).toMatchObject({ ok: true, text: "ended" });
+    expect(model.unhandled).toEqual([]);
+    return { marker: existsSync(join(h.work, "MARKER")), result: toolResults(model, "toolu_sh").join("\n"), agentPrompt: model.requests.some((r) => systemText(r.body).includes("AGENT-PROMPT-9")) };
+  } finally {
+    model.stop();
+  }
+}
+
+test("claude runner: the operator's user allow rules don't reach a child; no shell unless the config names it", async () => {
+  const t = await shellTrial(["Bash"], { allowedTools: [] });
+  expect(t.agentPrompt).toBe(true);
+  expect(t.marker).toBe(false);
+  expect(t.result).toContain("No such tool available: Bash");
+}, 120_000);
+
+test("claude runner: a shell the config names in tools but not allowedTools is still denied, unprompted", async () => {
+  const t = await shellTrial(["Bash"], { tools: ["Bash", "Read"], allowedTools: [] });
+  expect(t.marker).toBe(false);
+  expect(t.result).toContain("Permission for this tool use was denied");
+}, 120_000);
+
+test("claude runner: a shell the config names in both lists runs", async () => {
+  const t = await shellTrial([], { tools: ["Bash", "Read"], allowedTools: ["Bash"] });
+  expect(t.marker).toBe(true);
+}, 120_000);
+
+// Synthesis reads its subtasks' directories through --add-dir (#641), which
+// restricted mode's file confinement includes. The fake model has the child
+// Read a file in a sibling of its working directory, with the parent added
+// and without.
+async function readTrial(add: boolean): Promise<string> {
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("FACTORY-READ")) ? undefined
+      : called(q, "toolu_rd") ? { text: "ended" } : { tool: "Read", id: "toolu_rd", input: { file_path: join(dir, "tree", "8", "out.txt") } },
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
+    for (const d of ["main", "8"]) mkdirSync(join(dir, "tree", d), { recursive: true });
+    writeFileSync(join(dir, "tree", "8", "out.txt"), "SUBTASK-OUTPUT-8\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const place = { cwd: join(dir, "tree", "main"), addDirs: add ? [join(dir, "tree")] : [] };
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-READ" }, new AbortController().signal, { allowedTools: [] }, place, join(dir, "t.jsonl"));
+    expect(out).toMatchObject({ ok: true, text: "ended" });
+    expect(model.unhandled).toEqual([]);
+    return toolResults(model, "toolu_rd").join("\n");
+  } finally {
+    model.stop();
+  }
+}
+
+test("claude runner: a child reads a sibling directory only when the run adds it (#641)", async () => {
+  expect(await readTrial(true)).toContain("SUBTASK-OUTPUT-8");
+  expect(await readTrial(false)).not.toContain("SUBTASK-OUTPUT-8");
+}, 240_000);
+
+// A budget (#649): Claude Code checks it after each turn, so a child that
+// would loop forever stops at the first turn past it, exit 1.
+test("claude runner: a run past its budget stops, and the outcome says so", async () => {
+  let n = 0;
+  const model = startFakeAnthropic([
+    (q) => (userTexts(q).some((t) => t.includes("FACTORY-LOOP")) ? { tool: "Read", id: `toolu_l${++n}`, input: { file_path: `/nonexistent/${n}` } } : undefined),
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-LOOP" }, new AbortController().signal, { allowedTools: [], budgetUsd: 0.00001 }, { cwd: h.work, addDirs: [] }, join(dir, "t.jsonl"));
+    expect(out).toMatchObject({ ok: false, run: { code: 1, stop: "budget" } });
+    expect(out.ok ? "" : out.error).toStartWith("stopped at its budget of $0.00001");
+    expect(n).toBeLessThan(5); // stopped, not timed out
+    const last = JSON.parse(readFileSync(join(dir, "t.jsonl"), "utf8").trim().split("\n").at(-1)!);
+    expect(last).toMatchObject({ type: "result", subtype: "error_max_budget_usd" });
+  } finally {
+    model.stop();
+  }
+}, 120_000);
+
+// Ask and resume (#652): a run that ends on a question continues the same
+// conversation under the same flags, with the answer as the next prompt.
+// The second turn must see the first (task, question) and the agent's prompt.
+test("claude runner: a resumed run continues the conversation with the answer (#652)", async () => {
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("ANSWER-5")) ? undefined
+      : { text: userTexts(q).some((t) => t.includes("FACTORY-ASK")) && systemText(q).includes("AGENT-PROMPT-7") ? "RESUMED-OK" : "lost context" },
+    (q) => (userTexts(q).some((t) => t.includes("FACTORY-ASK")) ? { text: "QUESTION-1?" } : undefined),
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "researcher.md"), "---\nname: researcher\ndescription: researches\n---\nAGENT-PROMPT-7\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const agent = runner.roster()[0]!;
+    const req = { id: 1, source: "dm" as const, requester: "sim", persona: "researcher", task: "FACTORY-ASK" };
+    const t1 = join(dir, "t1.jsonl"), t2 = join(dir, "t2.jsonl");
+    const first = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t1);
+    expect(first).toMatchObject({ ok: true, text: "QUESTION-1?" });
+    const session = first.run!.session!;
+    const second = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t2, { session, input: "ANSWER-5", priorUsd: first.run!.costUsd! });
+    expect(second).toMatchObject({ ok: true, text: "RESUMED-OK" });
+    expect(model.unhandled).toEqual([]);
+    // Each run its own transcript, as the factory gives it.
+    const results = (f: string) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "result");
+    expect(results(t1).map((e) => e.result)).toEqual(["QUESTION-1?"]);
+    expect(results(t2).map((e) => e.result)).toEqual(["RESUMED-OK"]);
+    expect(second.run?.session).toBe(session); // --resume continues, it doesn't fork
+    // total_cost_usd is the session's running total across --resume; less
+    // priorUsd, each run reports its own share (the same usage, so the same cost).
+    expect(results(t2)[0].total_cost_usd).toBeCloseTo(2 * first.run!.costUsd!, 9);
+    expect(first.run!.costUsd!).toBeGreaterThan(0);
+    expect(second.run!.costUsd!).toBeCloseTo(first.run!.costUsd!, 9);
+    // Restricted mode's default tools keep Agent (measured on the pinned
+    // Claude Code), so a child can run subagents without a profile naming it.
+    expect(model.requests[0]!.body.tools?.map((x) => x.name)).toContain("Agent");
+  } finally {
+    model.stop();
+  }
+}, 120_000);
+
+// Bus tools (#669): a run given the relay's MCP server calls a relayed tool
+// unprompted and gets the reader's answer fenced as data; its --mcp-config
+// file goes when the run ends. A run without it has no MCP tool at all.
+test("claude runner: a run with the relay calls a bus tool unprompted; one without has none (#669)", async () => {
+  const calls: { tool: string; args: Record<string, unknown> }[] = [];
+  const reader = async (): Promise<Reader> => ({
+    call: async (tool, args = {}) => { calls.push({ tool, args }); return { board: "notes", posts: [{ id: 3, body: "BOARD-TEXT-3" }] }; },
+    close: async () => {},
+    closed: new Promise<void>(() => {}),
+  });
+  const relay = new Relay({ dir: join(dir, "relay"), shim: shimCommand(join(dir, "relay"), join(import.meta.dir, "../../adapters/factory/relay_shim.ts")), reader, log: () => {} });
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("FACTORY-BUS")) ? undefined
+      : called(q, "toolu_bus") ? { text: "ended" } : { tool: "mcp__bus__board_read", id: "toolu_bus", input: { board: "notes", limit: 5, extra: "dropped" } },
+    (q) => (userTexts(q).some((t) => t.includes("FACTORY-NOBUS")) ? { text: "plain" } : undefined),
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const agent = runner.roster()[0]!;
+    const g = await relay.grant();
+    const t = join(dir, "t.jsonl");
+    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-BUS" }, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t, undefined, g.server);
+    g.revoke();
+    expect(out).toMatchObject({ ok: true, text: "ended" });
+    expect(model.unhandled).toEqual([]);
+    expect(calls).toEqual([{ tool: "board_read", args: { board: "notes", limit: 5 } }]);
+    const result = toolResults(model, "toolu_bus").join("\n");
+    expect(result).toContain(DATA_NOTE);
+    expect(result).toContain("BOARD-TEXT-3");
+    expect(existsSync(`${t}.mcp.json`)).toBe(false);
+    const names = model.requests.find((r) => userTexts(r.body).some((x) => x.includes("FACTORY-BUS")))!.body.tools?.map((x) => x.name) ?? [];
+    expect(names.filter((n) => n.startsWith("mcp__")).sort()).toEqual(RELAY_TOOLS.map((n) => `mcp__bus__${n}`).sort());
+
+    const plain = await runner.run(agent, { id: 2, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-NOBUS" }, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, join(dir, "t2.jsonl"));
+    expect(plain).toMatchObject({ ok: true, text: "plain" });
+    const plainNames = model.requests.find((r) => userTexts(r.body).some((x) => x.includes("FACTORY-NOBUS")))!.body.tools?.map((x) => x.name) ?? [];
+    expect(plainNames.length).toBeGreaterThan(0);
+    expect(plainNames.filter((n) => n.startsWith("mcp__"))).toEqual([]);
+  } finally {
+    model.stop();
+    await relay.close();
+  }
+}, 120_000);

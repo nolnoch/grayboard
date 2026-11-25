@@ -1,31 +1,33 @@
-import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/rate_limit.ts";
-import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { startServer } from "../../src/server/app.ts";
+import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
-import { issueOAuth } from "../helpers/oauth.ts";
+import { issueOAuth, type IssuedOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { randomBytes } from "node:crypto";
 import { sessionContext } from "../../src/server/hosted.ts";
+import { stubAuthRead } from "../support/auth_stub.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { requestOrigin } from "../../src/server/request_context.ts";
+import { NO_MEMBER_AUTHORITY } from "../../src/server/store/identity.ts";
 
-let app: ReturnType<typeof startServer>, dir: string, base: string, clock: number;
+let srv: TestServer, app: TestServer["app"], base: string, clock: number;
 const clients: Client[] = [];
-beforeEach(() => {
+beforeEach(async () => {
   clock = Date.now();
-  dir = mkdtempSync(join(tmpdir(), "gb-mcp-streams-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock } });
+  srv = await TestServer.open({ publicUrl: "https://grayboard.example.com" }, { hostname: "127.0.0.1", oauth: { now: () => clock } });
+  app = srv.app;
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()));
-  await app.stop();
+  await srv.stop();
   expect(app.mcp.activeContexts).toBe(0);
   expect(app.mcp.activeResourceContexts).toBe(0);
   expect(app.mcp.activeStreams).toBe(0);
@@ -36,7 +38,6 @@ afterEach(async () => {
   expect(app.mcp.activePosts).toBe(0);
   expect(app.mcp.activeWatches).toBe(0);
   expect(app.mcp.activeBusListeners).toBe(0);
-  app.db.close(); rmSync(dir, { recursive: true, force: true });
 });
 const issue = (email = "alice@example.com") => issueOAuth(app.repo, app.oauth.resource, email, ["grayboard:tools", "grayboard:delivery"], clock, OPENCODE_CLIENT);
 async function until(predicate: () => boolean) {
@@ -45,8 +46,8 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 async function connect(token: string, version: string, role?: string, identity = "be") {
-  const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity });
-  const principal = app.oauth.authenticate(new Request(base + "/mcp", { headers }));
+  const headers = new Headers({ Authorization: `Bearer ${token}` });
+  const principal = await app.oauth.authenticate(new Request(base + "/mcp", { headers }));
   if (principal instanceof Response) throw new Error("fixture authentication failed");
   const routing = sessionContext(principal, { "ai.opencode/sessionID": identity });
   const current = await app.mcp.sessions.whoami(principal, routing);
@@ -107,7 +108,7 @@ async function watch(c: Connection, uri: string) {
 }
 const boardUri = "grayboard://boards/e2e";
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: independent native watchers fan out without consumption; unsubscribe and reconcile`, async () => {
-  const grant = issue();
+  const grant = await issue();
   const first = await connect(grant.token, version);
   const second = await connect(grant.token, version);
   await call(first, "board_create", { name: "e2e", purpose: "fixtures" });
@@ -117,8 +118,8 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: independent nativ
   await until(() => first.hints.length === 1 && second.hints.length === 1);
   expect(first.hints).toEqual([boardUri]); expect(second.hints).toEqual([boardUri]);
   expect(app.mcp.activeLeases).toBe(0);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
-  const observer = await connect(issue("bob@example.com").token, version);
+  expect(await app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
+  const observer = await connect((await issue("bob@example.com")).token, version);
   const peers = await call(observer, "peer_list", { include_offline: true });
   expect(peers.peers.find((peer: { handle: string }) => peer.handle === "alice@example.com/be").online).toBe(false);
   await stopFirst(); await stopSecond();
@@ -127,7 +128,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: independent nativ
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox hints are lease-epoch bound and never receipt pending`, async () => {
-  const grant = issue();
+  const grant = await issue();
   const native = await connect(grant.token, version);
   const subscriber = await connect(grant.token, version, "subscriber");
   if (version !== "2026-07-28") await until(() => app.mcp.activeGetStreams === 2);
@@ -135,29 +136,21 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox hints are l
   subscriber.headers.set("X-Grayboard-Lease", lease.capability);
   if (version !== "2026-07-28") {
     expect(await pending(subscriber)).toEqual([]);
-    const resume = subscriber.pauseGets();
-    try {
-      // The first current POST registers successfully without upgrading the old GET.
-      expect(await subscriber.client.subscribeResource({ uri: "grayboard://inbox" })).toEqual({});
-      await until(() => subscriber.getHeaders.length === 2);
-      expect(subscriber.getHeaders[0]!.has("X-Grayboard-Lease")).toBe(false);
-      expect(subscriber.getHeaders[1]!.get("X-Grayboard-Lease")).toBe(lease.capability);
-      expect(app.mcp.activeGetStreams).toBe(1);
-      expect(app.mcp.activeInboxListeners).toBe(0);
-      await call(native, "dm_send", { to: "be", body: "before fresh GET", pending: true });
-      expect(await pending(subscriber)).toHaveLength(1);
-      expect(subscriber.hints).toEqual([]);
-      expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
-    } finally { resume(); }
-    await until(() => app.mcp.activeInboxListeners === 1);
+    // The GET opened before the lease watches nothing, so the current POST re-authorizes it in place
+    // (#431): it watches the inbox under the POST's lease without the client reopening it.
+    expect(await subscriber.client.subscribeResource({ uri: "grayboard://inbox" })).toEqual({});
+    expect(app.mcp.activeGetStreams).toBe(2);
+    expect(app.mcp.activeInboxListeners).toBe(1);
+    expect(subscriber.getHeaders).toHaveLength(1);
+    expect(subscriber.getHeaders[0]!.has("X-Grayboard-Lease")).toBe(false);
   } else await watch(subscriber, "grayboard://inbox");
   const sent = await call(native, "dm_send", { to: "be", body: "durable", pending: true });
   await until(() => subscriber.hints.length > 0);
   const batch = await pending(subscriber);
-  expect(batch).toHaveLength(version === "2026-07-28" ? 1 : 2);
+  expect(batch).toHaveLength(1);
   expect(batch.at(-1).id).toBe(`direct:${sent.message_id}`);
   expect(await pending(subscriber)).toEqual(batch);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+  expect(await app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
   const oldHints = subscriber.hints.length;
   await call(subscriber, "delivery_release");
   await until(() => app.mcp.activeInboxListeners === 0);
@@ -177,27 +170,27 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox hints are l
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) for (const action of ["access", "expiry", "grant", "disable", "admin"] as const) test(`${version}: ${action} retires active streams without a hint`, async () => {
-  const grant = issue();
+  const grant = await issue();
   const connection = await connect(grant.token, version);
   await call(connection, "board_create", { name: "e2e", purpose: "fixtures" });
   await watch(connection, boardUri);
   await until(() => app.mcp.activeWatches === 1);
-  if (action === "access") app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock);
+  if (action === "access") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, clock));
   if (action === "expiry") clock += OAUTH_TTL.access;
-  if (action === "grant") app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock);
-  if (action === "disable") app.repo.users.setDisabled(grant.authed.user_id, true);
-  if (action === "admin") app.repo.sessions.revokeAllForUser(grant.authed.user_id);
+  if (action === "grant") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, hashToken(grant.refreshToken), grant.binding.clientId, clock));
+  if (action === "disable") await seed(app.repo, tx => app.repo.users.setDisabled(tx, grant.authed.user_id, true));
+  if (action === "admin") await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, grant.authed.user_id));
   await until(() => version === "2026-07-28" ? app.mcp.activeListens === 0 : app.mcp.activeGetStreams === 0);
   await expect(connection.client.readResource({ uri: boardUri })).rejects.toThrow();
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox listen requires the current user, grant, identity and capability`, async () => {
-  const grant = issue(), owner = await connect(grant.token, version, "subscriber");
+  const grant = await issue(), owner = await connect(grant.token, version, "subscriber");
   const lease = await call(owner, "delivery_open");
   const others = [
     await connect(grant.token, version, "subscriber", "fe"),
-    await connect(issue("bob@example.com").token, version, "subscriber"),
-    await connect(issue().token, version, "subscriber"),
+    await connect((await issue("bob@example.com")).token, version, "subscriber"),
+    await connect((await issue()).token, version, "subscriber"),
   ];
   for (const other of others) {
     other.headers.set("X-Grayboard-Lease", lease.capability);
@@ -207,11 +200,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox listen requ
   await expect(watch(owner, "grayboard://inbox")).rejects.toThrow();
   expect(app.mcp.activeInboxListeners).toBe(0);
   expect(app.mcp.activeLeases).toBe(1);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+  expect(await app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: malformed/read-only/private resources cannot be watched`, async () => {
-  const c = await connect(issue().token, version);
+  const c = await connect((await issue()).token, version);
   for (const uri of ["grayboard://identity", "grayboard://inbox", "grayboard://boards/missing", "grayboard://boards/e2e?limit=20", "grayboard://boards/%65%32e"]) {
     await expect(watch(c, uri)).rejects.toThrow();
   }
@@ -220,7 +213,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: malformed/read-on
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) for (const kind of ["http", "sdk"] as const) test(`${version}: ${kind} cancellation during lease acquisition cannot leave an owner`, async () => {
-  const grant = issue(), c = await connect(grant.token, version, "subscriber");
+  const grant = await issue(), c = await connect(grant.token, version, "subscriber");
   const abort = new AbortController();
   if (kind === "http") c.setCallSignal(abort.signal);
   const original = app.mcp.delivery.open;
@@ -253,26 +246,26 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const kind of ["http", "sdk"] 
   } finally { resume(); app.mcp.delivery.open = original; }
 });
 
-function refresh(grant: ReturnType<typeof issueOAuth>, priorRefresh = grant.refreshToken) {
+async function refresh(grant: IssuedOAuth, priorRefresh = grant.refreshToken) {
   const token = randomBytes(32).toString("base64url"), refreshToken = randomBytes(32).toString("base64url"), now = Date.now();
-  expect(app.repo.oauth.rotateRefresh({ clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(priorRefresh), tokens: {
+  expect((await seed(app.repo, tx => app.repo.oauth.rotateRefresh(tx, { clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(priorRefresh), tokens: {
     ...grant.tokens, accessHash: hashToken(token), refreshHash: hashToken(refreshToken), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
-  } }, now).status).toBe("ok");
+  } }, now))).status).toBe("ok");
   return { token, refreshToken };
 }
 
 for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: current subscribe succeeds after old GET access revocation and recovers visible registrations`, async () => {
-  const grant = issue(), c = await connect(grant.token, version);
+  const grant = await issue(), c = await connect(grant.token, version);
   await call(c, "board_create", { name: "e2e", purpose: "existing registration" });
   await call(c, "board_create", { name: "next", purpose: "current registration" });
   await watch(c, boardUri);
   expect(app.mcp.activeWatches).toBe(1);
   const sid = c.transport.sessionId;
-  const rotated = refresh(grant);
+  const rotated = await refresh(grant);
   c.headers.set("Authorization", `Bearer ${rotated.token}`);
   const resume = c.pauseGets();
   try {
-    app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock);
+    await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, clock));
     expect(await c.client.subscribeResource({ uri: "grayboard://boards/next" })).toEqual({});
     await until(() => c.getHeaders.length === 2);
     expect(c.getHeaders[0]!.get("Authorization")).toBe(`Bearer ${grant.token}`);
@@ -284,7 +277,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: current 
     await call(c, "board_post", { board: "e2e", body: "old registration while disconnected" });
     await call(c, "board_post", { board: "next", body: "current registration while disconnected" });
     expect(c.hints).toEqual([]);
-    expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+    expect(await app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
   } finally { resume(); }
   await until(() => app.mcp.activeWatches === 2);
   expect(c.transport.sessionId).toBe(sid);
@@ -299,12 +292,12 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: current 
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh same-grant requests do not inherit initialize or GET access`, async () => {
-  const grant = issue(), c = await connect(grant.token, version);
+  const grant = await issue(), c = await connect(grant.token, version);
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
   await watch(c, boardUri);
-  const rotated = refresh(grant);
+  const rotated = await refresh(grant);
   c.headers.set("Authorization", `Bearer ${rotated.token}`);
-  app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now());
+  await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, Date.now()));
   expect(await call(c, "whoami")).toMatchObject({ primary: "alice@example.com/be" });
   await until(() => app.mcp.activeWatches === 0);
   expect(app.mcp.activeLegacySessions).toBe(1);
@@ -312,8 +305,8 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   expect(JSON.stringify(await c.client.readResource({ uri: boardUri }))).toContain("e2e");
   const sid = c.transport.sessionId!;
   for (const change of [
-    { Authorization: `Bearer ${issue("bob@example.com").token}` },
-    { Authorization: `Bearer ${issue().token}` },
+    { Authorization: `Bearer ${(await issue("bob@example.com")).token}` },
+    { Authorization: `Bearer ${(await issue()).token}` },
     { "X-Grayboard-Client": "subscriber" },
   ]) {
     const headers = new Headers(c.headers);
@@ -329,32 +322,132 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   const missing = await fetch(base + "/mcp", { method: "DELETE", headers });
   expect(missing.status).toBe(404); await missing.body?.cancel();
 });
+// A testPause point armed in this process (the TestServer runs here): `hit` resolves once a task reaches it, `disarm`
+// stops later tasks pausing there, `go` releases every paused one. `restore` (in a finally) releases too, and puts the
+// environment back as it was. The point is armed per test, not in tests/support/hosted-pause.ts's start-and-overlap
+// shape, since these tests release it partway through their overlap.
+function armPause(point: string) {
+  const dir = mkdtempSync(join(tmpdir(), "gb-1408-")), file = join(dir, "go");
+  const oldPoint = process.env.BUS_TEST_PAUSE, oldFile = process.env.BUS_TEST_PAUSE_FILE;
+  let reached!: () => void;
+  const hit = new Promise<void>(resolve => { reached = resolve; });
+  const log = spyOn(console, "error").mockImplementation((message: unknown) => { if (message === `[grayboard] test pause hit: ${point}`) reached(); });
+  process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
+  const go = () => writeFileSync(file, "go");
+  return {
+    hit, go,
+    disarm() { delete process.env.BUS_TEST_PAUSE; },
+    restore() {
+      go();
+      if (oldPoint === undefined) delete process.env.BUS_TEST_PAUSE; else process.env.BUS_TEST_PAUSE = oldPoint;
+      if (oldFile === undefined) delete process.env.BUS_TEST_PAUSE_FILE; else process.env.BUS_TEST_PAUSE_FILE = oldFile;
+      log.mockRestore(); rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+// #1408: a resource read whose write body waits behind another request's body runs as its own exchange, not the
+// releasing holder's. Alice's read is held at `hosted:tool:in-gate` (past its gate's write, before its body's); bob's
+// tool call then takes the queue and holds it, alice's body queues behind it (told by her request's user agent), and
+// bob's release starts it. Started in bob's context, it judged bob's exchange principal and refused as "resource
+// session is closed or unauthorized".
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a resource read queued behind another request's write body judges its own exchange`, async () => {
+  const c = await connect((await issue()).token, version);
+  const d = await connect((await issue("bob@example.com")).token, version, undefined, "fe");
+  await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
+  c.headers.set("User-Agent", "alice-1408");
+  type Body = (tx: unknown) => unknown;
+  type Writers = Record<"write" | "writeKeyed", (...args: unknown[]) => unknown>;
+  const hosted = app.repo.hosted as unknown as Writers, write = hosted.write, writeKeyed = hosted.writeKeyed;
+  let arm = false, holding = false, aliceQueued = false, release!: () => void;
+  const gate = new Promise<void>(r => { release = r; });
+  // The first body after arming is held, exclusive (hosted.write) or keyed (hosted.writeKeyed, Postgres's tool bodies
+  // since #1575): either way an exclusive body arriving behind it waits for its release.
+  const wrap = (call: (fn: Body) => unknown) => (fn: Body) => {
+    const hold = arm && !holding;
+    if (hold) holding = true;
+    const out = call(hold ? async (tx: unknown) => { await gate; return fn(tx); } : fn);
+    // Queued behind bob's hold by the call above (the queue enqueues synchronously): only now may bob release.
+    if (!hold && holding && requestOrigin()?.ua === "alice-1408") aliceQueued = true;
+    return out;
+  };
+  hosted.write = (fn: unknown, ...rest: unknown[]) => wrap(f => write.call(app.repo.hosted, f, ...rest))(fn as Body);
+  if (writeKeyed) hosted.writeKeyed = (keys: unknown, fn: unknown, ...rest: unknown[]) => wrap(f => writeKeyed.call(app.repo.hosted, keys, f, ...rest))(fn as Body);
+  const pause = armPause("hosted:tool:in-gate");
+  const read = c.client.readResource({ uri: boardUri }).then(r => JSON.stringify(r), (error: unknown) => String(error));
+  let bob: Promise<unknown> | undefined;
+  try {
+    await pause.hit;
+    pause.disarm();
+    arm = true;
+    bob = call(d, "whoami");
+    await until(() => holding);
+    pause.go();
+    await until(() => aliceQueued);
+    release();
+    await bob;
+    expect(await read).toContain("e2e");
+  } finally {
+    hosted.write = write; if (writeKeyed) hosted.writeKeyed = writeKeyed; release(); pause.restore();
+    await Promise.allSettled([read, bob]);
+  }
+});
+// #1408: a GET that attaches while a subscribe's checks await was built from the registrations before it. The subscribe
+// stops it, and the client's reconnect carries the new registration; left alone, it never joined a stream.
+for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: a GET attached while a subscribe is judged is reconnected with its registration`, async () => {
+  const c = await connect((await issue()).token, version);
+  await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
+  await call(c, "board_create", { name: "other", purpose: "fixtures" });
+  const unwatch = await watch(c, "grayboard://boards/other");
+  await until(() => app.mcp.activeWatches === 1);
+  const resume = c.pauseGets();
+  await unwatch();
+  await until(() => app.mcp.activeGetStreams === 0);
+  const pause = armPause("mcp:legacy:control-stream");
+  const subscribed = c.client.subscribeResource({ uri: boardUri });
+  try {
+    await pause.hit;
+    pause.disarm();
+    resume();
+    await until(() => app.mcp.activeGetStreams === 1);
+    pause.go();
+    await subscribed;
+    await until(() => app.mcp.activeWatches === 1);
+  } finally {
+    resume(); pause.restore();
+    await subscribed.catch(() => {});
+  }
+});
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membership loss and background storage fault close streams`, async () => {
-  const grant = issue();
-  const team = app.repo.teams.create("private", grant.authed.user_id);
-  app.repo.teams.addMember(team.id, grant.authed.user_id);
+  const grant = await issue();
+  const team = await seed(app.repo, async (tx) => {
+    const t = await app.repo.teams.create(tx, "private", grant.authed.user_id);
+    await app.repo.teams.addMember(tx, t.id, grant.authed.user_id, NO_MEMBER_AUTHORITY);
+    return t;
+  });
   const c = await connect(grant.token, version);
-  const other = await connect(issue("bob@example.com").token, version);
+  const other = await connect((await issue("bob@example.com")).token, version);
   await expect(watch(other, "grayboard://boards/private")).rejects.toThrow();
   await watch(c, "grayboard://boards/private");
   await until(() => app.mcp.activeWatches === 1);
-  app.repo.teams.removeMember(team.id, grant.authed.user_id);
+  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, grant.authed.user_id, NO_MEMBER_AUTHORITY));
   await until(() => app.mcp.activeWatches === 0);
   expect(c.hints).toEqual([]); expect(other.hints).toEqual([]);
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
   await watch(c, boardUri);
   await until(() => app.mcp.activeWatches === 1);
-  const original = app.repo.oauth.findActiveAccess;
-  app.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM private_database"); };
+  const restoreFindActiveAccess = stubAuthRead(app.repo, "findActiveAccess", original => () => { throw new Error("SELECT secret FROM private_database"); });
+  // A users commit moves the auth generation, so the next tick misses the access cache and reads the stubbed store
+  // (phase B) even if a tick stamped the listen before the stub went in (#1152 audit).
+  await seed(app.repo, tx => app.repo.users.upsertByEmail(tx, "carol@example.com", null));
   try { await until(() => app.mcp.activeWatches === 0); }
-  finally { app.repo.oauth.findActiveAccess = original; }
+  finally { restoreFindActiveAccess(); }
   expect(app.mcp.activeLeases).toBe(0);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+  expect(await app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
 });
 
 test("modern methods refuse session operations and unsupported catalog hints are not honored", async () => {
-  const c = await connect(issue().token, "2026-07-28");
+  const c = await connect((await issue()).token, "2026-07-28");
   for (const method of ["GET", "DELETE"]) {
     const headers = new Headers(c.headers); headers.set("Mcp-Protocol-Version", "2026-07-28");
     const response = await fetch(base + "/mcp", { method, headers });
@@ -366,7 +459,7 @@ test("modern methods refuse session operations and unsupported catalog hints are
 });
 
 test("modern cancellation removes isolated listener; re-listen has no automatic replay", async () => {
-  const c = await connect(issue().token, "2026-07-28");
+  const c = await connect((await issue()).token, "2026-07-28");
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
   const cancel = new AbortController();
   const sub = await c.client.listen({ resourceSubscriptions: [boardUri] }, { signal: cancel.signal });

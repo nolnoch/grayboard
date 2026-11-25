@@ -10,26 +10,117 @@
 //   system  { sessionID }      experimental.chat.system.transform; value: output.system
 //   state                      value: { logs, toasts, prompts } the fake client saw
 //   dispose
+//   abort   { key }            abort an in-flight call tagged with that key
+//   advanceClock { ms }        advance the adapter's stability clock, not its timers
+//   session { sessionID, parentID? } seed the SDK lookup without a creation event
+//   holdPrompt { key }         hold SDK channel admission before its receipt
+//   releasePrompt { key }      release that admission
+//   holdAssociation { sessionID } hold the real grayboard/session response
+//   releaseAssociation            release that response unchanged
+//   holdReadiness { sessionID } hold that root's real ready response
+//   releaseReadiness           release that response unchanged
 import { createInterface } from "node:readline";
+import { ChildProcess } from "node:child_process";
+import { z } from "zod";
 import { tool } from "@opencode-ai/plugin";
 import { GrayboardPlugin } from "../../adapters/opencode/grayboard.ts";
+import { processDescendants } from "./procs.ts";
+
+// Hold actual stdout data events, then release their original payloads only
+// after exit: Bun's node:child_process stdout ignores Readable.pause().
+const children: ChildProcess[] = [];
+const spawnOwners: number[][] = [];
+type HeldStdout = { child: ChildProcess; emit: ChildProcess["emit"]; chunks: unknown[][] };
+const RequestSchema = z.object({ id: z.number().optional(), method: z.string(), params: z.record(z.string(), z.unknown()).optional() }).passthrough();
+const ResponseSchema = z.object({ id: z.number().optional() }).passthrough();
+const rpcRequests: z.infer<typeof RequestSchema>[] = [];
+let associationGate: { sessionID: string; response?: string; release?: () => void } | undefined;
+let readinessGate: { sessionID: string; response?: string; release?: () => void } | undefined;
+const heldStdout = new Map<string, HeldStdout>();
+const emit = ChildProcess.prototype.emit;
+ChildProcess.prototype.emit = function (event: string | symbol, ...args: unknown[]) {
+  if (event === "spawn") {
+    children.push(this);
+    spawnOwners.push(processDescendants(process.pid).filter(p => children.some(c => c.pid === p.pid)).map(p => p.pid));
+    const write = this.stdin!.write;
+    this.stdin!.write = function (this: unknown, ...args: Parameters<typeof write>) {
+      for (const line of String(args[0]).split("\n").filter(Boolean)) {
+        const request = RequestSchema.parse(JSON.parse(line));
+        if (request.id !== undefined) rpcRequests.push(request);
+      }
+      return write.apply(this, args);
+    } as typeof write;
+    const stdout = this.stdout!;
+    const streamEmit = stdout.emit;
+    let buffered = "";
+    stdout.emit = function (event: string | symbol, ...payload: unknown[]) {
+      if (event !== "data") return streamEmit.call(this, event, ...payload);
+      if (!associationGate && !readinessGate && !buffered) return streamEmit.call(this, event, ...payload);
+      buffered += String(payload[0]);
+      let nl: number;
+      while ((nl = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, nl + 1);
+        buffered = buffered.slice(nl + 1);
+        const response = ResponseSchema.parse(JSON.parse(line));
+        const request = rpcRequests.findLast(r => r.id === response.id);
+        const gate = associationGate;
+        if (gate && request?.method === "grayboard/session" && request.params?.session === gate.sessionID) {
+          gate.response = line;
+          gate.release = () => { streamEmit.call(stdout, "data", line); };
+        } else {
+          const ready = readinessGate;
+          const selected = rpcRequests.findLast(r => r.method === "grayboard/session" && r.params?.epoch === request?.params?.epoch);
+          if (ready && request?.method === "grayboard/session/ready" && selected?.params?.session === ready.sessionID) {
+            ready.response = line;
+            ready.release = () => { streamEmit.call(stdout, "data", line); };
+          } else streamEmit.call(stdout, "data", line);
+        }
+      }
+      return true;
+    };
+  }
+  return emit.call(this, event, ...args);
+};
 
 const logs: { level: string; message: string }[] = [];
 const toasts: string[] = [];
-const prompts: { session: string; text: string; noReply: boolean }[] = [];
+const prompts: { session: string; messageID?: string; text: string; noReply: boolean }[] = [];
+const restartOwners: { message: string; pids: number[] }[] = [];
+const sessions = new Map<string, { id: string; parentID?: string }>();
+const deletedSessions = new Set<string>();
+let promptGate: { key: string; promise: Promise<void>; resolve(): void } | undefined;
+const pendingPrompts = new Set<string>();
 const client = {
   app: { log: async ({ body }: any) => (logs.push({ level: body.level, message: body.message }), {}) },
-  tui: { showToast: async ({ body }: any) => (toasts.push(body.message), {}) },
+  tui: { showToast: async ({ body }: { body: { message: string } }) => {
+    toasts.push(body.message);
+    if (body.message.includes("restarting it (") || body.message.includes("after 3 restarts")) {
+      // Ignore the observing ps process; these are the actual MCP children,
+      // including a shell stub that exec'd sleep under the same pid.
+      restartOwners.push({ message: body.message, pids: processDescendants(process.pid).filter(p => children.some(c => c.pid === p.pid)).map(p => p.pid) });
+    }
+    return {};
+  } },
   session: {
+    get: async ({ path }: { path: { id: string } }) => deletedSessions.has(path.id)
+      ? { error: { name: "NotFoundError" } }
+      : { data: sessions.get(path.id) ?? { id: path.id } },
     promptAsync: async ({ path, body }: any) => {
-      prompts.push({ session: path.id, text: body.parts.map((p: any) => p.text).join(""), noReply: !!body.noReply });
+      const gate = promptGate;
+      if (gate) {
+        pendingPrompts.add(path.id);
+        try { await gate.promise; } finally { pendingPrompts.delete(path.id); }
+      }
+      prompts.push({ session: path.id, messageID: body.messageID, text: body.parts.map((p: { text?: string }) => p.text).join(""), noReply: !!body.noReply });
       return {};
     },
   },
 };
 
 let hooks: any;
-const ctx = (sessionID = "s1") => ({ sessionID, messageID: "m1", agent: "build", directory: process.cwd(), worktree: process.cwd(), abort: new AbortController().signal, metadata() {}, ask: async () => {} });
+const calls = new Map<string, AbortController>();
+const now = Date.now;
+const ctx = (sessionID = "s1", abort = new AbortController().signal) => ({ sessionID, messageID: "m1", agent: "build", directory: process.cwd(), worktree: process.cwd(), abort, metadata() {}, ask: async () => {} });
 
 async function run(msg: any): Promise<unknown> {
   switch (msg.op) {
@@ -40,10 +131,91 @@ async function run(msg: any): Promise<unknown> {
     }
     case "config":
       return hooks.config(msg.cfg);
-    case "event":
+    case "event": {
+      if (msg.event.type === "message.updated") {
+        msg.event.properties.info.id ??= `msg_${Date.now().toString(16).padStart(12, "0")}${msg.id.toString(16).padStart(14, "0")}`;
+      }
+      if (msg.event.type === "session.created" || msg.event.type === "session.updated") {
+        const s = msg.event.properties.info;
+        sessions.set(s.id, s);
+        deletedSessions.delete(s.id);
+      } else if (msg.event.type === "session.deleted") {
+        const id = msg.event.properties.info.id;
+        sessions.delete(id);
+        deletedSessions.add(id);
+      }
       return hooks.event({ event: msg.event });
-    case "call":
-      return hooks.tool[msg.tool].execute(msg.args, ctx());
+    }
+    case "session":
+      sessions.set(msg.sessionID, { id: msg.sessionID, ...(msg.parentID ? { parentID: msg.parentID } : {}) });
+      return;
+    case "call": {
+      const controller = new AbortController();
+      const key = String(msg.key ?? msg.id);
+      calls.set(key, controller);
+      try { return await hooks.tool[msg.tool].execute(msg.args, ctx(msg.sessionID, controller.signal)); }
+      finally { calls.delete(key); }
+    }
+    case "abort":
+      calls.get(msg.key)?.abort();
+      return;
+    case "advanceClock":
+      Date.now = () => now() + msg.ms;
+      return;
+    case "holdPrompt": {
+      if (promptGate) throw new Error("prompt admission already held");
+      promptGate = { key: msg.key, ...Promise.withResolvers<void>() };
+      return;
+    }
+    case "releasePrompt": {
+      if (!promptGate || promptGate.key !== msg.key) throw new Error("no held prompt admission");
+      const gate = promptGate;
+      promptGate = undefined;
+      gate.resolve();
+      return;
+    }
+    case "holdAssociation":
+      if (associationGate) throw new Error("association response already held");
+      associationGate = { sessionID: msg.sessionID };
+      return;
+    case "releaseAssociation": {
+      const gate = associationGate;
+      if (!gate?.release) throw new Error("no association response held");
+      associationGate = msg.nextSessionID ? { sessionID: msg.nextSessionID } : undefined;
+      gate.release();
+      return;
+    }
+    case "holdReadiness":
+      if (readinessGate) throw new Error("readiness response already held");
+      readinessGate = { sessionID: msg.sessionID };
+      return;
+    case "releaseReadiness": {
+      const gate = readinessGate;
+      readinessGate = undefined;
+      gate?.release?.();
+      return;
+    }
+    case "holdStdout": {
+      const child = children.at(-1);
+      if (!child?.stdout) throw new Error("no child stdout to hold");
+      const streamEmit = child.stdout.emit;
+      const chunks: unknown[][] = [];
+      child.stdout.emit = function (event: string | symbol, ...args: unknown[]) {
+        if (event === "data") { chunks.push(args); return true; }
+        return streamEmit.call(this, event, ...args);
+      };
+      heldStdout.set(msg.key, { child, emit: streamEmit, chunks });
+      return;
+    }
+    case "releaseStdout": {
+      const held = heldStdout.get(msg.key);
+      if (!held?.child.stdout) throw new Error("no held child stdout");
+      heldStdout.delete(msg.key);
+      const stdout = held.child.stdout;
+      stdout.emit = held.emit;
+      for (const chunk of held.chunks) held.emit.call(stdout, "data", ...chunk);
+      return;
+    }
     case "parse":
       // What opencode's runtime hands execute: the args through the tool's zod.
       return tool.schema.object(hooks.tool[msg.tool].args).parse(msg.args);
@@ -53,7 +225,7 @@ async function run(msg: any): Promise<unknown> {
       return output.system;
     }
     case "state":
-      return { logs, toasts, prompts };
+      return { logs, toasts, prompts, calls: [...calls.keys()], restartOwners, spawnOwners, pendingPrompts: [...pendingPrompts], heldAssociation: associationGate?.response ? associationGate.sessionID : undefined, heldReadiness: readinessGate?.response ? readinessGate.sessionID : undefined };
     case "dispose":
       return hooks.dispose();
   }

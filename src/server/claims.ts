@@ -1,0 +1,278 @@
+// The server's claim tools and steps (#807 P3 B5b3b, B5b3c): core's claim_take, claim_release, claim_watch, sweep and
+// queue requeue over the store's rows on the caller's Tx, judged by the async BoardAccess on that same Tx. Every rule and text is core's (expiredText, unclaimedText,
+// orderLanes, requeuePick, holderUserRule, endReachRule), so local and the server announce alike and only the reads differ.
+import { addressParts } from "../core/addresses.ts";
+import { orderLanes, REDELIVERED_NOTE, requeuePick } from "../core/boards.ts";
+import {
+  alreadyReleasedText, checkMove, endReachRule, isQueueKey, moves, queuePostOrder, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
+  releasedText, releaseRefusal, releaseText, renewAnnounces, takeDecision, unclaimedText, updateText, validKey, watching, watchNoBoard,
+  watchNoClaim, watchOwn, type Claim, type ClaimChanges, type ClaimCtx, type ClaimResult, type ClaimRow, type TakeOpts,
+} from "../core/claims.ts";
+import { CoreError } from "../core/errors.ts";
+import { claimTakeArgs, optBool, optStr, str, type ToolContext, type ToolOutcome } from "../core/tools.ts";
+import type { BoardAccess } from "./access.ts";
+import { seenAmong, systemPost } from "./board_post.ts";
+import type { Repo } from "./db.ts";
+import type { Read, Tx } from "./store/tx.ts";
+
+/**
+ * The caller's hook for an announcement its own claim call wrote: a take's claim, a renewal's update or a release,
+ * post `postId`, posted as `as` on `board` within `sp`. On a service's board that post is an invocation (#270 D6, #1259), which only the caller can
+ * record, since it knows who asked. A lapse, a requeue's reply, a session end's release and a release posted for the
+ * claimant's user (endReach, #1286) are the system's: no hook.
+ */
+export type Announced = (sp: Tx, as: string, board: string, postId: number) => Promise<void>;
+// `now`: the caller's clock reading, when its transaction already took one (a session end); else the Repo's.
+type ServerClaimCtx = ClaimCtx & { announced?: Announced; now?: number };
+
+/**
+ * core sweepChanges on `tx`: delete the claims lapsed at `now` and, per claim in lapse order, log its expiry, then
+ * requeue a queue post's claim or announce the lapse on the claim's board, its watchers cc'd. The delete makes each
+ * lapse announce once, however many sweep. A holder who lost the board lapses for its user, or quietly (core
+ * endReachRule, #1286); its watches go all the same.
+ */
+export async function sweepClaims(repo: Repo, access: BoardAccess, tx: Tx, now: number): Promise<ClaimChanges> {
+  const wake = new Set<string>();
+  const boards = new Set<string>();
+  for (const c of queuePostOrder(await repo.claims.expire(tx, now), (c) => c.key)) {
+    await repo.claims.logEvent(tx, "expire", c.holder, c, now);
+    let changed: ClaimChanges;
+    if (c.key.startsWith("queue:")) {
+      changed = await requeue(repo, access, tx, c, now);
+    } else {
+      const cc = await repo.claims.takeWatchers(tx, c.key);
+      const end = await endReach(repo, access, tx, c);
+      if (!end) continue;
+      changed = await systemPost(repo, access, tx, c.holder, end.board, expiredText(c.key, c.holder, cc), null, {
+        allowArchived: true, user: end.user ?? (await repo.claims.holderUser(tx, c)), seenBy: end.user,
+      });
+    }
+    for (const h of changed.wake) wake.add(h);
+    for (const b of changed.boards) boards.add(b);
+  }
+  return { wake: [...wake], boards: [...boards] };
+}
+
+/** The refusal of a claim take by an ID that has ended (#807 P3 C10d2-b, E4). */
+export const endedClaimText = (id: string) => `session ${id} has ended; it can't take a claim`;
+
+/**
+ * core requeue on `tx`: a queue post's claim ended (a lapse, or a decline in `ctx`'s name). Its watches go; the post goes
+ * to the next lane that hasn't held it, presence-blind; with none left, an `[unclaimed]` reply in its thread. A holder
+ * who lost the board ends it as serverRelease does (core endReachRule, #1286): the reply is posted for the claimant's
+ * user when that user still sees the board, never as the caller's session. When neither can write it (or a human
+ * holds it), or it's refused (a CoreError, its savepoint rolled back), the post's own author writes it unless it's a
+ * human (#1175), else nothing; the rest is kept.
+ */
+export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimRow, now: number, ctx: ClaimCtx = {}): Promise<ClaimChanges> {
+  const cc = await repo.claims.takeWatchers(tx, c.key);
+  const f = await repo.boards.redeliveryFacts(tx, c.key, c.holder);
+  if (!f) return { wake: [], boards: [] };
+  const rows = await repo.boards.laneRows(tx, f.board.name, f.poster);
+  const viewers = await repo.bindings.viewerIds(tx);
+  const sees = rows.length ? await access.canSeeMany(tx, rows, f.board) : new Set<string>();
+  const lanes = rows.length ? await access.lanesAmong(tx, rows, f.board) : new Set<string>();
+  const lane = requeuePick(orderLanes(rows, (h) => viewers.has(h), (h) => sees.has(h), (h) => lanes.has(h)), f.held);
+  if (lane) {
+    // false: the key was taken (another pod's sweep, on Postgres: no push for the lane), or the lane already held it
+    // (a manual claim_take of the queue: key; its push is reset, undelivered and waking, for its next drain). Either
+    // way this run wakes nobody.
+    const took = await repo.boards.claimQueuePost(tx, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE, push: true });
+    return { wake: took ? [lane] : [], boards: [] };
+  }
+  const text = unclaimedText(c.key, f.takers, cc);
+  const refusedAsNull = async (o: Parameters<typeof systemPost>[7], as: string): Promise<ClaimChanges | null> => {
+    try {
+      return await tx.savepoint((sp) => systemPost(repo, access, sp, as, f.board.name, text, f.postId, o));
+    } catch (e) {
+      if (e instanceof CoreError) return null;
+      throw e;
+    }
+  };
+  // Judged on the post's board, the key's, which claimQueuePost also recorded as the claim's; never as a human (core requeue).
+  const end = (await repo.aliases.isHuman(tx, c.holder)) ? null : await endReach(repo, access, tx, { ...c, board: f.board.name });
+  if (end) {
+    // The system's reply for the claimant's user: no caller's session, via or name set reaches it.
+    const opts = end.user
+      ? { allowArchived: true, user: end.user, seenBy: end.user }
+      : { allowArchived: true, session: ctx.session, via: ctx.via, addresses: ctx.addresses, user: ctx.user ?? (await repo.claims.holderUser(tx, c)) };
+    const done = await refusedAsNull(opts, c.holder);
+    if (done) return done;
+  }
+  // The post's own author, as its post's writer, so its address set is kept out of its own fan-out (core requeue).
+  if (await repo.aliases.isHuman(tx, f.author.handle)) return { wake: [], boards: [] };
+  const done = await refusedAsNull(
+    { allowArchived: true, session: f.author.id ?? undefined, user: f.author.user ?? undefined }, f.author.handle,
+  );
+  return done ?? { wake: [], boards: [] };
+}
+
+/**
+ * core endReach on `r`: the board claim `c`'s end is announced on and, when its holder lost the board but the
+ * claimant's user (#855) still sees it, that user, for whom the end is posted in fixed text (core endReachRule, #1286).
+ * Null for a quiet end. Read from the claim row alone, never from a caller.
+ */
+async function endReach(repo: Repo, access: BoardAccess, r: Read, c: ClaimRow): Promise<{ board: string; user?: string } | null> {
+  const b = c.board ? await repo.boards.get(r, c.board) : undefined;
+  const holderSees = !!b && (await access.canSee(r, c.holder, b));
+  const user = b && !holderSees ? await repo.claims.holderUser(r, c) : undefined;
+  const via = endReachRule(c.board, holderSees, user, !!b && user !== undefined && (await access.userSees(r, user, b)));
+  if (via === null) return null;
+  return via === "holder" ? { board: c.board! } : { board: c.board!, user: user! };
+}
+
+/** core canSeeBoard on `r`: the board exists and `handle` may see it. */
+async function boardVisible(repo: Repo, access: BoardAccess, r: Read, handle: string, name: string): Promise<boolean> {
+  const b = await repo.boards.get(r, name);
+  return !!b && (await access.canSee(r, handle, b));
+}
+
+/** core callBoardTool's claim arms on `tx`: the same arguments read in the same order, the same answers. */
+export async function callClaimTool(
+  repo: Repo, access: BoardAccess, tx: Tx, actor: string, tool: "claim_take" | "claim_release" | "claim_watch", a: Record<string, unknown>,
+  ctx: ToolContext & { announced?: Announced },
+): Promise<ToolOutcome> {
+  const who: ServerClaimCtx = { addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user, announced: ctx.announced };
+  switch (tool) {
+    case "claim_take": {
+      const { key, ...take } = claimTakeArgs(a);
+      const { wake, boards, ...result } = await serverClaim(repo, access, tx, actor, key, { ...take, ...who });
+      return { result, wake, boards };
+    }
+    case "claim_release": {
+      const key = str(a, "key");
+      const { wake, boards, releasedAt } = await serverRelease(repo, access, tx, actor, key, optStr(a, "note"), who);
+      return { result: releasedAt === undefined ? releasedText(key) : alreadyReleasedText(releasedAt), wake, boards };
+    }
+    case "claim_watch":
+      return { result: await serverWatch(repo, access, tx, actor, str(a, "key"), optBool(a, "off"), ctx.addresses, ctx.session ?? actor), wake: [] };
+  }
+}
+
+/** Whether `seer` may not see that `holder` exists (core holderHidden). */
+async function holderHidden(repo: Repo, access: BoardAccess, r: Read, seer: string, holder: string): Promise<boolean> {
+  return !(await seenAmong(repo, access, r, seer, [holder])).has(holder);
+}
+
+/**
+ * core claim on `tx`, in a savepoint as core's own transaction was: a refusal after a write (a renewal moving onto an
+ * archived board, a [claim] its board's gate refuses) rolls back the take and its sweep even when the caller answers
+ * the refusal and commits (HTTP's claimCall does).
+ */
+export async function serverClaim(
+  repo: Repo, access: BoardAccess, tx: Tx, handle: string, keyInput: string, opts: TakeOpts & ServerClaimCtx = {},
+): Promise<ClaimResult> {
+  const { key, board } = checkTake(keyInput, opts, opts.now ?? repo.now());
+  const addresses = opts.addresses ?? [handle];
+  // The acting ID's row first, under the lock a session end waits for (E4, bindings.lockLive; session_end.ts's lock
+  // order: ids before claims): a take racing the ID's end lands before it (and the end releases it) or refuses after.
+  const acting = opts.session ?? (addressParts(handle)?.kind === "id" ? handle : undefined);
+  if (acting !== undefined && (await repo.bindings.lockLive(tx, acting)) === false) throw new CoreError(endedClaimText(acting), "id_ended");
+  return tx.savepoint(async (sp): Promise<ClaimResult> => {
+    // A board that doesn't exist, or that `handle` can't see, refuses as a post to it would (#81).
+    if (board && !(await boardVisible(repo, access, sp, handle, board))) throw new CoreError(`no such board #${board}; see board_list`);
+    const now = opts.now ?? repo.now();
+    // Announce a lapsed claim before anyone takes it over.
+    const lapsed = await sweepClaims(repo, access, sp, now);
+    const held = async (cur: Claim): Promise<ClaimResult> => {
+      await repo.claims.logEvent(sp, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
+      const boardHidden = !!cur.board && !(await boardVisible(repo, access, sp, handle, cur.board));
+      return { ...heldAnswer(cur, await holderHidden(repo, access, sp, opts.session ?? handle, cur.holder), boardHidden), ...lapsed };
+    };
+    const cur = await repo.claims.get(sp, key);
+    const d = takeDecision(cur, addresses, handle, now, opts);
+    if (d.held) return held(cur!);
+    const row = await repo.claims.take(sp, { key, as: d.as, note: opts.note ?? null, board, now, expires: d.expires, user: opts.user ?? null });
+    if (!row) return held((await repo.claims.get(sp, key))!);
+    const moved = moves(d.renewed, row, cur);
+    const archived = moved && !!(await repo.boards.get(sp, row.board!))?.archived_at;
+    checkMove(d.renewed, row, cur, archived, !moved || row.holder === handle || (await boardVisible(repo, access, sp, row.holder, row.board!)));
+    await repo.claims.logEvent(sp, d.renewed ? "renew" : "take", d.as, row, now);
+    const say = (text: string, ending: boolean) => systemPost(repo, access, sp, d.as, row.board!, text, null, {
+      allowArchived: ending, session: opts.session, via: opts.via, user: opts.user,
+    });
+    let changed: ClaimChanges = { wake: [], boards: [] };
+    if (!d.renewed) {
+      if (row.board) {
+        const said = await say(claimText(key, row.note), false);
+        await opts.announced?.(sp, d.as, row.board, said.postId);
+        changed = said;
+      }
+    } else if (renewAnnounces(opts.note, cur) && row.board && (await boardVisible(repo, access, sp, d.as, row.board))) {
+      const said = await say(updateText(key, opts.note!, await repo.claims.watchers(sp, key)), true);
+      await opts.announced?.(sp, d.as, row.board, said.postId);
+      changed = said;
+    }
+    return {
+      ok: true, claim: row, renewed: d.renewed,
+      wake: [...new Set([...lapsed.wake, ...changed.wake])],
+      boards: [...new Set([...lapsed.boards, ...changed.boards])],
+    };
+  });
+}
+
+/** core release on `tx`, in a savepoint as core's own transaction was (serverClaim says why). */
+export async function serverRelease(
+  repo: Repo, access: BoardAccess, tx: Tx, handle: string, keyInput: string, note?: string, ctx: ServerClaimCtx = {},
+): Promise<ClaimChanges & { releasedAt?: number }> {
+  const key = checkRelease(keyInput, note);
+  const addresses = ctx.addresses ?? [handle];
+  return tx.savepoint(async (sp) => {
+    const now = ctx.now ?? repo.now();
+    const refuse = async (cur: ClaimRow | undefined) => {
+      const releasedAt = releasedByRule(await repo.claims.recentEvents(sp, key), key, addresses);
+      if (releasedAt !== undefined) return { wake: [], boards: [], releasedAt };
+      // A queue post's claim on a board the caller can't see answers as no claim: its key names the board (#270 D5).
+      if (cur && isQueueKey(key) && !(cur.board && (await boardVisible(repo, access, sp, handle, cur.board)))) throw releaseRefusal(key, undefined, now, false);
+      const live = !!cur && cur.expires_at > now;
+      throw releaseRefusal(key, cur, now, live && (await holderHidden(repo, access, sp, ctx.session ?? handle, cur!.holder)));
+    };
+    const cur = await repo.claims.get(sp, key);
+    if (!releasable(cur, addresses, now)) return refuse(cur);
+    const gone = await repo.claims.release(sp, key, cur!.holder, now);
+    if (!gone) return refuse(await repo.claims.get(sp, key));
+    const as = gone.holder;
+    await repo.claims.logEvent(sp, "release", as, { ...gone, note: note ?? null }, now);
+    // A declined queue post goes to the next lane with the original post, unannounced (#192 review).
+    if (key.startsWith("queue:")) return requeue(repo, access, sp, gone, now, ctx);
+    const cc = await repo.claims.takeWatchers(sp, key);
+    // A holder who lost the board releases for its user, without the note, or quietly (core endReachRule, #1286);
+    // its watchers go either way, since they're told through the board.
+    const end = await endReach(repo, access, sp, gone);
+    if (!end) return { wake: [], boards: [] };
+    if (end.user) {
+      // The system's post for the claimant's user: no caller's note, session or hook reaches it, so the caller's
+      // answer and its own deliveries are a quiet release's.
+      const { postId: _, ...changed } = await systemPost(repo, access, sp, as, end.board, releaseText(key, undefined, cc), null, {
+        allowArchived: true, user: end.user, seenBy: end.user,
+      });
+      return changed;
+    }
+    // A release with no signed-in caller posts as the claimant's user (#855).
+    const { postId, ...changed } = await systemPost(repo, access, sp, as, end.board, releaseText(key, note, cc), null, {
+      allowArchived: true, session: ctx.session, via: ctx.via, user: ctx.user ?? (await repo.claims.holderUser(sp, gone)),
+    });
+    await ctx.announced?.(sp, as, end.board, postId);
+    return changed;
+  });
+}
+
+/** core watch on `tx`: its checks in order, then the watch. */
+export async function serverWatch(
+  repo: Repo, access: BoardAccess, tx: Tx, handle: string, keyInput: string, off = false, addresses: string[] = [handle], seer: string = handle,
+): Promise<string> {
+  const key = validKey(keyInput);
+  if (off) {
+    await repo.claims.unwatch(tx, key, handle);
+    return notWatching(key);
+  }
+  const cur = await repo.claims.liveForWatch(tx, key, repo.now());
+  // A queue post's claim on a board the caller can't see answers as no claim: its key names the board (#270 D5).
+  if (!cur || (isQueueKey(key) && !(cur.board && (await boardVisible(repo, access, tx, handle, cur.board))))) throw watchNoClaim(key);
+  if (addresses.includes(cur.holder)) throw watchOwn(key);
+  if (!cur.board || !(await boardVisible(repo, access, tx, handle, cur.board))) {
+    throw watchNoBoard(key, (await holderHidden(repo, access, tx, seer, cur.holder)) ? null : cur.holder);
+  }
+  await repo.claims.addWatch(tx, key, handle);
+  return watching(key, cur.board);
+}

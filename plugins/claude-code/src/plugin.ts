@@ -7,27 +7,40 @@
 // lease (hosted-core's RootDelivery) only when Claude Code will show its
 // channel notifications (the shared rule, src/shared/claude_channels.ts).
 //
-// Claude Code runs one plugin process per session, and its subagents and
-// in-process work call through it, so they act as the root. The process
-// keeps CLAUDE_CODE_SESSION_ID across /clear (a reconnect starts a new one).
+// Claude Code runs one plugin process per session, and its subagents call
+// through it. The plugin's hooks (hooks/hooks.json, dist/hook.js) record which
+// agent made each grayboard call, keyed by its tool_use_id (#551,
+// src/shared/claude_agents.ts): a subagent's call runs as a child session
+// registered under this root, a main-agent call as the root, and a call with
+// no record is refused, never attributed to the root. The process keeps
+// CLAUDE_CODE_SESSION_ID across /clear (a reconnect starts a new one).
 //
 // The server stays on MCP SDK 1.x: Claude Code skips a channel whose session
 // negotiated protocol 2026-07-28 or later, and 1.x tops out at 2025-11-25.
 import { randomUUID } from "node:crypto";
+import { mkdirSync, watch, type FSWatcher } from "node:fs";
+import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult as ServerResult, type Tool as ListedTool } from "@modelcontextprotocol/sdk/types.js";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams } from "../../../adapters/hosted-core/src/channel.ts";
 import { HostedClient, message } from "../../../adapters/hosted-core/src/client.ts";
-import { Login, LoginFailed } from "../../../adapters/hosted-core/src/login.ts";
+import { Login, LoginFailed, type SignIn } from "../../../adapters/hosted-core/src/login.ts";
 import { accessExpiry } from "../../../adapters/hosted-core/src/model.ts";
+import * as signIns from "../../../adapters/hosted-core/src/offer.ts";
+import type { Flow, SignInState } from "../../../adapters/hosted-core/src/offer.ts";
 import { failure, hostTools, snapshotTools, type NativeTool } from "../../../adapters/hosted-core/src/proxy.ts";
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
+import { NEW_RUN, StaticLogin, staticMode } from "../../../adapters/hosted-core/src/static.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
+import { dropCalled, dropSignIn, factReader, hasCalled, markCalled, ownDir, MISSING_TEXT, putSignIn, readFacts, sessionDir, takeCalled, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
+import { SIGN_IN_FLOW_MS } from "../../../src/shared/signin.ts";
+import { testPauseAsync } from "../../../src/shared/testpause.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
-import { describeLocation } from "../../../src/shared/identity.ts";
+import { configuredIdentity, describeLocation, sessionIdentity } from "../../../src/shared/identity.ts";
+import { validSourceId } from "../../../src/shared/session_meta.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
 
 export const HARNESS = "Claude Code";
@@ -37,10 +50,16 @@ export const SOURCE = "plugin:grayboard:grayboard";
 export const ENTRY = `plugin:${CLAUDE_PLUGIN}` as const;
 export const RESUME_HINT = "call any grayboard tool to retry";
 // How each kind of session signs in, for AccessExpired and the instructions.
-export const LOGIN_INTERACTIVE = "approve the grayboard sign-in Claude Code shows (any grayboard tool call offers it again)";
+export const LOGIN_INTERACTIVE = "open the sign-in link Claude Code shows under a grayboard tool call, or approve the sign-in prompt Claude Code shows";
 export const LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 const INSTRUCTIONS_MS = 5_000;
-const FLOW_MS = 10 * 60_000;
+// Claude Code 2.1.316 answers an elicitation that lands while it is still
+// wiring the connection with an immediate cancel, never shown. A cancel this
+// fast came from that handler, not a person: the prompt is sent again, up to
+// RESENDS times, RESEND_MS apart, while the flow is still open.
+const UNSHOWN_MS = 1_000;
+const RESEND_MS = 500;
+const RESENDS = 3;
 
 export type PluginOptions = {
   env: Record<string, string | undefined>;
@@ -48,6 +67,10 @@ export type PluginOptions = {
   files: ClaudeFiles;
   version: string;
   cwd: string;
+  // Claude Code's process (this server's parent) and its start time, read once
+  // at startup: the hooks' record dir is keyed by it (CLAUDE_PID), and a dir
+  // whose start differs is a recycled pid's.
+  claude: { pid: number; start: string | null };
   log(message: string): void; // stderr: Claude Code keeps it in the MCP log
 };
 
@@ -70,10 +93,17 @@ export function pluginConfig(env: Record<string, string | undefined>): Config {
   if (!canonicalEndpoint(url)) return { error: `the grayboard plugin's server_url isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; ${reconfigure}` };
   return { id, dataDir, url };
 }
+// Static mode (#1243) from the launcher's environment, refused when the
+// project's dotenv or `.claude/settings*.json` sets its variables: both reach
+// this process.
+// Both the project dir and cwd, when they differ: CLAUDE_PROJECT_DIR is itself an environment variable.
+export const pluginStaticMode = (env: Record<string, string | undefined>, cwd: string) => staticMode(env, cwd, [...(env.CLAUDE_PROJECT_DIR ? [env.CLAUDE_PROJECT_DIR] : []), cwd]);
+export const STATIC_LOGOUT = "This run uses a launcher-set grayboard run token: nothing to sign out here; the launcher revokes it.";
 export function createPlugin(o: PluginOptions): Plugin {
   const config = pluginConfig(o.env);
   const interactive = interactiveClaude(o.env, o.parentCmd);
-  const loginAction = interactive ? LOGIN_INTERACTIVE : LOGIN_ELSEWHERE;
+  const mode = "error" in config ? undefined : pluginStaticMode(o.env, o.cwd);
+  const loginAction = mode ? NEW_RUN : interactive ? LOGIN_INTERACTIVE : LOGIN_ELSEWHERE;
   // Unknown counts as off: a push Claude Code doesn't show would be receipted and lost.
   const verdict: ChannelsVerdict = claudeChannels({ env: o.env, parentCmd: o.parentCmd, entry: ENTRY, files: o.files });
   const push = verdict.state === "on";
@@ -81,6 +111,11 @@ export function createPlugin(o: PluginOptions): Plugin {
   // first tool result and stderr each say it once, as the local servers do.
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
   const place = describeLocation(o.cwd) ?? HARNESS;
+  // An explicit BUS_IDENTITY: this session binds it at its first start (#443).
+  const configured = configuredIdentity(o.env, o.cwd);
+  // The name local mode would suggest here (#522): the pin or the repo's, with the worktree suffix. None when the
+  // directory gives no name (defaultIdentity throws).
+  const suggestion = (() => { try { return sessionIdentity(o.env, o.cwd); } catch { return undefined; } })();
   // Attachments come from and go to the session's directory and the project's.
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...(project ? attachRoots({}, project) : [])])];
@@ -89,7 +124,12 @@ export function createPlugin(o: PluginOptions): Plugin {
   let closed = false;
   let initialized = false;
   const { promise: ready, resolve: markInitialized } = Promise.withResolvers<void>();
-  let signingIn: { abort: AbortController; done: Promise<void> } | undefined;
+  // This process's sign-in record (hosted-core offer.ts), and each flow's
+  // open elicitation: one live prompt, withdrawn once the browser answers or
+  // the flow shows another URL (a waiter's next holder's).
+  type Prompt = { id: string; withdraw: AbortController };
+  const signins: SignInState = {};
+  const prompts = new WeakMap<Flow, Prompt>();
 
   // Made by connect(), once its initialize instructions are known: the 1.x
   // Server answers initialize from its constructor's options. Everything
@@ -100,40 +140,90 @@ export function createPlugin(o: PluginOptions): Plugin {
 
   // ---- sign-in ----
 
-  const login = "error" in config ? undefined : new Login({
+  const login: SignIn | undefined = "error" in config ? undefined
+    : mode ? new StaticLogin({ resource: config.url, clientId: CLIENT_ID, version: o.version, harness: HARNESS, mode })
+    : new Login({
     resource: config.url, clientId: CLIENT_ID, stateDir: config.dataDir, harness: HARNESS, loginAction,
-    // MCP URL elicitation: Claude Code asks the user to open the authorization
-    // URL. A decline ends this flow; the next tool call offers it again.
-    present: async url => {
-      const abort = signingIn?.abort.signal;
-      if (!server!.getClientCapabilities()?.elicitation?.url) {
-        // Claude Code switched URL elicitation off (tengu_mcp_url_elicitation):
-        // the next tool result carries the URL instead.
-        const text = `open ${url} to sign in to grayboard`;
-        root?.noticeOnce(text, "last");
-        say(text);
-        return;
+    // Every grayboard call while the flow runs shows the URL under the call
+    // (#497: Claude Code may never show the prompt, or show it only after the
+    // result): the hook after the call prints it as the user's line, never the
+    // model's (#500), so it is written before the waiting call's result
+    // returns. Where it can, Claude Code also asks the user to open it (MCP
+    // URL elicitation); a decline ends the flow and the next call starts one.
+    // A session waiting on another process's flow gets that flow's URL too.
+    present: async (url, answered) => {
+      const flow = signins.flow;
+      await testPauseAsync("claude-sign-in-present", o.env);
+      try { putSignIn(config.dataDir, o.claude.pid, url); }
+      catch (error) { say(`couldn't save the sign-in link for the hook to show: ${message(error)}; approve the sign-in prompt, or open the link in this log`); }
+      signIns.present(signins, url);
+      say(`open ${url} to sign in to grayboard`);
+      // Claude Code switched URL elicitation off (tengu_mcp_url_elicitation): the link alone.
+      if (!server!.getClientCapabilities()?.elicitation?.url) return;
+      // Login calls present only inside login(), which begin()'s signIns.start
+      // runs after setting the flow, so there always is one (#506).
+      if (!flow) return;
+      for (let sent = 0; ; sent++) {
+        const prompt: Prompt = { id: randomUUID(), withdraw: new AbortController() };
+        prompts.get(flow)?.withdraw.abort();
+        prompts.set(flow, prompt);
+        say(`sign-in prompt sent (elicitation ${prompt.id})`);
+        const start = Date.now();
+        let result;
+        try {
+          result = await server!.elicitInput(
+            { mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` },
+            { timeout: SIGN_IN_FLOW_MS, signal: AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) },
+          );
+        } catch (error) {
+          // Withdrawn: the browser answered first, and the flow went on without it.
+          if (prompt.withdraw.signal.aborted) return;
+          say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
+          throw error;
+        }
+        const ms = Date.now() - start;
+        say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action} after ${ms} ms`);
+        // Only a decline ends the flow: Esc (cancel) may just free the keyboard
+        // from a prompt Claude Code keeps up while the user finishes the link.
+        if (result.action === "decline") throw new LoginFailed("sign-in declined");
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS) return;
+        if (sent >= RESENDS) { say(`sign-in prompt cancelled unshown ${sent + 1} times; the link Claude Code shows under each grayboard call remains`); return; }
+        say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
+        await after(RESEND_MS);
+        await testPauseAsync("claude-sign-in-resend", o.env);
+        // The flow ended (signed in, failed, aborted) while waiting: nothing to ask.
+        if (signins.flow !== flow || flow.abort.signal.aborted) { say("sign-in ended before the prompt was sent again"); return; }
+        // The browser answered and the code exchange is still running: the
+        // prompt would name a used callback (#506).
+        if (answered?.aborted) { say("the browser answered before the prompt was sent again"); return; }
+        // A later URL's prompt replaced this one.
+        if (prompts.get(flow) !== prompt) return;
       }
-      const elicitationId = randomUUID();
-      const result = await server!.elicitInput(
-        { mode: "url", elicitationId, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` },
-        { timeout: FLOW_MS, ...(abort ? { signal: abort } : {}) },
-      );
-      if (result.action !== "accept") throw new LoginFailed(result.action === "decline" ? "sign-in declined" : "sign-in cancelled");
-      complete = () => server!.createElicitationCompletionNotifier(elicitationId)().catch(() => {});
     },
-    notify: message => say(message),
+    notify: message => {
+      say(message);
+      signIns.notify(signins, message);
+    },
+    // The link file's records (refused, unshared) only to the user's log:
+    // the model can't act on them (#592).
     diagnostic: record => {
       if (record.state !== "degraded" && record.state !== "paused") return;
-      root?.noticeOnce(record.message, "last");
+      if (record.operation !== "login_link") root?.noticeOnce(record.message, "last");
       say(record.message);
     },
   });
-  let complete: (() => Promise<void>) | undefined;
 
-  const client = login && new HostedClient({
+  // A bad fact file is left out (the other fact still goes) and, like a hook's
+  // failure to write one, said once until a read finds it fixed (#561).
+  const facts = "error" in config ? undefined : factReader(bad => readFacts(config.dataDir, o.claude.pid, o.claude.start, bad), say);
+  const client = "error" in config || !login ? undefined : new HostedClient({
     harness: HARNESS, clientId: CLIENT_ID, version: o.version, login, source: SOURCE,
-    loginAction, resumeHint: RESUME_HINT, retryHint: RESUME_HINT, roots, env: o.env, log: message => say(message),
+    loginAction, resumeHint: RESUME_HINT, retryHint: RESUME_HINT, roots, env: o.env, launcher: o.env.BUS_LAUNCHER === "1", log: message => say(message),
+    // The root's model and effort as the hooks last wrote them (#545), read per
+    // request; a child session reports none (no hook names a subagent's model).
+    facts: sessionID => sessionID === config.id ? facts?.() : undefined,
+    // The root's suggested name, local mode's (#522); a child's is the server's to ignore, so it sends none.
+    ...(suggestion ? { suggested: (sessionID: string) => sessionID === config.id ? suggestion : undefined } : {}),
   });
 
   // Resolves at `initialized`; rejects once `signal` (the run loop's) aborts.
@@ -146,7 +236,8 @@ export function createPlugin(o: PluginOptions): Plugin {
   };
 
   const root = client && !("error" in config) ? new RootDelivery(client, {
-    sessionID: config.id, stateDir: config.dataDir, place: () => place, push,
+    // Claude Code has no context-only admission: every channel notification starts a turn (#854).
+    sessionID: config.id, stateDir: config.dataDir, place: () => place, push, context: false, ...(configured && "name" in configured ? { configured: configured.name } : {}),
     // Claude Code drops a notification sent before `initialized`; the
     // Controller receipts only after this resolves, and its admission set
     // keeps a failed receipt from showing an item twice. A stop (the run
@@ -157,25 +248,50 @@ export function createPlugin(o: PluginOptions): Plugin {
     },
     onTools: () => listChanged(),
   }) : undefined;
-  if (offNotice) root?.noticeOnce(offNotice, "first");
-  // Another process's sign-in landed: this one's prompt is moot.
-  const changes = client?.onChange(signedIn => { if (signedIn) signingIn?.abort.abort(); });
-
+  const badIdentity = configured && "error" in configured ? `BUS_IDENTITY is ignored: ${configured.error}` : undefined;
+  if (badIdentity) say(badIdentity);
+  const firstNotice = [offNotice, badIdentity].filter(Boolean).join(" ");
+  if (firstNotice) root?.noticeOnce(firstNotice, "first");
   // At most one sign-in in this process; hosted-core's login lock keeps it to
-  // one across processes (a waiter shares the winner's grant). Never under
-  // -p or the SDK: the process may exit before the browser returns.
-  const signIn = () => {
-    if (!login || !root || !interactive || closed || signingIn || !initialized) return;
-    const abort = new AbortController();
-    const done = login.login(abort.signal, true).then(
-      async () => {
-        await complete?.();
-        say("signed in");
-        await root.credentialChanged();
-      },
-      error => { if (!abort.signal.aborted) say(`sign-in failed: ${message(error)}`); },
-    ).finally(() => { complete = undefined; if (signingIn?.done === done) signingIn = undefined; });
-    signingIn = { abort, done };
+  // one across processes (a waiter shares the winner's grant, and shows the
+  // winner's link meanwhile). Never under -p or the SDK: the process may exit
+  // before the browser returns.
+  const begin = (origin: "offer" | "startup"): Flow | undefined => {
+    if (signins.flow) return signins.flow;
+    if (!(login instanceof Login) || !root || !interactive || closed || !initialized) return undefined;
+    const flow = signIns.start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
+      const prompt = prompts.get(flow);
+      try {
+        // The prompt is done either way: completed if it was accepted, and
+        // withdrawn if the link the hook showed was opened instead.
+        if (outcome === "signed in") {
+          if (prompt) await server!.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
+          say(`signed in (${origin})`);
+          await root.credentialChanged();
+        } else if (outcome !== "cancelled") say(`sign-in failed (${[origin, ...(prompt ? [`elicitation ${prompt.id}`] : [])].join(", ")}): ${flow.failed}`);
+      } finally {
+        // However the flow ended, its prompt and link point at a closed callback.
+        prompt?.withdraw.abort();
+        // Only this flow's link: a later flow may have written its own.
+        if (flow.url && !("error" in config)) {
+          try { dropSignIn(config.dataDir, o.claude.pid, flow.url); }
+          catch (error) { say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60_000} minutes after it was written`); }
+        }
+      }
+    },
+    // Ends without `ended` when the store was already signed in (#592):
+    // another process's grant, which delivery restarts under now (#596).
+    current: async () => {
+      say(`sign-in not needed (${origin}): already signed in`);
+      await root.credentialChanged();
+    } });
+    return flow;
+  };
+  // What a signed-out call's result says about its sign-in (hosted-core
+  // offer.ts). The link itself never enters a result (#500).
+  const notes = {
+    started: "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again",
+    starting: "sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again",
   };
 
   // ---- tools ----
@@ -207,15 +323,81 @@ export function createPlugin(o: PluginOptions): Plugin {
   // Before each call: only a missing or expired sign-in offers one; a
   // transient failure (5xx, a refresh in progress) goes to the call, which
   // reports it.
-  const before = async (): Promise<string | undefined> => {
-    try { await login!.token(); }
-    catch (error) { if (accessExpiry(error)) { signIn(); return undefined; } }
-    return unpause();
-  };
+  // A static run offers no sign-in: its token is the launcher's to replace.
+  const before = async (): Promise<string | undefined> =>
+    (mode ? undefined : await signIns.offer(signins, login!, { interactive, begin: () => begin("offer"), notes })) ?? await unpause();
 
-  const call = async (name: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+  // ---- subagents (#551) ----
+
+  // A subagent's hosted child id: its agent id under this root's session id,
+  // unique on the server however Claude Code numbers its agents.
+  const childOf = (agent: string) => `${(config as { id: string }).id}/agent/${agent}`;
+  // SubagentStop's markers end each child's hosted session: the server's idle
+  // sweep ends only roots, so an unended child lasts until its root does.
+  // Watched once the first child call shows the session's record dir exists,
+  // or from startup when an earlier process noted a child's call (#555),
+  // and drained by every child call too, so a missed or coalesced watch event
+  // (or a failed watch, retried at that call) delays an end by one call at most.
+  let endWatch: FSWatcher | undefined;
+  const drainEnded = () => {
+    if ("error" in config || closed) return;
+    // Notes in a dir an earlier holder of this pid left aren't this session's.
+    const ours = ownDir(config.dataDir, o.claude.pid, o.claude.start);
+    for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
+      // A child id over the server's limit was refused at its call, so it has no session to end.
+      // A call this process didn't see still ends it: the plugin restarted since (#555).
+      const called = takeCalled(config.dataDir, o.claude.pid, agent) && ours;
+      if (validSourceId(childOf(agent))) void root?.endChild(childOf(agent), called);
+    }
+  };
+  const watchEnded = () => {
+    if (endWatch || "error" in config || closed) return;
+    const dir = join(sessionDir(config.dataDir, o.claude.pid), "ended");
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const watcher = watch(dir, () => drainEnded());
+      // A failed watch is dropped, so the next subagent call watches again (#555 item 10).
+      watcher.on("error", error => {
+        say(`stopped watching subagent ends: ${message(error)}; they end at the next subagent call, which watches again`);
+        watcher.close();
+        if (endWatch === watcher) endWatch = undefined;
+      });
+      endWatch = watcher;
+    } catch (error) { say(`couldn't watch subagent ends: ${message(error)}; they end at the next subagent call, or with this session`); }
+    drainEnded();
+  };
+  // A restarted plugin watches at once when an earlier process passed a subagent's call (#555).
+  if (!("error" in config) && ownDir(config.dataDir, o.claude.pid, o.claude.start) && hasCalled(config.dataDir, o.claude.pid)) watchEnded();
+
+  const call = async (name: string, args: Record<string, unknown>, meta: Record<string, unknown> | undefined): Promise<CallToolResult> => {
     if ("error" in config) return failure(config.error);
-    return root!.call(name, args, before);
+    // No tool_use_id: not a model's call (nothing to join); it acts as the root.
+    const toolUse = meta?.[TOOL_USE_META];
+    if (toolUse === undefined) return root!.call(name, args, before);
+    const taken = takeRecord(config.dataDir, o.claude.pid, o.claude.start, toolUse);
+    if ("missing" in taken) {
+      const cause = MISSING_TEXT[taken.missing];
+      say(`refused ${name} (tool_use_id ${String(toolUse).slice(0, 160)}): no agent record: ${cause}`);
+      return failure(`grayboard couldn't tell which Claude Code agent made this call (${cause}), so it didn't run. Restart Claude Code so the grayboard plugin's hooks run; hooks turned off (disableAllHooks, or managed settings that allow only managed hooks) stop every grayboard call.`);
+    }
+    if (taken.agent === null) return root!.call(name, args, before);
+    // The server takes a session id of at most 1024 characters (#555 item 15);
+    // a long session id plus a long agent id can pass that, so say why here.
+    const child = childOf(taken.agent), length = child.length;
+    if (!validSourceId(child)) {
+      say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
+      return failure(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
+    }
+    // Noted beside the records once the root takes the child, so a restarted
+    // plugin still ends it (#555); a call refused before that registers nothing.
+    const agent = taken.agent;
+    const passed = () => {
+      try { markCalled(config.dataDir, o.claude.pid, agent); }
+      catch (error) { say(`couldn't note subagent ${agent.slice(0, 160)}'s call: ${message(error)}; if this plugin restarts first, its session lasts until this one ends`); }
+    };
+    watchEnded();
+    drainEnded();
+    return root!.call(name, args, before, { child, passed });
   };
 
   const tools = (): NativeTool[] => root?.tools() ?? hostTools(snapshotTools());
@@ -227,12 +409,16 @@ export function createPlugin(o: PluginOptions): Plugin {
     );
     // The SDK 2 client's tool and result shapes are the 1.x server's, field for field.
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() as ListedTool[] }));
-    s.setRequestHandler(CallToolRequestSchema, async req => await call(req.params.name, req.params.arguments ?? {}) as ServerResult);
+    s.setRequestHandler(CallToolRequestSchema, async req => await call(req.params.name, req.params.arguments ?? {}, req.params._meta) as ServerResult);
     s.oninitialized = () => {
+      // Spends JSON-RPC request id 0 (the SDK numbers requests synchronously):
+      // the SDK's cancel handler, which Claude Code 2.1.316 bundles, ignores a
+      // cancel of id 0, so a sign-in prompt given it could never be withdrawn (#713).
+      void s.ping().catch(() => {});
       initialized = true;
       markInitialized();
       // A session without a grant offers the sign-in at once.
-      if (login && interactive) void login.token().catch(error => { if (accessExpiry(error)) signIn(); });
+      if (login && interactive && !mode) void login.token().catch(error => { if (accessExpiry(error)) begin("startup"); });
     };
     return s;
   };
@@ -250,6 +436,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   // the declared delivery; Claude Code reads instructions only at initialize.
   const instructions = async (): Promise<string> => {
     if ("error" in config) return `Warning: grayboard is unavailable: ${config.error}. Tell the user.`;
+    if (mode && "refused" in mode) return `Warning: grayboard is unavailable: ${mode.refused}. Tell the user.`;
     let body: string;
     try {
       const text = await Promise.race([root!.instructions(), after(INSTRUCTIONS_MS).then(() => { throw new Error("timeout"); })]);
@@ -270,6 +457,12 @@ export function createPlugin(o: PluginOptions): Plugin {
   };
 
   const connectTransport = async (transport: Transport) => {
+    // A link a killed predecessor left (Claude Code kills a stdio server 500 ms
+    // after stop, and a /mcp reconnect replaces it) names a closed callback.
+    if (!("error" in config)) {
+      try { dropSignIn(config.dataDir, o.claude.pid); }
+      catch (error) { say(`couldn't remove a sign-in link a previous server left: ${message(error)}`); }
+    }
     // Delivery starts (and rebinds) first, so the instructions say the bound
     // name; start() never rejects, so the race is safe.
     await Promise.race([root?.start(), after(INSTRUCTIONS_MS)]);
@@ -283,9 +476,16 @@ export function createPlugin(o: PluginOptions): Plugin {
   const shutdown = async () => {
     if (closed) return;
     closed = true;
-    changes?.dispose();
-    signingIn?.abort.abort();
+    endWatch?.close();
+    signins.flow?.abort.abort();
+    // A release ends this session and every child under it, so no later
+    // process ends them again (#555); one whose delivery another process
+    // holds ends nothing, and its notes stay.
+    const held = root?.status().held;
     await root?.shutdown("release");
+    if (root && !held && !("error" in config)) {
+      try { dropCalled(config.dataDir, o.claude.pid); } catch (error) { say(`couldn't clear subagent notes: ${message(error)}`); }
+    }
     await server?.close().catch(() => {});
   };
 

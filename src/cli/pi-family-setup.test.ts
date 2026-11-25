@@ -1,21 +1,23 @@
 // `grayboard setup` and `refresh-adapters` install pi's and omp's adapter for
-// the mode (#279, #280): local mode the local adapter and its mcp.json entry
-// (pi's disabled, omp's enabled), server mode the hosted extension bundle and
-// its config.json, with no entry. Each install removes the other variant. A
-// server URL the hosted extension would refuse changes nothing for pi, and
-// leaving a hosted install's server signs the harness out of it, revoking its
-// grant.
+// the mode (#279, #280): local mode the local adapter and its disabled
+// mcp.json entry (#523: omp's adapter serves the tools too), server mode the
+// hosted extension bundle and its config.json, with no entry. Each install
+// removes the other variant. A server URL the hosted extension would refuse
+// changes nothing for pi, and leaving a hosted install's server signs the
+// harness out of it, revoking its grant.
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
+import { adapterBundle } from "./adapters.ts" with { type: "macro" };
 
 type Harness = "pi" | "omp";
 const HARNESSES: Harness[] = ["pi", "omp"];
 const cli = join(import.meta.dir, "main.ts");
-const localSource = (h: Harness) => readFileSync(new URL(`../../adapters/${h}/grayboard.ts`, import.meta.url), "utf8");
+const OMP_LOCAL_BUNDLE = adapterBundle("omp", "local");
+const localSource = (h: Harness) => h === "omp" ? OMP_LOCAL_BUNDLE : readFileSync(new URL("../../adapters/pi/grayboard.ts", import.meta.url), "utf8");
 // Refused connections: setup's sign-out call and pi's grant revoke fail fast.
 const SERVER = "http://127.0.0.1:9";
 const CANONICAL_RULE = "canonical HTTPS (or loopback HTTP) server URL, without credentials, query or fragment";
@@ -29,12 +31,14 @@ function fixture(h: Harness = "pi") {
   mkdirSync(join(root, "bin"));
   writeFileSync(join(root, "bin", h), "#!/bin/sh\nexit 0\n");
   chmodSync(join(root, "bin", h), 0o755);
-  // pi's agentDir comes from PI_CODING_AGENT_DIR; the CLI puts omp's at ~/.omp/agent.
+  // pi's agentDir comes from PI_CODING_AGENT_DIR, set only for pi: omp
+  // honors it too (#439), so an omp run without it uses ~/.omp/agent.
   const pi = join(root, "pi");
   const dir = h === "pi" ? pi : join(root, ".omp", "agent");
   const paths = { local: join(dir, "extensions", "grayboard.ts"), hosted: join(dir, "extensions", "grayboard.js"), mcp: join(dir, "mcp.json"), config: join(dir, "grayboard", "config.json") };
-  const exec = (args: string[], piDir = pi) => {
-    const env = { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root, "config"), GRAYBOARD_CREDENTIALS: join(root, "credentials"), PI_CODING_AGENT_DIR: piDir,
+  const exec = (args: string[], piDir: string | undefined = h === "pi" ? pi : undefined, extra: Record<string, string> = {}) => {
+    const env = { ...process.env, OMP_PROFILE: undefined, PI_PROFILE: undefined, PI_CONFIG_DIR: undefined, ...extra,
+      HOME: root, XDG_CONFIG_HOME: join(root, "config"), GRAYBOARD_CREDENTIALS: join(root, "credentials"), PI_CODING_AGENT_DIR: piDir,
       PATH: join(root, "bin"), GRAYBOARD_TOKEN: undefined, GRAYBOARD_SERVER: undefined, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" };
     const r = Bun.spawnSync([process.execPath, cli, ...args], { cwd: root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
     return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
@@ -58,14 +62,22 @@ function fixture(h: Harness = "pi") {
   return { h, root, dir, paths, exec, run, signIn, entry, grant, seedGrant };
 }
 
-// From source the command is bun, as mcpCommand() names it. pi's entry is
-// disabled (its adapter serves the tools); omp serves its entry's tools.
-const localEntry = (h: Harness) => h === "pi" ? { command: "bun", args: [cli, "mcp"], enabled: false, env: { BUS_PUSH: "off" } } : { command: "bun", args: [cli, "mcp"] };
+// From source the command is bun, as mcpCommand() names it. The entry is
+// disabled: the adapter serves the tools.
+const localEntry = { command: "bun", args: [cli, "mcp"], enabled: false, env: { BUS_PUSH: "off" } };
 
 function expectLocal(f: ReturnType<typeof fixture>) {
   expect(readFileSync(f.paths.local, "utf8")).toBe(localSource(f.h));
+  if (f.h === "omp") {
+    const bundle = readFileSync(f.paths.local, "utf8");
+    expect(bundle).toContain("adapters/omp/grayboard.ts");
+    expect(bundle).toContain("adapters/hosted-core/src/channel.ts");
+    expect(bundle).toContain("adapters/pi-family/omp-instructions.ts");
+    expect(bundle).toMatch(/from ["']@oh-my-pi\/pi-coding-agent["']/);
+    expect(bundle).not.toMatch(/from ["']\.\.?\//);
+  }
   expect(existsSync(f.paths.hosted)).toBe(false);
-  expect(f.entry()).toEqual(localEntry(f.h));
+  expect(f.entry()).toEqual(localEntry);
 }
 
 function expectHosted(f: ReturnType<typeof fixture>) {
@@ -88,7 +100,7 @@ for (const h of HARNESSES) test(`setup switches ${h}'s adapter local → server 
 
   f.signIn();
   // A user's own MCP servers stay.
-  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { other: { command: "x" }, grayboard: localEntry(h) } }));
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { other: { command: "x" }, grayboard: localEntry } }));
   expect(f.run("setup", "--server", SERVER, "-y")).toContain(`Run /grayboard login in ${h}`);
   expectHosted(f);
   expect(JSON.parse(readFileSync(f.paths.mcp, "utf8")).mcpServers.other).toEqual({ command: "x" });
@@ -159,15 +171,18 @@ test("setup --server <another server> signs pi out of the old one and points con
   f.signIn();
   f.run("setup", "--server", SERVER, "-y");
   await f.seedGrant();
+  // Signed in already: a re-run on the same server asks for no login.
+  expect(f.run("setup", "--server", SERVER, "-y")).not.toContain("/grayboard login");
   const other = "http://localhost:9";
   f.signIn(other);
   const out = f.run("setup", "--server", other, "-y");
   await expectLoggedOut(f, out);
+  expect(out).toContain("Run /grayboard login in pi to sign it in.");
   expect(JSON.parse(readFileSync(f.paths.config, "utf8"))).toEqual({ url: `${other}/mcp` });
   expect(existsSync(f.paths.hosted)).toBe(true);
 }, 60_000);
 
-for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${h} adapter where either is installed, and leaves symlinks and absent installs alone`, () => {
+for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${h} adapter where either is installed, and leaves symlinks and absent installs alone`, async () => {
   const f = fixture(h);
   // Nothing installed: nothing written.
   f.signIn();
@@ -177,9 +192,24 @@ for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${
   // An old local install migrates to the hosted extension in server mode.
   mkdirSync(join(f.paths.local, ".."), { recursive: true });
   writeFileSync(f.paths.local, "// stale");
-  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: localEntry(h) } }));
-  expect(f.run("refresh-adapters")).toContain(`Refreshed ${f.paths.hosted}`);
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: localEntry } }));
+  const login = `Run /grayboard login in ${h} to sign it in.`;
+  const migrated = f.run("refresh-adapters");
+  expect(migrated).toContain(`Refreshed ${f.paths.hosted}`);
+  expect(migrated).toContain(login);
   expectHosted(f);
+  // The step follows the grant, not the config: still signed out, it's asked
+  // for again; signed in, never, even when config.json was rewritten.
+  expect(f.run("refresh-adapters")).toContain(login);
+  await f.seedGrant();
+  expect(f.run("refresh-adapters")).not.toContain(login);
+  rmSync(f.paths.config);
+  expect(f.run("refresh-adapters")).not.toContain(login);
+  // Another server: signed out of the old one, and the new one needs a login.
+  f.signIn("http://localhost:9");
+  const moved = f.run("refresh-adapters");
+  expect(moved).toContain(`Signed ${h} out of ${SERVER}/mcp`);
+  expect(moved).toContain(login);
 
   // Back in local mode the entry the local adapter reads is recreated.
   rmSync(join(f.root, "credentials"));
@@ -195,3 +225,217 @@ for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${
   expect(lstatSync(f.paths.local).isSymbolicLink()).toBe(true);
   expect(existsSync(f.paths.hosted)).toBe(false);
 }, 60_000);
+
+// Before #523 omp's local entry was enabled (omp's client served its tools
+// and a relay adapter woke the session). `update` runs refresh-adapters, which
+// disables it beside the new adapter, keeping the user's own env.
+test("refresh-adapters migrates an omp local install's enabled entry to the disabled one the adapter reads", () => {
+  const f = fixture("omp");
+  mkdirSync(join(f.paths.local, ".."), { recursive: true });
+  writeFileSync(f.paths.local, "// the relay adapter");
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { other: { command: "x" }, grayboard: { command: "bun", args: [cli, "mcp"], env: { BUS_MODEL: "m" } } } }));
+  expect(f.run("refresh-adapters")).toContain(`Disabled the grayboard entry in ${f.paths.mcp} (the adapter serves the tools)`);
+  expect(readFileSync(f.paths.local, "utf8")).toBe(localSource("omp"));
+  expect(f.entry()).toEqual({ command: "bun", args: [cli, "mcp"], enabled: false, env: { BUS_MODEL: "m", BUS_PUSH: "off" } });
+  expect(JSON.parse(readFileSync(f.paths.mcp, "utf8")).mcpServers.other).toEqual({ command: "x" });
+  // A second refresh changes nothing.
+  expect(f.run("refresh-adapters")).not.toContain("Disabled the grayboard entry");
+}, 60_000);
+
+// #439: setup installs omp's adapter where omp's getAgentDir() points: a
+// named profile has its own agent dir.
+test("setup installs omp's adapter in an OMP_PROFILE's agent dir", () => {
+  const f = fixture("omp");
+  const dir = join(f.root, ".omp", "profiles", "work", "agent");
+  const r = f.exec(["setup", "--local", "-y"], undefined, { OMP_PROFILE: "work" });
+  expect(r.exitCode, r.stderr).toBe(0);
+  expect(readFileSync(join(dir, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("omp"));
+  expect(JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8")).mcpServers.grayboard).toEqual(localEntry);
+  expect(existsSync(f.dir)).toBe(false);
+}, 60_000);
+
+// With PI_CODING_AGENT_DIR set, omp's default profile uses pi's agent dir,
+// where each harness would load the other's adapter: setup refuses omp's and
+// still installs pi's; refresh-adapters leaves the files to pi.
+test("setup refuses omp's adapter in an agent dir it shares with pi; refresh leaves it to pi", () => {
+  const f = fixture("omp");
+  writeFileSync(join(f.root, "bin", "pi"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(f.root, "bin", "pi"), 0o755);
+  const shared = join(f.root, "shared");
+  const setup = f.exec(["setup", "--local", "-y"], shared);
+  expect(setup.exitCode).toBe(1);
+  expect(setup.stderr).toContain(`omp's agent directory is pi's (${shared}: omp reads PI_CODING_AGENT_DIR too)`);
+  expect(setup.stderr).toContain("OMP_PROFILE=<name> grayboard setup");
+  expect(readFileSync(join(shared, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+  expect(existsSync(f.dir)).toBe(false);
+  const refresh = f.exec(["refresh-adapters"], shared);
+  expect(refresh.exitCode, refresh.stderr).toBe(0);
+  expect(refresh.stdout).toBe(`Refreshed ${join(shared, "extensions", "grayboard.ts")}\n`);
+  expect(refresh.stderr).not.toContain("omp's");
+  expect(readFileSync(join(shared, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+}, 60_000);
+
+// In a shared dir only pi's entry is checked: an enabled push-on entry with
+// no adapter warns once, as pi, never as omp.
+test("refresh-adapters in an agent dir omp shares with pi warns about an undelivered entry once, as pi's", () => {
+  const f = fixture("omp");
+  const shared = join(f.root, "shared");
+  mkdirSync(shared, { recursive: true });
+  writeFileSync(join(shared, "mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: "grayboard", args: ["mcp"] } } }));
+  const r = f.exec(["refresh-adapters"], shared);
+  expect(r.exitCode, r.stderr).toBe(0);
+  const warnings = r.stdout.split("\n").filter(l => l.includes("no grayboard adapter is installed"));
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toStartWith("[grayboard] pi: ");
+}, 60_000);
+
+// omp's named profile exports its agent dir as PI_CODING_AGENT_DIR to every
+// child (setProfile), so `grayboard` run from omp's bash sees omp's dir there:
+// it's omp's, and pi's stays its default.
+test("setup and refresh-adapters run inside an omp profile session keep omp's adapter in the profile dir and pi's in its default", () => {
+  const f = fixture("omp");
+  writeFileSync(join(f.root, "bin", "pi"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(f.root, "bin", "pi"), 0o755);
+  const dir = join(f.root, ".omp", "profiles", "work", "agent");
+  const pi = join(f.root, ".pi", "agent");
+  const setup = f.exec(["setup", "--local", "-y"], dir, { OMP_PROFILE: "work" });
+  expect(setup.exitCode, setup.stderr).toBe(0);
+  expect(readFileSync(join(dir, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("omp"));
+  expect(readFileSync(join(pi, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+  const refresh = f.exec(["refresh-adapters"], dir, { OMP_PROFILE: "work" });
+  expect(refresh.exitCode, refresh.stderr).toBe(0);
+  expect(readFileSync(join(dir, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("omp"));
+  expect(readFileSync(join(pi, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+}, 60_000);
+
+// omp path-resolves a relative default-profile PI_CODING_AGENT_DIR against
+// its own start directory, so setup can't know the dir and refuses.
+test("setup refuses omp's adapter for a relative or ~ PI_CODING_AGENT_DIR in the default profile", () => {
+  for (const value of ["~/omp", "rel/omp"]) {
+    const f = fixture("omp");
+    const r = f.exec(["setup", "--local", "-y"], value);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain(`omp resolves PI_CODING_AGENT_DIR (${value}) against the directory omp starts in`);
+    expect(existsSync(join(f.root, value))).toBe(false);
+  }
+}, 120_000);
+// #439: an mcp.json holding JSON null has nothing to keep, so setup writes
+// the entry into it; one holding an array or a scalar would be lost, so setup
+// refuses and leaves it alone.
+test("setup writes into an mcp.json holding JSON null and refuses one holding an array", () => {
+  const f = fixture();
+  mkdirSync(f.dir, { recursive: true });
+  writeFileSync(f.paths.mcp, "null");
+  f.run("setup", "--local", "-y");
+  expectLocal(f);
+
+  for (const [text, kind] of [["[1]", "array"], ["5", "number"]]) {
+    writeFileSync(f.paths.mcp, text);
+    const r = f.exec(["setup", "--local", "-y"]);
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain(`Can't parse ${f.paths.mcp}: it holds a JSON ${kind}, not an object`);
+    expect(readFileSync(f.paths.mcp, "utf8")).toBe(text);
+  }
+}, 60_000);
+
+// #439: the rewrite is a temp file renamed over the config, so it must land
+// at a symlink's target (the link stays), keep the file's mode (0664, which
+// the test's umask 022 would narrow), and leave no temp file behind.
+test("setup rewrites a symlinked mcp.json at its target, keeping the link and the mode", () => {
+  const f = fixture();
+  const dotfiles = join(f.root, "dotfiles");
+  mkdirSync(dotfiles);
+  mkdirSync(f.dir, { recursive: true });
+  const target = join(dotfiles, "mcp.json");
+  writeFileSync(target, JSON.stringify({ mcpServers: { other: { command: "x" } } }));
+  chmodSync(target, 0o664);
+  symlinkSync(target, f.paths.mcp);
+  const umask = process.umask(0o022);
+  try { f.run("setup", "--local", "-y"); } finally { process.umask(umask); }
+  expect(lstatSync(f.paths.mcp).isSymbolicLink()).toBe(true);
+  expectLocal(f);
+  expect(JSON.parse(readFileSync(target, "utf8")).mcpServers.other).toEqual({ command: "x" });
+  expect(lstatSync(target).mode & 0o777).toBe(0o664);
+  expect(readdirSync(dotfiles)).toEqual(["mcp.json"]);
+  expect(readdirSync(f.dir).filter(n => n.endsWith(".tmp"))).toEqual([]);
+}, 60_000);
+
+// A dangling link is a dotfiles target not yet made: the write creates the
+// target, as an in-place write through the link did, never replacing the link.
+test("setup writes a dangling symlinked mcp.json's target, keeping the link", () => {
+  const f = fixture();
+  const dotfiles = join(f.root, "dotfiles");
+  mkdirSync(dotfiles);
+  mkdirSync(f.dir, { recursive: true });
+  symlinkSync(join("..", "dotfiles", "mcp.json"), join(dotfiles, "hop"));
+  symlinkSync(join(dotfiles, "hop"), f.paths.mcp);
+  f.run("setup", "--local", "-y");
+  expect(lstatSync(f.paths.mcp).isSymbolicLink()).toBe(true);
+  expect(lstatSync(join(dotfiles, "hop")).isSymbolicLink()).toBe(true);
+  expect(lstatSync(join(dotfiles, "mcp.json")).isFile()).toBe(true);
+  expectLocal(f);
+}, 60_000);
+
+// A config the user can't write is refused, as an in-place write was, though
+// the rename only needs the directory. Root may write any file.
+test.skipIf(process.getuid?.() === 0)("setup refuses an mcp.json the user can't write and leaves it alone", () => {
+  const f = fixture();
+  mkdirSync(f.dir, { recursive: true });
+  const text = JSON.stringify({ mcpServers: { other: { command: "x" } } });
+  writeFileSync(f.paths.mcp, text);
+  chmodSync(f.paths.mcp, 0o444);
+  const r = f.exec(["setup", "--local", "-y"]);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stderr).toContain("EACCES");
+  expect(readFileSync(f.paths.mcp, "utf8")).toBe(text);
+  expect(lstatSync(f.paths.mcp).mode & 0o777).toBe(0o444);
+}, 60_000);
+
+test("setup upgrades an existing raw local omp adapter in place to the bundle", () => {
+  const f = fixture("omp");
+  mkdirSync(join(f.paths.local, ".."), { recursive: true });
+  writeFileSync(f.paths.local, readFileSync(new URL("../../adapters/omp/grayboard.ts", import.meta.url), "utf8"));
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: localEntry } }));
+  f.run("setup", "--local", "-y");
+  expectLocal(f);
+}, 60_000);
+
+// #95: an enabled push-mode entry with no adapter consumes pushes into a void.
+for (const h of HARNESSES) test(`setup and refresh-adapters warn when ${h}'s grayboard entry is enabled with push on and no adapter is installed`, () => {
+  const f = fixture(h);
+  const warning = `${h}: the grayboard entry in ${f.paths.mcp} is enabled with push on, but no grayboard adapter is installed`;
+  mkdirSync(f.dir, { recursive: true });
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: { command: "bun", args: [cli, "mcp"] } } }));
+  const refresh = f.exec(["refresh-adapters"]);
+  expect(refresh.exitCode, refresh.stderr).toBe(0);
+  expect(refresh.stdout).toContain(warning);
+  // Declining every harness at setup (--no-register) still warns.
+  const setup = f.exec(["setup", "--local", "-y", "--no-register"]);
+  expect(setup.exitCode, setup.stderr).toBe(0);
+  expect(setup.stderr).toContain(warning);
+  // BUS_PUSH=off, a disabled entry, or an installed adapter: no warning.
+  for (const e of [{ env: { BUS_PUSH: "off" } }, { enabled: false }]) {
+    writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: { command: "bun", args: [cli, "mcp"], ...e } } }));
+    expect(f.run("refresh-adapters")).not.toContain(warning);
+  }
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: { command: "bun", args: [cli, "mcp"] } } }));
+  const fixed = f.exec(["setup", "--local", "-y"]);
+  expect(fixed.exitCode, fixed.stderr).toBe(0);
+  expect(fixed.stderr + fixed.stdout).not.toContain(warning);
+  expect(f.entry()).toEqual(localEntry);
+}, 60_000);
+
+// From source, a macro runs when its module loads: only adapter_texts.ts, which
+// setup and refresh-adapters load on demand, may import one, so `mcp`,
+// `--version` and every other command never run `bun build` (#438).
+test("only adapter_texts.ts imports the adapter macros among the CLI's modules, and nothing imports it statically", () => {
+  const modules = readdirSync(import.meta.dir).filter(f => f.endsWith(".ts") && !f.endsWith(".test.ts"));
+  const source = (f: string) => readFileSync(join(import.meta.dir, f), "utf8");
+  // The transpiler refuses main.ts's shebang line.
+  const imports = new Map(modules.map(f => [f, new Bun.Transpiler({ loader: "ts" }).scanImports(source(f).replace(/^#!.*\n/, ""))]));
+  // scanImports doesn't report import attributes: a macro import names adapters.ts with `type: "macro"`.
+  expect(modules.filter(f => /from\s+["']\.\/adapters\.ts["']\s+with\s*\{\s*type:\s*["']macro["']/.test(source(f)))).toEqual(["adapter_texts.ts"]);
+  const statically = [...imports].filter(([, list]) => list.some(i => i.path === "./adapter_texts.ts" && i.kind !== "dynamic-import")).map(([f]) => f);
+  expect(statically).toEqual([]);
+  expect(imports.get("cli.ts")!.some(i => i.path === "./adapter_texts.ts" && i.kind === "dynamic-import")).toBe(true);
+});

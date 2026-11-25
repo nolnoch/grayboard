@@ -7,7 +7,7 @@ import { channelInstructions, COORDINATION_INSTRUCTIONS, boardTools } from "./to
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
-import { boardAddress, normalizeBoard, type BoardUse, type UnboundPeer } from "./boards.ts";
+import { HOLD_ORDER, boardAddress, normalizeBoard, type BoardUse, type UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
 
@@ -38,6 +38,17 @@ export function envSessionKey(env: Record<string, string | undefined> = process.
 /** The session ID a key stands for: the first 64 bits of its SHA-256, as an `id:` address. */
 export function idAddress(key: string): string {
   return `id:${crockford13(createHash("sha256").update(key).digest("hex").slice(0, 16))}`;
+}
+
+/**
+ * A local child session's ID (#523): a harness subagent `raw` (its harness's
+ * own session id) under the session whose key is `rootKey`. Derived from the
+ * secret key, so only the root's process can mint it, and stable for the
+ * same subagent across the root's keyed restarts. NUL separates the two: a
+ * valid `raw` has no control characters.
+ */
+export function childSessionId(rootKey: string, raw: string): string {
+  return idAddress(createHash("sha256").update(`${rootKey}\0${raw}`).digest("hex"));
 }
 
 // A 1.x session ID: the same 64 bits as 16 hex characters. Binding history
@@ -78,6 +89,50 @@ export function tooManyHolds(held: string[]): string {
   return `this session already holds ${held.length} names (${held.join(", ")}); unbind one first`;
 }
 
+/**
+ * How long a session may go unseen before it is idle: hosted's default sweep
+ * window (GRAYBOARD_HOSTED_IDLE_SECONDS), and the window within which a local
+ * child counts toward MAX_CHILDREN (#523).
+ */
+export const DEFAULT_IDLE_SECONDS = 900;
+
+/**
+ * How often a local call moves an address's or session's last_seen, at most
+ * (#148 18, #894): each touch is a write, and a write waits out another
+ * process's write lock (busy_timeout, 5 s) even for a read-only call.
+ * Presence ages are minutes, the stale-recipient warning an hour and the
+ * child window DEFAULT_IDLE_SECONDS, so the lag doesn't show.
+ */
+export const TOUCH_EVERY_MS = 30_000;
+
+/**
+ * How many child sessions (#523) one root may have at once, in both modes. A
+ * hosted child's row ends at its subagent's end; a local child has no end of
+ * its own, so it counts only while seen within DEFAULT_IDLE_SECONDS.
+ */
+export const MAX_CHILDREN = 128;
+
+/** The refusal for a child session past MAX_CHILDREN under `root`. */
+export function childCapacity(root: string): string {
+  return `child capacity reached: session ${root} has ${MAX_CHILDREN} active child sessions, the most one session may have; a child's place frees when it ends or goes idle`;
+}
+
+// What a child session (#523) is told instead of a call that would take on or
+// change its root's read state: the inbox's owed-list and its acks, the root's
+// board subscriptions and thread mutes. dm_history, dm_thread and board_read
+// change nothing, so stay the child's.
+const ROOT_STATE: Record<string, string> = {
+  dm_inbox: "its root owns this inbox. dm_thread a thread you wrote to see its replies.",
+  dm_ack: "its root owns this inbox. dm_thread a thread you wrote to see its replies.",
+  board_subscribe: "its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.",
+};
+
+/** The child_session refusal for `tool` called by child `child` of the root writing as `rootPrimary`, or null if the tool is the child's. */
+export function childStateRefusal(tool: string, child: string, rootPrimary: string): string | null {
+  const why = ROOT_STATE[tool];
+  return why === undefined ? null : `${child} is a subagent of ${rootPrimary}; ${why}`;
+}
+
 /** Session `id` no longer holds `address`; a hold another session took since stays. */
 export function dropHold(db: Database, address: string, id: string): void {
   db.prepare(`DELETE FROM alias_holds WHERE address = ? AND id = ?`).run(address, id);
@@ -90,7 +145,7 @@ export function holderOf(db: Database, address: string): string | null {
 
 /** The aliases session `id` holds, oldest hold first. */
 export function holdsOf(db: Database, id: string): string[] {
-  return (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address`).all(id) as { address: string }[]).map((r) => r.address);
+  return (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ${HOLD_ORDER}`).all(id) as { address: string }[]).map((r) => r.address);
 }
 
 /** Session `id`'s address set (#284 S1): the aliases it holds, oldest first, then its ID. */
@@ -119,7 +174,7 @@ export function actingAs(input: string, addresses: string[], ownScope: string | 
 /**
  * The address a board tool acts as (#284 S3, S14): `as` when given
  * (board_post, claim_take), checked against `asAddresses`; for a board read,
- * post or subscription without it, the one of `addresses` (primary first, the
+ * post, subscription or archive (picked as a read) without it, the one of `addresses` (primary first, the
  * ID last) that boardAddress picks, else the primary, whose refusal stands.
  * Every other tool acts as the primary, and refuses `as` (a raw server
  * call skips the MCP schema check). Callers resolve it before callBoardTool
@@ -131,29 +186,40 @@ export function boardActor(
   args: Record<string, unknown>,
   s: { addresses: string[]; asAddresses: string[]; ownScope: string | null },
 ): string {
+  const c = actorChoice(tool, args, s);
+  return "actor" in c ? c.actor : (boardAddress(db, c.board, s.addresses, c.use) ?? c.primary);
+}
+
+/**
+ * boardActor's rule before any read: the actor itself (`as`, or the primary for a tool that picks none), or the
+ * board and use to pick among `addresses` by (boardAddress), falling back to `primary`.
+ */
+export function actorChoice(
+  tool: string,
+  args: Record<string, unknown>,
+  s: { addresses: string[]; asAddresses: string[]; ownScope: string | null },
+): { actor: string } | { board: string; use: BoardUse; primary: string } {
   const primary = s.addresses[0]!;
   if (args.as !== undefined) {
     if (!AS_TOOLS.has(tool)) throw new CoreError(`${tool} takes no "as": it acts as your primary`);
-    return actingAs(String(args.as), s.asAddresses, s.ownScope);
+    return { actor: actingAs(String(args.as), s.asAddresses, s.ownScope) };
   }
   const use = BOARD_USES[tool];
-  if (!use || typeof args.board !== "string") return primary;
-  let board: string;
+  if (!use || typeof args.board !== "string") return { actor: primary };
   try {
-    board = normalizeBoard(args.board);
+    return { board: normalizeBoard(args.board), use, primary };
   } catch {
-    return primary;
+    return { actor: primary };
   }
-  return boardAddress(db, board, s.addresses, use) ?? primary;
 }
 
 // The board tools whose schema takes `as`. Built on first use: tools.ts ->
 // boards.ts -> session_end.ts -> this module is an import cycle, so when
 // tools.ts loads first, boardTools isn't ready at this module's load.
 let asTools: Set<string> | undefined;
-const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
+const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true, attachments: "paths" }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
 
-const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post" };
+const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post", board_archive: "read" };
 
 /**
  * The address a DM reply goes out as without `as` (#284 S4): the parent's
@@ -166,13 +232,50 @@ export function replySender(parent: { sender: string; recipient: string }, holds
 }
 
 /**
+ * The address a DM reply must go to (#524): the parent's other party, its
+ * sender when `me` received it, else its recipient. A reply to anyone else
+ * would thread under a message one of whose parties can't read it.
+ */
+export function replyPeer(parent: { sender: string; recipient: string }, me: string[]): string {
+  return me.includes(parent.recipient) ? parent.sender : parent.recipient;
+}
+
+export function replyPeerError(parentId: number, peer: string): string {
+  return `parent_id ${parentId} is a thread with ${peer}, so a reply goes to ${peer}; to write to someone else, send without parent_id`;
+}
+
+/**
+ * Why a reply may not go out as `sender` (#530 1), or null when it may: it
+ * goes out as the parent's party that isn't `peer`, so whoever holds that
+ * address later sees the whole thread. A party that is a session ID is the
+ * exception (#284 S4): no one else ever holds an ID, so its thread may move
+ * onto any address the session sends as.
+ */
+export function replySenderError(parent: { id: number; sender: string; recipient: string }, peer: string, sender: string): string | null {
+  const party = parent.sender === peer ? parent.recipient : parent.sender;
+  if (sender === party || addressParts(party)?.kind === "id") return null;
+  return `parent_id ${parent.id} is a thread you're in as ${party}, so a reply goes out as ${party}; to write as ${sender}, send without parent_id`;
+}
+
+/**
  * The address set a caller acting as `address` reads as (#284 S8), for a
- * request that names one address (HTTP `?as=`, `grayboard claim`): `address`
- * first, then the rest of the address set of the session it is or that holds
- * it, when that session is `principal`'s (null: local mode's one implicit
- * scope), so another principal's session's addresses never join the set.
+ * server request that names one address (HTTP `?as=`, an attachment read):
+ * `address` first, then the rest of the address set of the session it is or
+ * that holds it, when that session is `principal`'s, so another principal's
+ * session's addresses never join the set. A null principal (the Slack bridge's
+ * humans, which have no session) reads as `address` alone, never as a session's
+ * whole set (#373).
  */
 export function addressSet(db: Database, address: string, principal: string | null): string[] {
+  return principal === null ? [address] : sessionSet(db, address, principal);
+}
+
+/** addressSet for local mode's one implicit scope (`grayboard claim`), where sessions have no principal. */
+export function localAddressSet(db: Database, address: string): string[] {
+  return sessionSet(db, address, null);
+}
+
+function sessionSet(db: Database, address: string, principal: string | null): string[] {
   const id = addressParts(address)?.kind === "id" ? address : holderOf(db, address);
   const row = id === null ? undefined : idRow(db, id);
   if (id === null || !row || row.principal !== principal) return [address];
@@ -191,6 +294,9 @@ export function aliasUser(db: Database, address: string, exceptPrincipal: string
     `SELECT i.id FROM ids i
       WHERE i.ended_at IS NULL AND (?2 IS NULL OR i.principal IS NOT ?2)
         AND (i.id IN (SELECT id FROM alias_holds WHERE address = ?1) OR i.writes_as = ?1)
+      -- The holder before a tools-only writer, then the oldest: the refusal
+      -- names one session, so the pick can't ride on the plan's row order (#338).
+      ORDER BY i.id IN (SELECT id FROM alias_holds WHERE address = ?1) DESC, i.started_at, i.rowid
       LIMIT 1`,
   ).get(address, exceptPrincipal) as { id: string } | null)?.id ?? null;
 }
@@ -211,9 +317,9 @@ export function idRow(db: Database, id: string): IdRow | undefined {
   return r ? { ...r, viewer: r.viewer === 1 } : undefined;
 }
 
-/** The sessions not yet ended (viewers aside), every principal's or one's. */
-export function unendedIds(db: Database, principal: string | null = null): string[] {
-  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0 AND (?1 IS NULL OR principal = ?1)`).all(principal) as { id: string }[]).map((r) => r.id);
+/** The sessions not yet ended (viewers aside). */
+export function unendedIds(db: Database): string[] {
+  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0`).all() as { id: string }[]).map((r) => r.id);
 }
 
 /** The statuses set on these sessions, by ID. */
@@ -326,8 +432,9 @@ export const WHOAMI_TOOL = {
   inputSchema: { type: "object", properties: {} },
 };
 
-// `fresh`: the name has never existed, so binding it needs create: true.
-export type Candidate = { name: string; queued: number; claims: number; where: string | null; suggested?: true; fresh?: true };
+// `fresh`: the name has never existed, so binding it needs create: true, which `create` carries as bind's argument
+// (#1640: an agent reading the structure, not the instruction text, otherwise binds and is refused identity_unknown).
+export type Candidate = { name: string; queued: number; claims: number; where: string | null; suggested?: true; fresh?: true; create?: true };
 
 /** What a name has waiting, for ranking candidates. */
 export type NameStats = { name: string; queued: number; claims: number; last_seen: number; where: string | null };
@@ -346,7 +453,7 @@ export function orderCandidates(pool: NameStats[], suggested: string | null): Ca
   return [...first, ...rest].map((s) => ({
     name: s.name, queued: s.queued, claims: s.claims, where: s.where,
     ...("suggested" in s ? { suggested: true as const } : {}),
-    ...("fresh" in s ? { fresh: true as const } : {}),
+    ...("fresh" in s ? { fresh: true as const, create: true as const } : {}),
   }));
 }
 
@@ -378,6 +485,14 @@ export function heldNote(name: string, holder: string): string {
 }
 
 /**
+ * A name this session held that its harness's adapter session took (#1381):
+ * the adapter's grayboard owns the harness session's delivery.
+ */
+export function displacedNote(name: string, taker: string | null): string {
+  return `"${name}" was taken by ${taker ?? "another session"}, the grayboard this harness's adapter runs, which delivers its mail; this session no longer holds it.`;
+}
+
+/**
  * A name record (decision 14) this restart couldn't take back. `holdsOthers`:
  * it took back another name from the record (#284 S10).
  */
@@ -386,11 +501,20 @@ export function restoreNote(name: string, why: string, holdsOthers = false): str
 }
 
 /**
- * The parent is a launcher (npx, a shell), not the harness: each restart gets
+ * A restart took back `names` from its record, but the names' history
+ * didn't show the recorded session as their latest binder (#211), so its
+ * peer status wasn't carried over (#260). Said only when it had one.
+ */
+export function unverifiedRestoreNote(names: string[]): string {
+  return `This grayboard process restarted and took back ${names.map((n) => `"${n}"`).join(", ")}, but another session bound ${names.length > 1 ? "them" : "it"} in between, so the earlier peer status wasn't carried over; peer_status sets it again.`;
+}
+
+/**
+ * The parent is a wrapper (npx, a shell), not the harness: each restart gets
  * a new parent, so the name record never matches it.
  */
-export function launcherNote(launcher: string): string {
-  return `Its parent process is a launcher (${launcher}), so if this grayboard process restarts, its name won't come back; register grayboard as a direct command to keep it.`;
+export function wrapperNote(wrapper: string): string {
+  return `Its parent process is a wrapper (${wrapper}), so if this grayboard process restarts, its name won't come back; register grayboard as a direct command to keep it.`;
 }
 
 /**
@@ -415,6 +539,22 @@ export function boundInstructions(name: string, source: string | null, general: 
         ]
       : []),
     ...named,
+  ];
+}
+
+/**
+ * What a runner child (#523 step 5) is told: a subagent process of its own
+ * acting under its root's session, which writes as the root's primary
+ * (`rootPrimary` at start: the root's holds are re-read on each call) with
+ * its own ID as `via`, is pushed nothing, and becomes its own session by
+ * binding. `modeGeneral` adds a mode's general sentences.
+ */
+export function runnerChildInstructions(child: string, root: string, rootPrimary: string, modeGeneral: string[]): string[] {
+  return [
+    `You are a subagent of session ${root} on the grayboard bus, which coordinates between agents: you send, post and claim as its name ("${rootPrimary}" at your start; whoami shows it now), and what you write shows your ID ${child} as via.`,
+    `Mail and board pushes are your root's and never reach you: dm_thread a thread you wrote to see its replies; board_read reads without marking anything read. bind(name) makes this process its own session holding that name, which receives that name's mail; unbind is your root's.`,
+    ...COORDINATION_INSTRUCTIONS,
+    ...modeGeneral,
   ];
 }
 
@@ -468,13 +608,15 @@ export function bindOk(name: string, held: string[], instructions: (general: boo
  * unbind's result (#284 S2), built like bindOk's: the release, the claims
  * that stay with the alias, the new primary when it changed, then the
  * instructions for the session as it is now (its new primary's, or its ID's
- * with the unbound line). `structuredContent.name` is the primary now.
+ * with the unbound line). `structuredContent.name` is the primary now: null
+ * for an unbound session in both modes (#542, #375 F10), so an adapter
+ * forgets the hold instead of rebinding it on restart.
  */
-export function unbindOk(alias: string, primaryBefore: string, primaryAfter: string, left: string[], instructions: (general: boolean) => string[]) {
+export function unbindOk(alias: string, primaryBefore: string, primaryAfter: string | null, left: string[], instructions: (general: boolean) => string[]) {
   const text = [
     `Released "${alias}"; mail to it queues for its next holder.`,
     ...leftNote(alias, left),
-    ...(primaryAfter !== primaryBefore ? [`You now send as "${primaryAfter}".`] : []),
+    ...(primaryAfter === null ? ["This session is now unbound."] : primaryAfter !== primaryBefore ? [`You now send as "${primaryAfter}".`] : []),
     ...instructions(false),
   ].join(" ");
   return { content: [{ type: "text" as const, text }], structuredContent: { name: primaryAfter, instructions: instructions(true) } };

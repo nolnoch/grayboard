@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse } from "jsonc-parser";
@@ -62,7 +62,7 @@ for (const text of ["", "[]", "null", '{"mcp":[]}', '{"mcp":{"servers":[]}}', '{
 
 for (const url of ["http://remote.example.com/mcp", "https://user:password@example.com/mcp", "https://example.com/mcp?token=secret", "https://example.com/mcp#fragment", "https://example.com/mcp?", "https://example.com/mcp#", "https://example.com//mcp", "https://example.com/a/../mcp", "https://example.com/%2e/mcp", "https://example.com/a\\mcp", "https://example.com/mcp/", "https://EXAMPLE.com/mcp", "https://example.com:443/mcp"]) test(`unsafe/ambiguous endpoint refuses: ${url}`, () => expect(() => hostedEndpoint(url)).toThrow());
 for (const url of ["https://grayboard.example.com/team/mcp", "http://127.0.0.1:8080/mcp", "http://localhost:8080/mcp", "http://[::1]:8080/mcp"]) test(`explicit endpoint accepts: ${url}`, () => expect(hostedEndpoint(url)).toBe(url));
-for (const name of ["human", "Human", "FE", "you@example.com/fe", "../fe", "", "a".repeat(33)]) test(`invalid name refuses: ${name}`, () => {
+for (const name of ["human", "Human", "you@example.com/fe", "../fe", "", "a".repeat(33)]) test(`invalid name refuses: ${name}`, () => {
   const f = fixture();
   expect(() => f.run({ name })).toThrow();
   expect(existsSync(f.config)).toBe(false);
@@ -105,6 +105,52 @@ test("selected config symlinks and dangling symlinks refuse without target mutat
     expect(lstatSync(f.config).isSymbolicLink()).toBe(true);
     if (!dangling) expect(readFileSync(target, "utf8")).toBe('{}\n');
   }
+});
+
+test("a hard-linked config refuses a write (dry run too) and stays linked; an unchanged one passes", () => {
+  const f = fixture();
+  const other = join(f.root, "dotfiles.jsonc");
+  writeFileSync(f.config, '{ // mine\n}\n');
+  linkSync(f.config, other);
+  const before = readdirSync(f.root).sort();
+  for (const dryRun of [false, true]) expect(() => f.run({ dryRun })).toThrow("other hard links");
+  expect(readdirSync(f.root).sort()).toEqual(before);
+  expect(lstatSync(f.config).ino).toBe(lstatSync(other).ino);
+  expect(readFileSync(other, "utf8")).toBe('{ // mine\n}\n');
+  rmSync(other);
+  f.run();
+  const text = readFileSync(f.config, "utf8");
+  linkSync(f.config, other);
+  expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false });
+  expect(lstatSync(f.config).ino).toBe(lstatSync(other).ino);
+  expect(readFileSync(f.config, "utf8")).toBe(text);
+});
+
+test("a hard link made during setup refuses the replace and leaves no temp file", () => {
+  const f = fixture();
+  const other = join(f.root, "dotfiles.jsonc");
+  writeFileSync(f.config, '{}\n');
+  expect(() => setupOpenCode(f.opts, source, () => linkSync(f.config, other))).toThrow("Config changed during setup");
+  expect(lstatSync(f.config).ino).toBe(lstatSync(other).ino);
+  expect(readFileSync(f.config, "utf8")).toBe('{}\n');
+  expect(readdirSync(f.root).sort()).toEqual(["dotfiles.jsonc", "installed-plugin", "opencode.jsonc"]);
+});
+
+test("a hard link made during a migration restores the adapter and keeps the config backup", () => {
+  const f = fixture();
+  const other = join(f.root, "dotfiles.jsonc");
+  const text = JSON.stringify({ mcp: { grayboard: f.old } });
+  writeFileSync(f.config, text);
+  f.seedAdapter();
+  expect(() => setupOpenCode({ ...f.opts, migrate: true }, source, () => linkSync(f.config, other))).toThrow(/^Config changed during setup\..*manual recovery required/);
+  expect(readFileSync(f.adapter, "utf8")).toBe(source);
+  expect(readdirSync(join(f.root, "plugin"))).toEqual(["grayboard.ts"]);
+  expect(lstatSync(f.config).ino).toBe(lstatSync(other).ino);
+  expect(readFileSync(f.config, "utf8")).toBe(text);
+  const backups = readdirSync(f.root).filter(name => name.includes(".grayboard-backup"));
+  expect(backups.length).toBe(1);
+  expect(readFileSync(join(f.root, backups[0]!), "utf8")).toBe(text);
+  expect(readdirSync(f.root).some(name => name.endsWith(".tmp"))).toBe(false);
 });
 
 test("sibling conflict/malformed/symlink config refuses; unrelated sibling stays byte-exact", () => {
@@ -195,7 +241,7 @@ test("migration dry-run validates all inputs without creating backups or moving 
   writeFileSync(f.config, before);
   f.seedAdapter();
   const result = f.run({ migrate: true, dryRun: true });
-  expect(result).toEqual({ changed: true, migrated: true, dryRun: true });
+  expect(result).toEqual({ changed: true, migrated: true, dryRun: true, adapters: 1 });
   expect(readFileSync(f.config, "utf8")).toBe(before);
   expect(readFileSync(f.adapter, "utf8")).toBe(source);
   expect(existsSync(f.config + ".grayboard-backup")).toBe(false);
@@ -259,6 +305,16 @@ test("unrecognized commands and remote secrets refuse migration", () => {
     expect(() => f.run({ migrate: true })).toThrow("Unrecognized");
     expect(readFileSync(f.config, "utf8")).toBe(before);
   }
+});
+
+test("a launcher's static service-credential entry (#270 D3) is left alone: setup-opencode refuses it unwritten, setup skips it", () => {
+  const f = fixture();
+  const entry = { type: "remote", url: f.opts.url, oauth: false, headers: { Authorization: "Bearer {env:GRAYBOARD_RUN_TOKEN}" } };
+  writeFileSync(f.config, JSON.stringify({ mcp: { servers: { grayboard: entry } } }));
+  const before = readFileSync(f.config, "utf8");
+  for (const migrate of [false, true]) expect(() => f.run({ migrate })).toThrow("Unrecognized native Grayboard MCP entry");
+  expect(opencodeShimGuard(f.root)).toEqual({ skip: true, warning: expect.stringContaining("leaving OpenCode unchanged") });
+  expect(readFileSync(f.config, "utf8")).toBe(before);
 });
 
 test("plugin source migration preserves option bytes/enrollment and unrelated entries", () => {
@@ -426,6 +482,62 @@ test("optional name explicitly defaults create false and preserves unrelated plu
   expect(() => f.run({ name: "be", create: true })).toThrow("--migrate");
   f.run({ name: "be", create: true, migrate: true });
   expect(f.read().plugins[0].options).toEqual({ name: "be", create: true });
+});
+
+test("launcher: --launcher declares it, omitting the flag keeps it, --no-launcher removes only that key (#564)", () => {
+  const f = fixture();
+  expect(f.run({ launcher: true, name: "fe", dryRun: true })).toEqual({ changed: true, migrated: false, dryRun: true, launcher: "declared" });
+  expect(existsSync(f.config)).toBe(false);
+  f.run({ launcher: true, name: "fe" });
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false, launcher: true });
+  expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false });
+  expect(f.run({ launcher: true })).toEqual({ changed: false, migrated: false, dryRun: false, launcher: "unchanged" });
+  expect(f.read().plugins[0].options.launcher).toBe(true);
+  // Removal edits an existing entry, as a name change does, and keeps the other option bytes and comments.
+  const text = readFileSync(f.config, "utf8").replace('"name":"fe"', '/* keep */ "name" : "fe"');
+  expect(text).toContain("/* keep */");
+  writeFileSync(f.config, text);
+  expect(() => f.run({ launcher: false })).toThrow("--migrate");
+  expect(f.run({ launcher: false, migrate: true, dryRun: true })).toEqual({ changed: true, migrated: true, dryRun: true, launcher: "removed" });
+  expect(readFileSync(f.config, "utf8")).toBe(text);
+  const removed = f.run({ launcher: false, migrate: true });
+  expect(removed).toEqual({ changed: true, migrated: true, dryRun: false, launcher: "removed", backups: [f.config + ".grayboard-backup"] });
+  expect(readFileSync(f.config + ".grayboard-backup", "utf8")).toBe(text);
+  expect(readFileSync(f.config, "utf8")).toContain('/* keep */ "name" : "fe"');
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false });
+  expect(f.run({ launcher: false })).toEqual({ changed: false, migrated: false, dryRun: false, launcher: "unchanged" });
+  // Declaring it on an existing entry is a migration too.
+  expect(() => f.run({ launcher: true })).toThrow("--migrate");
+  f.run({ launcher: true, migrate: true });
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false, launcher: true });
+});
+
+test("launcher: an entry without options gains one; a prior non-true value is replaced by --launcher (#564)", () => {
+  const f = fixture();
+  const mcp = { servers: { grayboard: { type: "remote", url: f.opts.url } } };
+  writeFileSync(f.config, JSON.stringify({ mcp, plugins: [{ package: f.plugin }] }));
+  f.run({ launcher: true, migrate: true });
+  expect(f.read().plugins[0]).toEqual({ package: f.plugin, options: { launcher: true } });
+  writeFileSync(f.config, JSON.stringify({ mcp, plugins: [{ package: f.plugin, options: { launcher: "yes" } }] }));
+  expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false });
+  f.run({ launcher: true, migrate: true });
+  expect(f.read().plugins[0].options).toEqual({ launcher: true });
+});
+
+test("CLI parses --launcher and --no-launcher; neither leaves the declaration alone (#564)", () => {
+  const f = fixture();
+  const declared = invoke(f, [...cliArgs(f), "--launcher"]);
+  expect(declared.exitCode, declared.stderr.toString()).toBe(0);
+  expect(declared.stdout.toString()).toContain("launcher declared");
+  expect(f.read().plugins[0].options).toEqual({ launcher: true });
+  const kept = invoke(f, cliArgs(f));
+  expect(kept.exitCode, kept.stderr.toString()).toBe(0);
+  expect(kept.stdout.toString()).not.toContain("launcher");
+  expect(f.read().plugins[0].options).toEqual({ launcher: true });
+  const removed = invoke(f, [...cliArgs(f), "--no-launcher", "--migrate"]);
+  expect(removed.exitCode, removed.stderr.toString()).toBe(0);
+  expect(removed.stdout.toString()).toContain("launcher removed");
+  expect(f.read().plugins[0].options).toEqual({});
 });
 
 for (const directive of ["{env:PRIVATE_TOKEN}", "{file:./private-token}", "prefix-{env:PRIVATE_TOKEN}-suffix", "prefix-{file:./private-token}-suffix"]) test("installed plugin path rejects substitutions before writes", () => {
@@ -649,3 +761,104 @@ test("ordinary local/V1 setup and refresh still install carried shim; refresh re
   expect(lstatSync(adapter).isSymbolicLink()).toBe(true);
   expect(readFileSync(target, "utf8")).toBe("intentional checkout");
 });
+
+// Before #282 a signed-in machine's V1 entry served the team server; now it runs the local bus (#474). refresh-adapters
+// keeps the entry and says how to reach the server; a signed-out machine (truncated credentials) hears nothing.
+test("refresh-adapters on a signed-in machine keeps the V1 entry and names the setup-opencode command (#474)", () => {
+  const f = fixture();
+  fakeOpenCode(f);
+  expect(invoke(f, ["setup", "--local", "-y"]).exitCode).toBe(0);
+  const config = join(f.root, "config", "opencode", "opencode.json");
+  const entry = JSON.parse(readFileSync(config, "utf8")).mcp.grayboard;
+  writeFileSync(join(f.root, "credentials"), "");
+  const signedOut = invoke(f, ["refresh-adapters"]);
+  expect(signedOut.exitCode, signedOut.stderr.toString()).toBe(0);
+  expect(signedOut.stdout.toString()).not.toContain("setup-opencode");
+  writeFileSync(join(f.root, "credentials"), JSON.stringify({ session_token: "t", server: "https://bus.example.com/", user_email: "you@example.com" }));
+  const signedIn = invoke(f, ["refresh-adapters"]);
+  expect(signedIn.exitCode, signedIn.stderr.toString()).toBe(0);
+  const out = signedIn.stdout.toString();
+  expect(out).toContain("runs this machine's local bus, not the team server you're signed in to (https://bus.example.com)");
+  expect(out).toContain("grayboard setup-opencode --url https://bus.example.com/mcp --config <opencode config file> --revision <full git sha>");
+  expect(out).not.toContain('"t"');
+  // A sign-in URL's credentials are never printed; its path is kept, since the hosted entry is under it.
+  writeFileSync(join(f.root, "credentials"), JSON.stringify({ session_token: "t", server: "https://user:hunter2@bus.example.com/team/x", user_email: "you@example.com" }));
+  const withCreds = invoke(f, ["refresh-adapters"]);
+  expect(withCreds.exitCode, withCreds.stderr.toString()).toBe(0);
+  expect(withCreds.stdout.toString()).not.toContain("hunter2");
+  expect(withCreds.stdout.toString()).toContain("grayboard setup-opencode --url https://bus.example.com/team/x/mcp ");
+  expect(JSON.parse(readFileSync(config, "utf8")).mcp.grayboard).toEqual(entry);
+});
+
+test("--name follows the one naming rule: FE is lowercased and stored as fe (#382)", () => {
+  const f = fixture();
+  f.run({ name: "FE" });
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false });
+});
+
+test("argument errors carry no manual-resolution advice; config errors keep it (#382)", () => {
+  const f = fixture();
+  expect(() => f.run({ plugin: undefined, revision: "master" })).toThrow(/^Git plugin setup requires --revision[^.]*; alternatively supply an installed --plugin directory$/);
+  expect(() => hostedEndpoint("https://example.com/mcp?x")).toThrow(/ending in \/mcp, without credentials, query, or fragment$/);
+  writeFileSync(f.config, "[]");
+  expect(() => f.run()).toThrow("Resolve manually");
+});
+
+test("a plugin mcpName is the server setup writes and the guard classifies (#382)", () => {
+  const f = fixture();
+  writeFileSync(f.config, JSON.stringify({ plugins: [{ package: f.plugin, options: { mcpName: "gb" } }] }));
+  const result = f.run();
+  expect(result).toMatchObject({ changed: true, mcpName: "gb" });
+  expect(f.read().mcp.servers).toEqual({ gb: { type: "remote", url: f.opts.url } });
+  expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false, mcpName: "gb" });
+  // The local shim guard must see the hosted registration under its real name.
+  const guard = opencodeShimGuard(f.root);
+  expect(guard.skip).toBe(true);
+  // A second registration under the default name is a conflict, not something to add to.
+  writeFileSync(f.config, JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: f.opts.url } } }, plugins: [{ package: f.plugin, options: { mcpName: "gb" } }] }));
+  const before = readFileSync(f.config, "utf8");
+  expect(() => f.run({ migrate: true })).toThrow("Conflicting native Grayboard MCP entries");
+  expect(readFileSync(f.config, "utf8")).toBe(before);
+});
+
+test("CLI result message separates config changes, adapter moves and dry runs (#382)", () => {
+  const f = fixture();
+  writeFileSync(f.config, JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: f.opts.url } } }, plugins: [{ package: f.plugin }] }));
+  f.seedAdapter();
+  const dry = invoke(f, [...cliArgs(f), "--migrate", "--dry-run"]);
+  expect(dry.exitCode).toBe(0);
+  expect(dry.stdout.toString()).toContain("(config unchanged); 1 carried adapter to disable; recognized migration required.");
+  expect(dry.stdout.toString()).not.toContain("with backups");
+  const applied = invoke(f, [...cliArgs(f), "--migrate"]);
+  expect(applied.stdout.toString()).toContain("(config unchanged); 1 carried adapter disabled; recognized migration.");
+  expect(applied.stdout.toString()).toContain(`Retained backup: ${f.adapter}.grayboard-backup`);
+});
+
+test("a config created after preflight, when none existed, is kept and the temp file removed (#381)", () => {
+  const f = fixture();
+  const concurrent = '{"created":"by the user meanwhile"}';
+  expect(() => setupOpenCode(f.opts, source, () => writeFileSync(f.config, concurrent))).toThrow("Config changed during setup");
+  expect(readFileSync(f.config, "utf8")).toBe(concurrent);
+  expect(readdirSync(f.root).some(x => x.endsWith(".tmp"))).toBe(false);
+  // An empty file is still a concurrent file, kept like any other.
+  rmSync(f.config);
+  expect(() => setupOpenCode(f.opts, source, () => writeFileSync(f.config, ""))).toThrow();
+  expect(readFileSync(f.config, "utf8")).toBe("");
+});
+
+test("a sibling that gains Grayboard during setup refuses the commit and restores adapters (#381)", () => {
+  const f = fixture();
+  writeFileSync(f.config, JSON.stringify({ mcp: { grayboard: f.old } }));
+  const before = readFileSync(f.config, "utf8");
+  f.seedAdapter();
+  const other = f.config.slice(0, -1);
+  const sibling = JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: "https://other.example.com/mcp" } } } });
+  let failure: unknown;
+  try { setupOpenCode({ ...f.opts, migrate: true }, source, () => writeFileSync(other, sibling)); } catch (e) { failure = e; }
+  expect(((failure as Error).cause as Error)?.message ?? (failure as Error).message).toContain("Sibling config changed during setup");
+  expect(readFileSync(f.config, "utf8")).toBe(before);
+  expect(readFileSync(other, "utf8")).toBe(sibling);
+  expect(readFileSync(f.adapter, "utf8")).toBe(source);
+  expect(readdirSync(f.root).some(x => x.endsWith(".tmp"))).toBe(false);
+});
+

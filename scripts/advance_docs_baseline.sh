@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-DOCS=(docs/ AGENTS.md CLAUDE.md README.md)
+DOCS=(docs/ AGENTS.md CLAUDE.md README.md CONTRIBUTING.md)
 if ! git diff --quiet -- "${DOCS[@]}" || ! git diff --cached --quiet -- "${DOCS[@]}"; then
   echo "REFUSING: uncommitted changes in ${DOCS[*]}." >&2
   echo "Commit the reconcile before advancing the baseline (commit-then-tag)." >&2

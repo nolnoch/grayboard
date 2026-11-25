@@ -1,16 +1,17 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
 
 const root = resolve(import.meta.dir, "../..");
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
 
 test("hosted gates remain independent, mandatory and release-blocking", () => {
   const pkg = JSON.parse(read("package.json"));
-  expect(pkg.scripts.test).toBe("bun test --timeout 30000 ./src ./tests");
+  expect(pkg.scripts.test).toBe("bun test --timeout 30000 --parallel ./src ./tests");
   const hosted = read(".github/workflows/hosted.yml");
-  expect(hosted).toContain("suite: [strict, git, config, host, matrix, native, durable]");
+  expect(hosted).toContain("suite: [hosted-strict, hosted-git, hosted-config, hosted-host, hosted-matrix, hosted-native, hosted-durable, claude-hosted, rust-sdk]");
   expect(hosted).toContain("timeout-minutes: 60");
   expect(hosted).toContain("bun install --frozen-lockfile");
   expect(hosted).not.toContain("GRAYBOARD_PUBLIC_REVISION");
@@ -18,14 +19,16 @@ test("hosted gates remain independent, mandatory and release-blocking", () => {
   expect(hosted).toContain("contents: read");
   expect(hosted).toContain("if: always()");
   expect(hosted).toContain("retention-days: 7");
-  expect(hosted).toContain("path: ${{ runner.temp }}/hosted-run/evidence");
+  const upload = (Bun.YAML.parse(hosted) as any).jobs.hosted.steps.find((s: any) => s.uses?.startsWith("actions/upload-artifact@"));
+  // A hosted suite uploads its evidence only, never its fixture HOME or auth store; claude-hosted its run dir, as e2e.yml does.
+  expect(upload.with.path).toBe("${{ runner.temp }}/hosted-run/evidence\n${{ !startsWith(matrix.suite, 'hosted-') && format('{0}/hosted-run', runner.temp) || '' }}\n");
   expect(read("scripts/e2e.sh")).toContain("bun scripts/hosted-evidence.ts");
   expect(read("scripts/e2e.sh")).not.toContain("tee \"$run/hosted.log\"");
   expect(hosted).not.toContain("continue-on-error");
   expect(hosted).not.toContain("secrets: inherit");
   for (const workflow of ["test", "release"]) expect(read(`.github/workflows/${workflow}.yml`)).toContain("uses: ./.github/workflows/hosted.yml");
   expect(read(".github/workflows/release.yml")).toContain("needs: [test, hosted]");
-  expect(read(".github/workflows/release.yml")).toContain("needs: [build, e2e, upgrade-matrix, hosted-network, claude-hosted]");
+  expect(read(".github/workflows/release.yml")).toContain("needs: [build, e2e, upgrade-matrix, hosted-network, claude-hosted, claude-local]");
   expect(read(".github/workflows/test.yml")).toContain("RestartBogus=1");
 });
 
@@ -35,17 +38,141 @@ test("the stable hosted aggregator runs even when matrix dependencies fail, canc
   expect(job.name).toBe("Hosted required"); expect(job.needs).toBe("hosted");
   expect(job.if).toBe("${{ always() }}"); expect(job.steps).toHaveLength(1);
   expect(job.steps[0].env.RESULT).toBe("${{ needs.hosted.result }}");
-  expect(workflow.jobs.hosted.if).toBeUndefined();
+  // The matrix skips only when the caller asks: a pin-only (#507) or docs-only (#601) PR.
+  expect(workflow.jobs.hosted.if).toBe("${{ !inputs.skip }}");
+  expect(job.steps[0].env.SKIP).toBe("${{ inputs.skip }}");
   expect(workflow.jobs.hosted.strategy["fail-fast"]).toBe(false);
   expect(workflow.jobs.hosted["continue-on-error"]).toBeUndefined();
-  expect(workflow.jobs.hosted.strategy.matrix.suite).toEqual(["strict", "git", "config", "host", "matrix", "native", "durable"]);
+  // #501: claude-hosted (the real Claude Code with the hosted plugin) is a required leg too; #929: so is rust-sdk.
+  expect(workflow.jobs.hosted.strategy.matrix.suite).toEqual(["hosted-strict", "hosted-git", "hosted-config", "hosted-host", "hosted-matrix", "hosted-native", "hosted-durable", "claude-hosted", "rust-sdk"]);
+  const run = workflow.jobs.hosted.steps.find((s: any) => s.name === "Run ${{ matrix.suite }}");
+  expect(run.run).toBe('bash scripts/e2e.sh "$SUITE"');
+  expect(run.env).toEqual({ GRAYBOARD_E2E_RUN_DIR: "${{ runner.temp }}/hosted-run", SUITE: "${{ matrix.suite }}" });
+  expect(workflow.jobs.hosted.steps.find((s: any) => s.name === "Independent frozen package install").if).toBe("startsWith(matrix.suite, 'hosted-')");
   const caller = Bun.YAML.parse(read(".github/workflows/test.yml")) as any;
   expect(caller.jobs.hosted.name).toBeUndefined();
   expect(caller.jobs.hosted.uses).toBe("./.github/workflows/hosted.yml");
+  expect(caller.jobs.hosted.if).toBe("${{ !cancelled() }}");
+  expect(caller.jobs.hosted.with).toEqual({ skip: "${{ needs.scope.outputs.pin-only == 'true' || needs.scope.outputs.docs-only == 'true' }}" });
+  for (const skip of ["true", "false", ""]) {
+    for (const result of ["success", "failure", "cancelled", "skipped", ""]) {
+      const process = Bun.spawnSync(["bash", "-c", job.steps[0].run], { env: { ...Bun.env, RESULT: result, SKIP: skip } });
+      expect(process.exitCode === 0).toBe(result === "success" || (skip === "true" && result === "skipped"));
+    }
+  }
+});
+
+// #507: a PR's newer push cancels its older runs, never a master push; a
+// pin-only PR's required test check runs the pin check, and a failed scope
+// fails it rather than skipping it (a skipped required check passes).
+test("PR runs cancel superseded ones, and the required test check fails closed on a failed scope", () => {
+  const workflow = Bun.YAML.parse(read(".github/workflows/test.yml")) as any;
+  expect(workflow.concurrency).toEqual({
+    group: "${{ github.event_name == 'pull_request' && format('test-pr-{0}', github.event.pull_request.number) || format('test-run-{0}', github.run_id) }}",
+    "cancel-in-progress": true,
+  });
+  const test = workflow.jobs.test;
+  expect(test.needs).toBe("scope");
+  expect(test.if).toBe("${{ !cancelled() }}");
+  expect(test.steps[0].env.SCOPE).toBe("${{ needs.scope.result }}");
   for (const result of ["success", "failure", "cancelled", "skipped", ""]) {
-    const process = Bun.spawnSync(["bash", "-c", job.steps[0].run], { env: { ...Bun.env, RESULT: result } });
+    const process = Bun.spawnSync(["bash", "-c", test.steps[0].run], { env: { ...Bun.env, SCOPE: result } });
     expect(process.exitCode === 0).toBe(result === "success");
   }
+  expect(test.env.SUITES).toBe("${{ needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true' }}");
+  const suites = test.steps.filter((step: any) => step.name === "Typecheck" || step.name === "Test");
+  expect(suites.map((step: any) => step.if)).toEqual(["env.SUITES == 'true'", "env.SUITES == 'true'"]);
+  const docs = test.steps.filter((step: any) => step.if === "needs.scope.outputs.docs-only == 'true'");
+  expect(docs.map((step: any) => step.run)).toEqual(["bun test tests/integration/doc_links.test.ts tests/integration/site.test.ts"]);
+  expect(workflow.jobs["deploy-lint"].if).toBe("needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true'");
+  const pinSteps = test.steps.filter((step: any) => step.if === "env.PIN_ONLY == 'true'");
+  expect(pinSteps.map((step: any) => step.name)).toEqual(["Marketplace tests", "The file only moves the pin forward", "The pin names an immutable release at its commit"]);
+  expect(pinSteps[1].env.BASE).toBe("${{ github.event.pull_request.base.sha }}");
+  expect(pinSteps[1].run).toContain('bun scripts/pin_claude_plugin.ts verify "$RUNNER_TEMP/base-marketplace.json"');
+});
+
+// #507, #601: scope's routing decides which PRs skip the suites, so it runs
+// here against a real repo: only a lone marketplace.json change is pin-only,
+// only docs (docs/, markdown outside adapters/ and plugins/) is docs-only, and
+// fork-chosen file names print with workflow commands stopped.
+test("scope marks a PR pin-only or docs-only exactly when its files allow it", () => {
+  const step = (Bun.YAML.parse(read(".github/workflows/test.yml")) as any).jobs.scope.steps.find((s: any) => s.id === "files");
+  const dir = mkdtempSync(resolve(tmpdir(), "gb-scope-"));
+  const repo = resolve(dir, "repo");
+  const decoy = resolve(dir, "decoy");
+  const output = resolve(dir, "output");
+  try {
+    // Under the pre-push hook git exports GIT_DIR and friends for the pushing
+    // checkout; inherited, they'd aim every command below at it. A decoy
+    // stands in for that checkout and must come through untouched.
+    const run = (cwd: string, env: Record<string, string>, ...args: string[]) => {
+      const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
+      if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+      return r.stdout.toString().trim();
+    };
+    mkdirSync(decoy);
+    const clean = repositoryGitEnv(process.env);
+    run(decoy, clean, "init", "-q");
+    run(decoy, clean, "commit", "-q", "--allow-empty", "-m", "decoy");
+    const decoyHead = run(decoy, clean, "rev-parse", "HEAD");
+    const env = repositoryGitEnv({ ...process.env, GIT_DIR: resolve(decoy, ".git"), GIT_WORK_TREE: decoy, GIT_INDEX_FILE: resolve(decoy, ".git/index") });
+    const git = (...args: string[]) => {
+      const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env, stdout: "pipe", stderr: "pipe" });
+      if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+      return r.stdout.toString().trim();
+    };
+    const write = (files: Record<string, string>) => {
+      for (const [path, text] of Object.entries(files)) {
+        mkdirSync(dirname(resolve(repo, path)), { recursive: true });
+        writeFileSync(resolve(repo, path), text);
+      }
+    };
+    const commit = (files: Record<string, string>, from?: string) => {
+      if (from) git("checkout", "-q", "--detach", from);
+      write(files);
+      git("add", "-A");
+      git("commit", "-q", "--allow-empty", "-m", "c");
+      return git("rev-parse", "HEAD");
+    };
+    const scope = (vars: Record<string, string>) => {
+      writeFileSync(output, "");
+      const r = Bun.spawnSync(["bash", "-e", "-c", step.run], { cwd: repo, env: { ...env, GITHUB_OUTPUT: output, ...vars }, stdout: "pipe", stderr: "pipe" });
+      expect(r.stderr.toString()).toBe("");
+      expect(r.exitCode).toBe(0);
+      const out = readFileSync(output, "utf8");
+      return { pin: out.split("\n")[0] + "\n", docs: out.split("\n")[1], stdout: r.stdout.toString() };
+    };
+    mkdirSync(repo);
+    git("init", "-q");
+    const base = commit({ ".claude-plugin/marketplace.json": "{}\n", "README.md": "x\n" });
+    expect(scope({ BASE: base, HEAD: commit({ ".claude-plugin/marketplace.json": '{"pin":1}\n' }, base) }).pin).toBe("pin-only=true\n");
+    expect(scope({ BASE: base, HEAD: commit({ ".claude-plugin/marketplace.json": '{"pin":2}\n', "src/x.ts": "x\n" }, base) }).pin).toBe("pin-only=false\n");
+    expect(scope({ BASE: base, HEAD: commit({ "README.md": "y\n" }, base) }).pin).toBe("pin-only=false\n");
+    expect(scope({ BASE: base, HEAD: base }).pin).toBe("pin-only=false\n");
+    expect(scope({ BASE: "", HEAD: "" }).pin).toBe("pin-only=false\n"); // a push: no PR head
+    const docsOnly = (files: Record<string, string>) => scope({ BASE: base, HEAD: commit(files, base) }).docs;
+    expect(docsOnly({ "README.md": "z\n" })).toBe("docs-only=true");
+    expect(docsOnly({ "docs/guide/x.md": "x\n", "docs/a.png": "x", "CONTRIBUTING.md": "x\n", ".github/PULL_REQUEST_TEMPLATE.md": "x\n", ".claude/commands/c.md": "x\n", "tests/e2e/README.md": "x\n" })).toBe("docs-only=true");
+    expect(docsOnly({ "docs/y.md": "y\n", "src/y.ts": "y\n" })).toBe("docs-only=false");
+    expect(docsOnly({ "adapters/opencode-v2/README.md": "y\n" })).toBe("docs-only=false"); // ships in the package
+    expect(docsOnly({ "plugins/claude-code/skills/logout/SKILL.md": "y\n" })).toBe("docs-only=false"); // ships in the plugin
+    expect(docsOnly({ "src/notes.md": "y\n" })).toBe("docs-only=false");
+    expect(docsOnly({ ".github/workflows/test.yml": "y\n" })).toBe("docs-only=false");
+    expect(docsOnly({ ".claude-plugin/marketplace.json": '{"pin":3}\n' })).toBe("docs-only=false");
+    expect(scope({ BASE: base, HEAD: base }).docs).toBe("docs-only=false");
+    expect(scope({ BASE: "", HEAD: "" }).docs).toBe("docs-only=false"); // a push runs everything
+    // A file named like a workflow command prints between stop-commands and its resume token.
+    const { pin, stdout } = scope({ BASE: base, HEAD: commit({ "::error::injected": "x\n" }, base) });
+    expect(pin).toBe("pin-only=false\n");
+    const token = /^::stop-commands::([0-9a-f]{32})$/m.exec(stdout)?.[1];
+    expect(token).toBeDefined();
+    const at = (line: string) => stdout.split("\n").indexOf(line);
+    expect(at(`::stop-commands::${token}`)).toBeLessThan(at("::error::injected"));
+    expect(at("::error::injected")).toBeLessThan(at(`::${token}::`));
+    expect(run(decoy, clean, "rev-parse", "HEAD")).toBe(decoyHead);
+    expect(run(decoy, clean, "config", "core.bare")).toBe("false");
+    expect(run(decoy, clean, "status", "--porcelain")).toBe("");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("hosted gates preserve the signed tag-only release boundary", () => {
@@ -54,7 +181,7 @@ test("hosted gates preserve the signed tag-only release boundary", () => {
   expect(release.on.push.tags).toEqual(["v*"]);
   expect(release.permissions).toEqual({ contents: "read" });
   expect(release.jobs.build.needs).toEqual(["test", "hosted"]);
-  expect(release.jobs.release.needs).toEqual(["build", "e2e", "upgrade-matrix", "hosted-network", "claude-hosted"]);
+  expect(release.jobs.release.needs).toEqual(["build", "e2e", "upgrade-matrix", "hosted-network", "claude-hosted", "claude-local"]);
   expect(release.jobs.release.environment).toBe("release");
   expect(release.jobs.release.permissions).toEqual({ contents: "write", "id-token": "write", attestations: "write", "artifact-metadata": "write" });
   for (const name of ["Sign SHA256SUMS", "Remove the signing key", "Verify the signature against assets/release-keys", "Attest build provenance"]) {
@@ -68,21 +195,21 @@ test("hosted gates preserve the signed tag-only release boundary", () => {
   expect(config).toContain("helloLimit: DEFAULT_HELLO_LIMIT");
   expect(config).toContain("authFailLimit: DEFAULT_AUTH_FAIL_LIMIT");
   expect(config).toContain("trustedProxies: DEFAULT_TRUSTED_PROXIES");
-  expect(config).toContain('app.repo.aliases.find("you@example.com/be")');
+  expect(config).toContain('await app.repo.aliases.find(app.repo.read, "you@example.com/be")');
   expect(config).not.toMatch(/FROM handles|repo\.identities/);
 });
 
 test("outside-network hosted suites run only nightly, explicitly, or across the release boundary", () => {
   const hosted = Bun.YAML.parse(read(".github/workflows/hosted.yml")) as any;
   expect(Object.keys(hosted.on)).toEqual(["workflow_call"]);
-  expect(Object.keys(hosted.on.workflow_call.inputs)).toEqual(["rep"]);
+  expect(Object.keys(hosted.on.workflow_call.inputs)).toEqual(["rep", "skip"]);
   expect(JSON.stringify(hosted)).not.toMatch(/hosted-(?:live|public)|CIMD_LIVE|PUBLIC_REVISION/);
   const nightly = Bun.YAML.parse(read(".github/workflows/e2e.yml")) as any;
   expect(Object.keys(nightly.on)).toEqual(["schedule", "workflow_dispatch", "workflow_call"]);
   const expression = nightly.jobs.e2e.strategy.matrix.suite;
-  expect(expression).toContain('github.event_name == \'schedule\' && \'["upgrade-matrix","claude-hosted","hosted-live","hosted-public"]\'');
+  expect(expression).toContain('github.event_name == \'schedule\' && \'["upgrade-matrix","claude-hosted","claude-local","hosted-live","hosted-public"]\'');
   expect(expression).toContain('inputs.suite == \'hosted-network\' && \'["hosted-live","hosted-public"]\'');
-  expect(nightly.jobs["tracking-issue"].strategy.matrix.suite).toEqual(["upgrade-matrix", "claude-hosted", "hosted-live", "hosted-public"]);
+  expect(nightly.jobs["tracking-issue"].strategy.matrix.suite).toEqual(["upgrade-matrix", "claude-hosted", "claude-local", "hosted-live", "hosted-public"]);
   const steps = nightly.jobs.e2e.steps;
   const resolve = steps.find((s: any) => s.id === "public");
   expect(resolve.if).toBe("matrix.suite == 'hosted-public'");
@@ -154,4 +281,20 @@ test("hosted entry point uses frozen package commands and retains no private sta
     const result = Bun.spawnSync(["bash", "-n", resolve(root, script)]);
     expect(result.exitCode, result.stderr.toString()).toBe(0);
   }
+});
+
+// #1482, #1408: test-pg finds its files under fixed roots rather than listing them, so a new pg-only test
+// (`*.pg.test.ts`, which skips without a Postgres URL) runs there only if it lives under one of those roots.
+test("test-pg finds every *.pg.test.ts in the tree", () => {
+  const step = (Bun.YAML.parse(read(".github/workflows/test.yml")) as any).jobs["test-pg"]?.steps.find((s: any) => s.name === "Test on Postgres");
+  expect(step, "test-pg's 'Test on Postgres' step not found").toBeDefined();
+  const find = (step.run as string).split("\n").map(line => line.trim()).find(line => line.includes("find "));
+  expect(find, "test-pg's step has no find line").toBeDefined();
+  expect(find, "test-pg excludes a file").not.toContain("!");
+  const roots = [...find!.matchAll(/\.\/([\w/.-]+)/g)].map(m => m[1]!.replace(/\/$/, "") + "/");
+  expect(roots.length).toBeGreaterThan(0);
+  for (const r of roots) expect(existsSync(resolve(root, r)), `test-pg root ${r} is missing`).toBe(true);
+  const present = [...new Bun.Glob("{src,tests,adapters,plugins}/**/*.pg.test.ts").scanSync({ cwd: root })].filter(path => !path.includes("node_modules/")).sort();
+  expect(present.length).toBeGreaterThan(0);
+  expect(present.filter(path => !roots.some(r => path.startsWith(r)))).toEqual([]);
 });

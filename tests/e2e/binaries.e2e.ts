@@ -1,6 +1,7 @@
 // A release's compiled binaries, before they're published: release.yml runs
 // this per target against the build job's artifacts. GRAYBOARD_E2E_BIN_DIR
-// holds grayboard-<target> and grayboard-server-<target> for this machine;
+// holds grayboard-<target>, grayboard-server-<target> and
+// grayboard-inspect-<target> for this machine;
 // GRAYBOARD_E2E_TAG is the tag being released. Not part of `bun test`'s
 // default run (the .e2e.ts suffix); run it with
 //   bun test ./tests/e2e/binaries.e2e.ts
@@ -28,6 +29,7 @@ const TAG = required("GRAYBOARD_E2E_TAG");
 const TARGET = `${process.platform}-${process.arch}`;
 const CLI = join(BIN_DIR, `grayboard-${TARGET}`);
 const SERVER = join(BIN_DIR, `grayboard-server-${TARGET}`);
+const INSPECT = join(BIN_DIR, `grayboard-inspect-${TARGET}`);
 
 let dir: string;
 let label: string;
@@ -42,8 +44,10 @@ beforeEach(() => {
 // server's env file and database) and the server's log.
 afterEach(async () => {
   try {
-    await closeSessions();
-    await Promise.all(hosted.splice(0).map((h) => h.close()));
+    // Every session closes, and the list empties, whichever close fails.
+    const closed = await Promise.allSettled([closeSessions(), ...hosted.splice(0).map((h) => h.close())]);
+    const failed = closed.find((r) => r.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   } finally {
     const s = server;
     server = undefined;
@@ -98,10 +102,12 @@ async function serverFromEnvFile(): Promise<{ server: ServerProcess; dbPath: str
     // Inbox polling spends hosted requests.
     "GRAYBOARD_HOSTED_REQUEST_BURST=10000",
     "GRAYBOARD_HOSTED_REQUEST_PER_SEC=10000",
+    "GRAYBOARD_HOSTED_SUBSCRIBER_BURST=10000",
+    "GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC=10000",
     "",
   ].join("\n"));
   const { GRAYBOARD_DB_PATH: dbPath, ...env } = readEnvFile(envFile);
-  return { server: await ServerProcess.start(SERVER, dbPath!, env), dbPath: dbPath! };
+  return { server: await ServerProcess.start(SERVER, { dbPath: dbPath! }, env), dbPath: dbPath! };
 }
 
 test("server: the compiled server, started from an env file, relays a DM and its reply between hosted MCP sessions", async () => {
@@ -112,9 +118,9 @@ test("server: the compiled server, started from an env file, relays a DM and its
   // through the server's own database beside the running process (WAL), since
   // the compiled server's upstream Google sign-in can't be stubbed.
   const store = openDatabase(started.dbPath, { blobDir: join(dir, "blobs") });
-  const token = (email: string) => issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT).token;
+  const token = async (email: string) => (await issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT)).token;
   const session = async (email: string, identity: string) => {
-    const h = new HostedSession(`${server!.base}/mcp`, token(email), identity);
+    const h = new HostedSession(`${server!.base}/mcp`, await token(email), identity);
     hosted.push(h);
     await h.connect();
     return h;
@@ -134,4 +140,25 @@ test("server: the compiled server, started from an env file, relays a DM and its
   await be.call("dm_send", { to: "bob@example.com/fe", body: "pong", parent_id: got.id });
   const reply = (await fe.next(direct((m) => m.body === "pong"), 10_000)).event.message;
   expect(reply.parent_id).toBe(q.message_id);
+
+  // The compiled inspector reads the schema this server writes (#608): the
+  // round trip's DMs and the live handles' last_seen, from aliases.
+  const inspector = Bun.spawn([INSPECT, "--db", started.dbPath, "--port", "0"], { stdout: "pipe", stderr: "pipe" });
+  try {
+    const reader = inspector.stdout.getReader();
+    let banner = "";
+    while (!banner.includes("\n")) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`grayboard-inspect exited: ${await new Response(inspector.stderr).text()}`);
+      banner += new TextDecoder().decode(value);
+    }
+    const base = banner.match(/http:\/\/127\.0\.0\.1:\d+\//)![0];
+    const overview = await (await fetch(`${base}api/overview`)).json() as { totals: { dms: number }; handles: { name: string; last_seen: number }[] };
+    expect(overview.totals.dms).toBe(2);
+    const be = overview.handles.find((h) => h.name === "alice@example.com/be");
+    expect(Date.now() - be!.last_seen).toBeLessThan(60_000);
+  } finally {
+    inspector.kill();
+    await inspector.exited;
+  }
 }, 60_000);

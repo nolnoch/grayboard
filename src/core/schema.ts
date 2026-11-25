@@ -5,8 +5,8 @@ import type { Database } from "bun:sqlite";
 export function initCoreSchema(db: Database): void {
   db.exec(`
     -- The 1.x roster, replaced by aliases and ids (#284). Nothing reads or
-    -- writes it after each mode's open seeds aliases from it; it stays
-    -- because schema changes are additive.
+    -- writes it after each mode's open seeds aliases from it, but for local
+    -- mode's 1.x case move (#216); it stays because schema changes are additive.
     CREATE TABLE IF NOT EXISTS handles (
       name        TEXT PRIMARY KEY,
       first_seen  INTEGER NOT NULL,
@@ -94,6 +94,8 @@ export function initCoreSchema(db: Database): void {
       notified_id  INTEGER NOT NULL,
       PRIMARY KEY (board, handle)
     );
+    -- A handle's own subscriptions (the digest read on every pending check, #900): the key leads with board.
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_handle ON subscriptions(handle);
 
     -- Per-handle pending pushes (mentions, thread replies, push-mode subs).
     CREATE TABLE IF NOT EXISTS outbox (
@@ -148,6 +150,10 @@ export function initCoreSchema(db: Database): void {
       at          INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
+    -- A key's history: a release's repeat (#254) and a queue post's past lanes (#220).
+    CREATE INDEX IF NOT EXISTS idx_claim_events_key ON claim_events(key);
+    -- A queue board's rotation reads each lane's latest delivery (#221).
+    CREATE INDEX IF NOT EXISTS idx_claim_events_take ON claim_events(board, handle, at) WHERE event = 'take';
 
     -- Which session held which name, and when (#182): the join between a
     -- session's run metadata and a name. event: bound, moved (a rebind;
@@ -176,6 +182,8 @@ export function initCoreSchema(db: Database): void {
       detail  TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at);
+    -- lastCoreAudit's (action, target) lookup, newest first (#295).
+    CREATE INDEX IF NOT EXISTS idx_audit_log_action_target ON audit_log(action, target, at);
 
     -- File attachments (src/core/attachments.ts). The catalog of stored
     -- blobs, one per content hash; the bytes are in the mode's BlobStore. A
@@ -208,6 +216,18 @@ export function initCoreSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_attachments_unbound ON attachments(created_at) WHERE message_id IS NULL AND post_id IS NULL;
     CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader);
   `);
+  // The claimant's signed-in user (server only; #855): a claim's expiry and a session end's release post
+  // carry it as author_user, so they're marked other_user/ungranted like the holder's own posts. Never shown:
+  // claim rows reach callers through CLAIM_COLS (src/core/claims.ts), which leaves it out.
+  const claimCols = new Set((db.prepare(`PRAGMA table_info(claims)`).all() as { name: string }[]).map((c) => c.name));
+  if (!claimCols.has("holder_user")) db.exec(`ALTER TABLE claims ADD COLUMN holder_user TEXT`);
+  // The session holding a claim event's handle when the row was written (#1351): the alias's holder, else the handle
+  // when it is a session ID; null for an alias no session held, and for rows from before it. A queue lane's take
+  // history follows it while that session is live (queueLaneRowsSql, redeliveryFacts). The index comes after the
+  // ALTER: on an old database the column doesn't exist until it runs.
+  const claimEventCols = new Set((db.prepare(`PRAGMA table_info(claim_events)`).all() as { name: string }[]).map((c) => c.name));
+  if (!claimEventCols.has("session_id")) db.exec(`ALTER TABLE claim_events ADD COLUMN session_id TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_claim_events_take_sid ON claim_events(board, session_id, at) WHERE event = 'take'`);
   // Session end and kinds (#284 PR 2). held_aliases_json: the aliases the ID
   // held when it ended, for the id_ended hint and bounces. delivery: 'push'
   // (default) or 'none', a tools-only process (BUS_PUSH=off) that receives
@@ -228,13 +248,15 @@ export function initCoreSchema(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_viewer ON ids(id) WHERE viewer = 1`);
   // keyed: the ID came from a session key (#284 S10), so a later session can
   // present it again. Retention deletes an ended ids row (pruneEndedIds); a
-  // keyed one leaves a pruned_ids row, so a key re-used after the prune is
-  // audited id.reused rather than registering silently. Unkeyed IDs are
+  // keyed one leaves a pruned_ids row, so a key re-used after the prune, within
+  // TOMBSTONE_HORIZON_MS (#333), is audited id.reused rather than registering silently. Unkeyed IDs are
   // random and never come back, so they leave none.
   if (!idCols.has("keyed")) db.exec(`ALTER TABLE ids ADD COLUMN keyed INTEGER NOT NULL DEFAULT 0`);
-  // Metadata (#284 S12). An ID's model and effort are what its launch
-  // reported (BUS_MODEL, BUS_EFFORT; the former hello), display facts that end
-  // with the session. An alias's task, owner, source_board, spec_hash and
+  // Local conversation restore is opt-in; runner promotion never changes provenance.
+  if (!idCols.has("local_resume")) db.exec(`ALTER TABLE ids ADD COLUMN local_resume INTEGER NOT NULL DEFAULT 0`);
+  // Metadata (#284 S12). An ID's model and effort are what it reported:
+  // at launch in local mode (BUS_MODEL, BUS_EFFORT), the latest on its requests
+  // when hosted (#364), display facts that end with the session. An alias's task, owner, source_board, spec_hash and
   // description are one-line labels its binder sets (`bind(…, meta)`), never
   // a reference or task state (decision 12). When it was bound is
   // binding_events' record, not a column.
@@ -245,6 +267,21 @@ export function initCoreSchema(db: Database): void {
   // hello under (#351), so a logout ends the token's IDs in their grace too,
   // which have no connection to find them by. Server-only; null locally.
   if (!idCols.has("token_session")) db.exec(`ALTER TABLE ids ADD COLUMN token_session INTEGER`);
+  // root_id: the root session a child session (a harness subagent, #523) acts
+  // under; null for a root. A child ID is never an address: a send or mention
+  // to it is refused child_session naming the root's primary (undeliverableId).
+  // Kept on the ids row, not the hosted store's, because a hosted child's
+  // source row is deleted when the child ends; a local child's row is ended
+  // with its root's (endSession). A hosted ID that later starts as a root
+  // clears it (hostedRoot).
+  if (!idCols.has("root_id")) db.exec(`ALTER TABLE ids ADD COLUMN root_id TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_root ON ids(root_id) WHERE root_id IS NOT NULL`);
+  // harness_session: the harness's own id for the session this one serves
+  // (BUS_HARNESS_SESSION; pi's getSessionId()), null when the harness passes
+  // none. A subagent process the harness started for that session (pi-subagents'
+  // detached runner, BUS_PARENT_SESSION) finds its root by it (#523 step 5).
+  if (!idCols.has("harness_session")) db.exec(`ALTER TABLE ids ADD COLUMN harness_session TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_harness_session ON ids(harness_session) WHERE harness_session IS NOT NULL`);
   const aliasCols = new Set((db.prepare(`PRAGMA table_info(aliases)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["task", "TEXT"], ["owner", "TEXT"], ["source_board", "TEXT"], ["spec_hash", "TEXT"], ["description", "TEXT"]]) {
     if (!aliasCols.has(col!)) db.exec(`ALTER TABLE aliases ADD COLUMN ${col} ${type}`);
@@ -256,6 +293,8 @@ export function initCoreSchema(db: Database): void {
       pruned_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_ids_ended ON ids(ended_at) WHERE ended_at IS NOT NULL;
+    -- Live rows only: every local open's orphan and tools-only probes (liveSessions) read just these (#338).
+    CREATE INDEX IF NOT EXISTS idx_ids_live ON ids(id) WHERE ended_at IS NULL;
   `);
 
   // The 1.x roster's later columns, which each mode's alias seed reads.
@@ -270,6 +309,24 @@ export function initCoreSchema(db: Database): void {
   // The session that wrote the post (#284), beside the address it posted as;
   // null for posts from before it, and for writers with no session.
   if (!postCols.some((c) => c.name === "author_id")) db.exec(`ALTER TABLE posts ADD COLUMN author_id TEXT`);
+  // The child session that wrote it (#523), when the writer was a harness
+  // subagent acting under its root's addresses; equal to author_id then, and
+  // null for a root's own writes. Stored at write time: a hosted child's
+  // source row is gone once it ends, so childhood can't be derived at read.
+  if (!postCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE posts ADD COLUMN via TEXT`);
+  // The writer's signed-in user on a server (security audit F-10), so a reader
+  // of another user can be told so; null locally, for posts from before it,
+  // and for system posts. Never shown on reads (POST_COLS).
+  if (!postCols.some((c) => c.name === "author_user")) db.exec(`ALTER TABLE posts ADD COLUMN author_user TEXT`);
+  // Whether the post bears the human mark (#1355): 1 for a declared human's own words, judged when it's written, 0
+  // for every other post (a system post written as a human's handle among them); null for posts from before it, which
+  // fall back to whether the author is the declared human at delivery (postHuman). Never shown on reads (POST_COLS).
+  if (!postCols.some((c) => c.name === "human")) db.exec(`ALTER TABLE posts ADD COLUMN human INTEGER`);
+  // The root of the session that wrote it (#540), judged when it's written: author_id's ids.root_id, or author_id
+  // itself for a root's post; null with no author_id and for posts from before it, which fall back to the author's
+  // root as it is now. NOT_OWN reads it, so a raw ID's later change of role (a former child starting as a root clears
+  // its root_id; a root registered as a child gains one) never moves its earlier posts. Never shown on reads.
+  if (!postCols.some((c) => c.name === "author_root")) db.exec(`ALTER TABLE posts ADD COLUMN author_root TEXT`);
 
   // The principal an upload counts against (#284 decision 13): a server
   // user's email, null in local mode. Backfilled from the uploader's "email/"
@@ -284,6 +341,12 @@ export function initCoreSchema(db: Database): void {
   // next push that does (0): a thread reply to a bystander.
   const outboxCols = db.prepare(`PRAGMA table_info(outbox)`).all() as { name: string }[];
   if (!outboxCols.some((c) => c.name === "wake")) db.exec(`ALTER TABLE outbox ADD COLUMN wake INTEGER NOT NULL DEFAULT 1`);
+  // The session holding the row's handle when the push was written (#1370), by claim_events.session_id's rule (#1351):
+  // the alias's holder, else the handle when it is a session ID; null for an alias no session held, and for rows from
+  // before it. A queue lane's push history follows it while that session is live (queueLaneRowsSql). The index after
+  // the ALTER, as claim_events'.
+  if (!outboxCols.some((c) => c.name === "session_id")) db.exec(`ALTER TABLE outbox ADD COLUMN session_id TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_outbox_session ON outbox(session_id, post_id) WHERE session_id IS NOT NULL`);
 
   // A refused binding event's repeats (#210): NULL count means 1, NULL
   // last_at means at.
@@ -299,4 +362,9 @@ export function initCoreSchema(db: Database): void {
   // Queue boards deliver each post to exactly one subscriber (the claim IS the
   // delivery); broadcast (the default) fans out to every push subscriber.
   if (!cols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE boards ADD COLUMN kind TEXT NOT NULL DEFAULT 'broadcast'`);
+
+  // An archived board (#635): out of board_list, closed to new top-level
+  // posts, readable by name. NULL means open.
+  if (!cols.some((c) => c.name === "archived_at")) db.exec(`ALTER TABLE boards ADD COLUMN archived_at INTEGER`);
+  if (!cols.some((c) => c.name === "archived_by")) db.exec(`ALTER TABLE boards ADD COLUMN archived_by TEXT`);
 }

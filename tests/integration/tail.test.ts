@@ -2,14 +2,15 @@
 // processes: it gets a board's posts, is never listed, notified or
 // addressable, and a tail killed hard is ended by the next opener.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
-import { closeSessions, localSession, type Session } from "../support/mcp.ts";
+import { GRAYBOARD_AGENT_META } from "../../src/shared/session_meta.ts";
+import { closeSessions, localSession, refusal } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
+import { busRows } from "../support/local_bus.ts";
 
 let dir: string;
 const tails: Bun.Subprocess[] = [];
@@ -24,21 +25,8 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function rows<T>(sql: string, ...args: (string | number)[]): T[] {
-  const db = new Database(join(dir, "bus.db"), { readonly: true });
-  try {
-    return db.prepare(sql).all(...args) as T[];
-  } finally {
-    db.close();
-  }
-}
+const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 
-async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
-  const r = await s.c.callTool({ name, arguments: args });
-  const text = (r.content as { text: string }[])[0]!.text;
-  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
-  return text;
-}
 
 // A running `grayboard tail <board>`, its output read as it arrives, and its
 // session ID once it has registered.
@@ -78,6 +66,22 @@ test("a tail is a viewer session: it gets the board's posts, and isn't listed, n
   expect(JSON.stringify(seen)).not.toContain(t.id);
   expect(await refusal(be, "dm_send", { to: t.id, body: "hi" })).toBe(`error: not_found: no session ${t.id}`);
   expect(await refusal(be, "board_post", { board: "e2e", body: `@${t.id} hi` })).toBe(`error: not_found: no session ${t.id}`);
+}, 20_000);
+
+// #523: a child's post (a harness subagent's, through its root) names it
+// after the author, backlog and live alike; the root's post names the author alone.
+test("a tail names a child's posts by their author and the subagent, as the harness's claim", async () => {
+  const be = await localSession(dir, "be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const asChild = (body: string) => be.c.callTool({ name: "board_post", arguments: { board: "e2e", body }, _meta: { [GRAYBOARD_AGENT_META]: "reviewer-1" } });
+  expect((await asChild("from the backlog")).isError).toBeFalsy();
+  const child = rows<{ id: string }>(`SELECT id FROM ids WHERE root_id IS NOT NULL`)[0]!.id;
+  const t = await tail("e2e");
+  await until(() => t.out().includes(`be (subagent ${child}, harness-asserted): from the backlog`));
+  expect((await asChild("live")).isError).toBeFalsy();
+  await be.call("board_post", { board: "e2e", body: "the root's own" });
+  await until(() => t.out().includes("be: the root's own"));
+  expect(t.out()).toContain(`be (subagent ${child}, harness-asserted): live`);
 }, 20_000);
 
 test("a tail stopped by a signal ends its session; one killed hard is ended by the next process to open the bus", async () => {

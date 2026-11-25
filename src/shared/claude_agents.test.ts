@@ -1,0 +1,497 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { dropCalled, dropSignIn, factReader, HOOK_ERROR, hasCalled, LEFTOVER_TTL_MS, markCalled, ownDir, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
+import { SIGN_IN_FLOW_MS } from "./signin.ts";
+import { procStart } from "./proc.ts";
+import { pauseEnv, releasePause } from "../../tests/support/local_bus.ts";
+import { until } from "../../tests/support/until.ts";
+
+let base: string;
+const pid = process.pid;
+const env = { CLAUDE_PID: String(pid) };
+const hook = (event: string, input: Record<string, unknown>, hosted = false, now?: number) =>
+  runHook(event, JSON.stringify(input), { base, env, hosted, ...(now ? { now } : {}) });
+const start = () => procStart(pid) ?? null;
+const id = (n: number | string) => `toolu_01ABC${n}`;
+
+beforeEach(() => { base = mkdtempSync(join(tmpdir(), "gb-agents-")); });
+afterEach(() => rmSync(base, { recursive: true, force: true }));
+
+describe("records", () => {
+  test("a subagent's call names its agent; a main-agent call is the root", () => {
+    hook("session-start", { hook_event_name: "SessionStart" });
+    hook("pre-tool-use", { tool_use_id: id(1), agent_id: "a573e90bd84bce7ff" });
+    hook("pre-tool-use", { tool_use_id: id(2) });
+    expect(takeRecord(base, pid, start(), id(1))).toEqual({ agent: "a573e90bd84bce7ff" });
+    expect(takeRecord(base, pid, start(), id(2))).toEqual({ agent: null });
+    // Taken once.
+    expect(takeRecord(base, pid, start(), id(1))).toEqual({ missing: "absent" });
+    expect(readdirSync(sessionDir(base, pid)).sort()).toEqual(["start"]);
+  });
+
+  test("a bad tool_use_id is never written and always refused", () => {
+    hook("session-start", {});
+    for (const bad of ["../start", "toolu_", "toolu_a/b", "x".repeat(10), `toolu_${"a".repeat(129)}`]) {
+      hook("pre-tool-use", { tool_use_id: bad, agent_id: "a1" });
+      expect(takeRecord(base, pid, start(), bad)).toEqual({ missing: "bad_tool_use_id" });
+    }
+    expect(readdirSync(sessionDir(base, pid))).toEqual(["start"]);
+  });
+
+  test("a bad agent id writes nothing, and a forged bad record is refused", () => {
+    hook("session-start", {});
+    hook("pre-tool-use", { tool_use_id: id(1), agent_id: "a\nb" });
+    hook("pre-tool-use", { tool_use_id: id(2), agent_id: ROOT });
+    hook("pre-tool-use", { tool_use_id: id(3), agent_id: 7 });
+    expect(readdirSync(sessionDir(base, pid))).toEqual(["start"]);
+    writeFileSync(join(sessionDir(base, pid), id(4)), "x\u0000y");
+    expect(takeRecord(base, pid, start(), id(4))).toEqual({ missing: "bad_record" });
+  });
+
+  test("no SessionStart and a recycled pid each count as absent; an old record is still taken", () => {
+    hook("pre-tool-use", { tool_use_id: id(1) });
+    expect(takeRecord(base, pid, start(), id(1))).toEqual({ missing: "no_session" });
+    hook("session-start", {});
+    hook("pre-tool-use", { tool_use_id: id(2) });
+    // A call can wait on Claude Code's permission prompt for any time after PreToolUse.
+    const old = (Date.now() - 60 * 60_000) / 1000;
+    utimesSync(join(sessionDir(base, pid), id(2)), old, old);
+    expect(takeRecord(base, pid, start(), id(2))).toEqual({ agent: null });
+    hook("pre-tool-use", { tool_use_id: id(3) });
+    expect(takeRecord(base, pid, "Mon Jan  1 00:00:00 2001", id(3))).toEqual({ missing: "recycled_pid" });
+    // An unknown start on the reader's side accepts the dir.
+    expect(takeRecord(base, pid, null, id(3))).toEqual({ agent: null });
+  });
+
+  test("two concurrent takes give the record to one reader", async () => {
+    hook("session-start", {});
+    const n = 20;
+    for (let i = 0; i < n; i++) hook("pre-tool-use", { tool_use_id: id(i), agent_id: `a${i}` });
+    const script = join(base, "take.ts");
+    writeFileSync(script, `import { takeRecord } from ${JSON.stringify(join(import.meta.dir, "claude_agents.ts"))};
+const out = []; for (let i = 0; i < ${n}; i++) out.push(takeRecord(process.argv[2], ${pid}, null, "toolu_01ABC" + i));
+console.log(JSON.stringify(out));`);
+    const run = () => Bun.spawn(["bun", script, base], { stdout: "pipe" });
+    const [a, b] = [run(), run()];
+    const [ra, rb] = await Promise.all([new Response(a.stdout).text(), new Response(b.stdout).text()]);
+    const xs = JSON.parse(ra) as { agent?: string }[], ys = JSON.parse(rb) as { agent?: string }[];
+    for (let i = 0; i < n; i++) {
+      const got = [xs[i], ys[i]].filter(r => r && "agent" in r);
+      expect(got).toEqual([{ agent: `a${i}` }]);
+    }
+  });
+
+  test("the hook keeps at most RECORD_CAP records and prunes old takes", () => {
+    hook("session-start", {});
+    const dir = sessionDir(base, pid);
+    const old = (Date.now() - LEFTOVER_TTL_MS - 1000) / 1000;
+    writeFileSync(join(dir, `${id("x")}.taken.1`), "a");
+    utimesSync(join(dir, `${id("x")}.taken.1`), old, old);
+    writeFileSync(join(dir, `${id("y")}.taken.2`), "a");
+    for (let i = 0; i < RECORD_CAP + 5; i++) {
+      writeFileSync(join(dir, id(`r${i}`)), JSON.stringify({ agent: null }));
+      const t = (Date.now() - (RECORD_CAP + 5 - i) * 1000) / 1000;
+      utimesSync(join(dir, id(`r${i}`)), t, t);
+    }
+    hook("pre-tool-use", { tool_use_id: id("new") });
+    const names = readdirSync(dir);
+    expect(names.filter(n => /^toolu_[A-Za-z0-9_]+$/.test(n)).length).toBe(RECORD_CAP);
+    expect(names).toContain(id("new"));
+    expect(names).not.toContain(id("r0"));
+    expect(names).not.toContain(`${id("x")}.taken.1`);
+    expect(names).toContain(`${id("y")}.taken.2`);
+  });
+});
+
+describe("session lifecycle", () => {
+  test("SessionEnd removes the dir, except on /clear", () => {
+    hook("session-start", {});
+    hook("pre-tool-use", { tool_use_id: id(1) });
+    hook("session-end", { reason: "clear" });
+    expect(takeRecord(base, pid, start(), id(1))).toEqual({ agent: null });
+    hook("session-end", { reason: "prompt_input_exit" });
+    expect(existsSync(sessionDir(base, pid))).toBe(false);
+  });
+
+  // Claude Code's SessionEnd reasons: clear, resume, logout, prompt_input_exit, other; /resume sends `resume` in a process that lives on (#588).
+  test("hosted: SessionEnd on /resume keeps the dir and its sign-in link; local's resume and hosted's exit remove it", () => {
+    const url = "https://gb.example.com/authorize?client_id=x&state=s";
+    hook("session-start", {}, true);
+    putSignIn(base, pid, url);
+    hook("session-end", { reason: "resume" }, true);
+    hook("session-start", { source: "resume" }, true);
+    expect(JSON.parse(hook("post-tool-use", { tool_use_id: id(1) }, true)!).systemMessage).toBe(`grayboard: open ${url} to sign in`);
+    hook("session-end", { reason: "prompt_input_exit" }, true);
+    expect(existsSync(sessionDir(base, pid))).toBe(false);
+    hook("session-start", {});
+    hook("session-end", { reason: "resume" });
+    expect(existsSync(sessionDir(base, pid))).toBe(false);
+  });
+
+  test("SessionStart prunes a dead session's dir and keeps a live one's", () => {
+    const dead = join(base, "claude-agents", "999999");
+    mkdirSync(dead, { recursive: true });
+    writeFileSync(join(dead, "start"), "x");
+    const live = join(base, "claude-agents", String(process.ppid));
+    mkdirSync(live, { recursive: true });
+    writeFileSync(join(live, "start"), procStart(process.ppid) ?? "");
+    hook("session-start", {});
+    expect(existsSync(dead)).toBe(false);
+    expect(existsSync(live)).toBe(true);
+  });
+
+  test("SubagentStop's marker is hosted-only and consumed once", () => {
+    hook("session-start", {});
+    hook("subagent-stop", { agent_id: "a1" });
+    expect(takeEnded(base, pid)).toEqual([]);
+    hook("subagent-stop", { agent_id: "a1" }, true);
+    hook("subagent-stop", { agent_id: "a2" }, true);
+    expect(takeEnded(base, pid).sort()).toEqual(["a1", "a2"]);
+    expect(takeEnded(base, pid)).toEqual([]);
+  });
+
+  test("a noted subagent call is taken once per agent, whatever its id holds; none noted is false (#555)", () => {
+    expect(hasCalled(base, pid)).toBe(false);
+    expect(takeCalled(base, pid, "a1")).toBe(false);
+    const odd = `../${"x".repeat(1000)}/a2`;
+    markCalled(base, pid, "a1");
+    markCalled(base, pid, odd);
+    markCalled(base, pid, "a1");
+    expect(hasCalled(base, pid)).toBe(true);
+    expect(takeCalled(base, pid, "a1")).toBe(true);
+    expect(takeCalled(base, pid, "a1")).toBe(false);
+    expect(takeCalled(base, pid, odd)).toBe(true);
+    expect(hasCalled(base, pid)).toBe(false);
+  });
+
+  test("a recycled pid's SessionStart drops the earlier holder's notes and ends; ownDir tells the dirs apart (#555)", () => {
+    expect(ownDir(base, pid, start())).toBe(false);
+    hook("session-start", {}, true);
+    expect(ownDir(base, pid, start())).toBe(true);
+    markCalled(base, pid, "a1");
+    hook("subagent-stop", { agent_id: "a1" }, true);
+    // The same process starting again (/clear, /resume) keeps them.
+    hook("session-start", { source: "clear" }, true);
+    expect(hasCalled(base, pid)).toBe(true);
+    // An earlier holder of this pid wrote the dir.
+    writeFileSync(join(sessionDir(base, pid), "start"), "1");
+    expect(ownDir(base, pid, start())).toBe(false);
+    expect(ownDir(base, pid, null)).toBe(true);
+    hook("session-start", {}, true);
+    expect(hasCalled(base, pid)).toBe(false);
+    expect(takeEnded(base, pid)).toEqual([]);
+    expect(ownDir(base, pid, start())).toBe(true);
+    markCalled(base, pid, "a2");
+    dropCalled(base, pid);
+    expect(hasCalled(base, pid)).toBe(false);
+  });
+
+  test("SubagentStop keeps at most RECORD_CAP undrained markers, dropping the oldest", () => {
+    hook("session-start", {});
+    for (let i = 0; i <= RECORD_CAP + 2; i++) {
+      runHook("subagent-stop", JSON.stringify({ agent_id: `a${i}` }), { base, env: { CLAUDE_PID: String(pid) }, hosted: true, now: 1_000 + i });
+    }
+    const got = takeEnded(base, pid);
+    expect(got.length).toBe(RECORD_CAP);
+    expect(got).not.toContain("a0");
+    expect(got).toContain(`a${RECORD_CAP + 2}`);
+  });
+
+  test("a hook without CLAUDE_PID or with bad input does nothing and never throws", () => {
+    runHook("session-start", "{}", { base, env: {}, hosted: false });
+    runHook("pre-tool-use", "not json", { base, env, hosted: false });
+    expect(existsSync(join(base, "claude-agents"))).toBe(false);
+  });
+});
+
+describe("facts (#545)", () => {
+  const said: string[] = [];
+  const facts = () => readFacts(base, pid, start(), (fact, error) => said.push(`${fact}: ${error}`));
+  beforeEach(() => { said.length = 0; });
+
+  test("SessionStart's model, then PostModelSwitch's; the root's PreToolUse effort", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "medium" } }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "medium" });
+    // A switch drops the old model's effort until the next root call names one.
+    hook("model-switch", { from_model: "claude-opus-5-5", to_model: "claude-haiku-4-5" }, true);
+    expect(facts()).toEqual({ model: "claude-haiku-4-5" });
+    hook("pre-tool-use", { tool_use_id: id(2), effort: { level: "high" } }, true);
+    expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: "high" });
+    // /clear: SessionStart carries no model (2.1.316), so both facts stay.
+    hook("session-start", { source: "clear" }, true);
+    expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: "high" });
+    // A root call on a model without effort says it has none (#558): null, which the wire sends as a clear.
+    hook("pre-tool-use", { tool_use_id: id(3) }, true);
+    expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: null });
+    // A null level, or a null effort, is none as well (#563 item 4).
+    for (const effort of [{ level: null }, null]) {
+      hook("pre-tool-use", { tool_use_id: id(5), effort: { level: "high" } }, true);
+      hook("pre-tool-use", { tool_use_id: id(6), effort }, true);
+      expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: null });
+    }
+    // A switch makes it unknown again (left out, so the server keeps its value), not none.
+    hook("model-switch", { from_model: "claude-haiku-4-5", to_model: "claude-opus-5-5" }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    // A new process's SessionStart removes a none, too.
+    hook("pre-tool-use", { tool_use_id: id(4) }, true);
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    expect(said).toEqual([]);
+  });
+
+  test("a fact-writing hook that fails leaves its reason, which the reader says; the next success removes it (#561)", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    const dir = sessionDir(base, pid);
+    // A directory where the effort goes: the write fails, and the hook still never throws.
+    mkdirSync(join(dir, "effort", "x"), { recursive: true });
+    expect(() => hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "high" } }, true)).not.toThrow();
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    expect(said.map(s => s.split(":")[0])).toEqual(["effort", "hook"]);
+    expect(said[1]).toStartWith("hook: pre-tool-use: ");
+    // Without the temporary's pid: every hook is a new process, and a lasting failure must read the same.
+    expect(said[1]).toContain("effort.tmp");
+    expect(said[1]).not.toMatch(/\.tmp\.\d/);
+    // A hook that wrote no fact neither clears it (a subagent's call, an invalid one, a /clear without a model)...
+    hook("pre-tool-use", { tool_use_id: id(7), agent_id: "sub-1" }, true);
+    hook("pre-tool-use", { tool_use_id: "bad id" }, true);
+    hook("model-switch", { to_model: "" }, true);
+    hook("session-start", { source: "clear" }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(true);
+    // ...nor fails one: a subagent's record that can't be written is the reader's missing-record error.
+    const before = readFileSync(join(dir, HOOK_ERROR), "utf8");
+    mkdirSync(join(dir, id(8), "x"), { recursive: true });
+    hook("pre-tool-use", { tool_use_id: id(8), agent_id: "sub-1" }, true);
+    expect(readFileSync(join(dir, HOOK_ERROR), "utf8")).toBe(before);
+    rmSync(join(dir, "effort"), { recursive: true });
+    hook("pre-tool-use", { tool_use_id: id(2), effort: { level: "high" } }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(false);
+    said.length = 0;
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "high" });
+    expect(said).toEqual([]);
+    // A model switch's failed write is said too, and a startup SessionStart's success clears it.
+    mkdirSync(join(dir, "model.tmp." + process.pid, "x"), { recursive: true });
+    hook("model-switch", { to_model: "claude-haiku-4-5" }, true);
+    expect(readFileSync(join(dir, HOOK_ERROR), "utf8")).toStartWith("model-switch: ");
+    rmSync(join(dir, "model.tmp." + process.pid), { recursive: true });
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(false);
+  });
+
+  test("the reader folds a hook-error's control characters (#561)", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    writeFileSync(join(sessionDir(base, pid), HOOK_ERROR), "pre-tool-use: \x1b[31mred\u009b2J\nnext");
+    facts();
+    expect(said).toEqual(["hook: pre-tool-use:  [31mred 2J next"]);
+  });
+
+  test("the plugin's reader says a problem once, and again only after a read without it (#561)", () => {
+    const out: string[] = [];
+    let problems: [Parameters<Parameters<typeof readFacts>[3]>[0], string][] = [["effort", "bad"], ["hook", "pre-tool-use: full"]];
+    let other = false;
+    const read = factReader(bad => { if (other) return undefined; for (const [what, error] of problems) bad(what, error); return {}; }, text => out.push(text));
+    read(); read();
+    expect(out).toEqual(["the server gets no effort for this session: bad", "a grayboard hook failed, so the server may show a stale model or effort: pre-tool-use: full"]);
+    // Another process's dir reads nothing: no news, so nothing re-arms.
+    problems = []; other = true; read(); other = false;
+    problems = [["effort", "bad"]]; read();
+    expect(out).toHaveLength(2);
+    // Fixed, then broken again: said again; a new hook failure is its own.
+    problems = []; read();
+    problems = [["effort", "bad"], ["hook", "model-switch: full"]]; read();
+    expect(out.slice(2)).toEqual(["the server gets no effort for this session: bad", "a grayboard hook failed, so the server may show a stale model or effort: model-switch: full"]);
+  });
+
+  // #561 item 7: a root call's hook still running when a confirmed /model switch
+  // lands would write the old model's effort after the switch dropped it.
+  for (const [what, effort] of [["a level", { level: "max" }], ["none", undefined]] as const) {
+    test(`a root call's effort (${what}) that a model switch overtook drops itself`, async () => {
+      hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+      hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "low" } }, true);
+      const point = "hook-root-effort";
+      const input = JSON.stringify({ tool_use_id: id(2), ...(effort ? { effort } : {}) });
+      const child = Bun.spawn(["bun", "-e", `import { runHook } from ${JSON.stringify(join(import.meta.dir, "claude_agents.ts"))}; runHook("pre-tool-use", process.argv[1], { base: process.env.GB_BASE, env: process.env, hosted: true });`, input], {
+        env: { ...process.env, ...env, ...pauseEnv(base, point), GB_BASE: base }, stderr: "pipe", stdout: "ignore",
+      });
+      let err = "";
+      void (async () => { for await (const chunk of child.stderr) err += new TextDecoder().decode(chunk); })();
+      await until(() => err.includes(`test pause hit: ${point}`), 10_000, "the root call's hook reaching its effort write");
+      expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "low" });
+      hook("model-switch", { from_model: "claude-opus-5-5", to_model: "claude-haiku-4-5" }, true);
+      releasePause(base, point);
+      expect(await child.exited).toBe(0);
+      // Unknown, not the old model's effort: the next root call names the new model's.
+      expect(facts()).toEqual({ model: "claude-haiku-4-5" });
+      hook("pre-tool-use", { tool_use_id: id(3), effort: { level: "high" } }, true);
+      expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: "high" });
+      expect(said).toEqual([]);
+    });
+  }
+
+  test("a subagent's effort and malformed values write nothing", () => {
+    hook("session-start", { model: "claude-opus-5-5" }, true);
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "low" } }, true);
+    hook("pre-tool-use", { tool_use_id: id(2), agent_id: "a1", effort: { level: "max" } }, true);
+    hook("pre-tool-use", { tool_use_id: id(3), agent_id: "a1" }, true);
+    for (const bad of ["", "has space", "x".repeat(65), 5, { level: "high" }, "bad\nline"]) {
+      hook("pre-tool-use", { tool_use_id: id(4), effort: { level: bad } }, true);
+      hook("model-switch", { to_model: bad }, true);
+    }
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "low" });
+    // The server's limit is the hook's.
+    hook("model-switch", { to_model: "x".repeat(64) }, true);
+    expect(facts()?.model).toBe("x".repeat(64));
+  });
+
+  test("the local hook writes no facts", () => {
+    hook("session-start", { model: "claude-opus-5-5" });
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "high" } });
+    hook("model-switch", { to_model: "claude-haiku-4-5" });
+    expect(facts()).toEqual({});
+    expect(readdirSync(sessionDir(base, pid)).sort()).toEqual(["start", id(1)]);
+  });
+
+  test("no SessionStart record, a recycled pid's dir, and a malformed file", () => {
+    expect(facts()).toBeUndefined();
+    hook("model-switch", { to_model: "claude-haiku-4-5" }, true);
+    expect(facts()).toBeUndefined();
+    hook("session-start", { model: "claude-opus-5-5" }, true);
+    expect(readFacts(base, pid, "another start", () => {})).toBeUndefined();
+    // A bad file is left out and said; the good one still reads.
+    writeFileSync(join(sessionDir(base, pid), "effort"), "two words");
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    expect(said).toEqual([`effort: ${join(sessionDir(base, pid), "effort")} isn't a Claude Code effort`]);
+  });
+
+  test("a new process's SessionStart drops facts an earlier holder of the pid left; /clear keeps both", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "max" } }, true);
+    hook("session-start", { source: "clear" }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "max" });
+    hook("session-start", { source: "startup" }, true);
+    expect(facts()).toEqual({});
+  });
+
+  test("a link, a FIFO or an oversized fact file is said and left out, never followed, waited on or read whole", () => {
+    hook("session-start", { model: "claude-opus-5-5" }, true);
+    const dir = sessionDir(base, pid);
+    symlinkSync("/dev/zero", join(dir, "effort"));
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    rmSync(join(dir, "effort"));
+    execFileSync("mkfifo", [join(dir, "effort")]);
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    rmSync(join(dir, "model"));
+    writeFileSync(join(dir, "model"), "x".repeat(10_000));
+    expect(facts()).toEqual({});
+    expect(said.map(s => s.split(":")[0])).toEqual(["effort", "effort", "model", "effort"]);
+  });
+});
+
+describe("sign-in link (#500)", () => {
+  const post = (now?: number) => hook("post-tool-use", { hook_event_name: "PostToolUseFailure", tool_use_id: id(1) }, true, now);
+  const url = "https://gb.example.com/authorize?client_id=x&state=s";
+
+  test("a live link is the hook's systemMessage, the only output any event has", () => {
+    hook("session-start", {}, true);
+    expect(post()).toBeUndefined();
+    putSignIn(base, pid, url);
+    expect(JSON.parse(post()!)).toEqual({ systemMessage: `grayboard: open ${url} to sign in` });
+    // Other events still print nothing while it lives.
+    expect(hook("pre-tool-use", { tool_use_id: id(2) }, true)).toBeUndefined();
+    expect(hook("session-start", {}, true)).toBeUndefined();
+    dropSignIn(base, pid);
+    expect(post()).toBeUndefined();
+  });
+
+  test("loopback http is a link; other http, credentials, other schemes and junk are not", () => {
+    for (const ok of ["http://127.0.0.1:8080/authorize?x=1", "http://localhost:8080/authorize", "http://[::1]:8080/authorize"]) {
+      putSignIn(base, pid, ok);
+      expect(JSON.parse(post()!).systemMessage).toBe(`grayboard: open ${new URL(ok).href} to sign in`);
+    }
+    putSignIn(base, pid, `https://gb.example.com/authorize?state=${"s".repeat(2048)}`);
+    expect(post()).toBeUndefined();
+    for (const bad of ["http://gb.example.com/authorize", "https://u:p@gb.example.com/authorize", "javascript:alert(1)", "file:///etc/passwd", "not a url"]) {
+      putSignIn(base, pid, bad);
+      expect(post()).toBeUndefined();
+    }
+    const file = join(sessionDir(base, pid), SIGN_IN);
+    for (const junk of ["{", "null", "[]", JSON.stringify({ url }), JSON.stringify({ url: 7, at: Date.now() }), JSON.stringify({ url, at: "now" })]) {
+      writeFileSync(file, junk);
+      expect(post()).toBeUndefined();
+    }
+  });
+
+  test("a link older than a flow, or from the future, is a dead flow's", () => {
+    const now = Date.now();
+    putSignIn(base, pid, url, now - SIGN_IN_FLOW_MS);
+    expect(post(now)).toBeDefined();
+    putSignIn(base, pid, url, now - SIGN_IN_FLOW_MS - 1);
+    expect(post(now)).toBeUndefined();
+    putSignIn(base, pid, url, now + 1);
+    expect(post(now)).toBeUndefined();
+  });
+
+  test("another Claude Code process's link and the local hook show nothing", () => {
+    putSignIn(base, pid + 1, url);
+    expect(post()).toBeUndefined();
+    putSignIn(base, pid, url);
+    expect(hook("post-tool-use", { tool_use_id: id(1) }, false)).toBeUndefined();
+  });
+
+  test("an ended flow removes only its own link; a failed removal throws, a missing file doesn't", () => {
+    const newer = "https://gb.example.com/authorize?client_id=x&state=t";
+    putSignIn(base, pid, newer);
+    dropSignIn(base, pid, url);
+    expect(JSON.parse(post()!).systemMessage).toBe(`grayboard: open ${newer} to sign in`);
+    dropSignIn(base, pid, newer);
+    expect(post()).toBeUndefined();
+    dropSignIn(base, pid, url);
+    dropSignIn(base, pid);
+    const file = join(sessionDir(base, pid), SIGN_IN);
+    writeFileSync(file, "{");
+    dropSignIn(base, pid, url);
+    expect(existsSync(file)).toBe(true);
+    rmSync(file);
+    // A directory is no flow's link: a flow's removal leaves it; an unconditional one fails and throws.
+    mkdirSync(join(file, "x"), { recursive: true });
+    dropSignIn(base, pid, url);
+    expect(existsSync(file)).toBe(true);
+    expect(() => dropSignIn(base, pid)).toThrow();
+  });
+
+  // A same-user writer is outside #229's trust boundary, but a planted file must not stall or redirect the hook (#588).
+  test("a planted symlink, FIFO or oversized file is no link: never followed or waited on, and a flow's removal leaves it", () => {
+    const file = join(sessionDir(base, pid), SIGN_IN);
+    const target = join(base, "elsewhere");
+    writeFileSync(target, JSON.stringify({ url, at: Date.now() }));
+    mkdirSync(sessionDir(base, pid), { recursive: true });
+    symlinkSync(target, file);
+    expect(post()).toBeUndefined();
+    dropSignIn(base, pid, url);
+    expect(existsSync(target)).toBe(true);
+    rmSync(file);
+    execFileSync("mkfifo", [file]);
+    const t0 = Date.now();
+    expect(post()).toBeUndefined();
+    dropSignIn(base, pid, url);
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    rmSync(file);
+    writeFileSync(file, JSON.stringify({ url, at: Date.now(), pad: "x".repeat(20_000) }));
+    expect(post()).toBeUndefined();
+    // The next flow's link replaces whatever is there.
+    rmSync(file);
+    execFileSync("mkfifo", [file]);
+    putSignIn(base, pid, url);
+    expect(JSON.parse(post()!).systemMessage).toBe(`grayboard: open ${url} to sign in`);
+  });
+
+  test("the link file is private: 0600 in a 0700 dir", () => {
+    putSignIn(base, pid, url);
+    expect(statSync(sessionDir(base, pid)).mode & 0o777).toBe(0o700);
+    expect(statSync(join(sessionDir(base, pid), SIGN_IN)).mode & 0o777).toBe(0o600);
+  });
+});

@@ -1,17 +1,20 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startServer } from "./app.ts";
+import { startLimits, startServer } from "./app.ts";
+import { hashToken, mintToken } from "./auth.ts";
 import { Database } from "bun:sqlite";
 import { until } from "../../tests/support/until.ts";
 
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 const hostname = "127.0.0.1";
 
@@ -21,7 +24,7 @@ for (const trusted of [true, false]) test(`OAuth address limits use the actual a
   let clock = Date.now();
   try {
     app = startServer({
-      dbPath: ":memory:", blobDir: dir, httpPort: 0,
+      store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0,
       googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://rate.example.com",
       messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT,
       trustedProxies: trusted ? DEFAULT_TRUSTED_PROXIES : [], oauthLimit: { burst: 1, perSec: 1 }, oauthGlobalLimit: { burst: 10, perSec: 1 },
@@ -44,12 +47,12 @@ for (const trusted of [true, false]) test(`OAuth address limits use the actual a
   }
 });
 
-const restartConfig = (dir: string) => ({ dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://restart.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+const restartConfig = (dir: string) => ({ store: { kind: "sqlite" as const, path: join(dir, "bus.db") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://restart.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
 
 // A bound root with a child and an open delivery lease on a real server.
 async function leasedRoot(app: ReturnType<typeof startServer>) {
-  const issued = issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
-  const principal = app.oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${issued.token}` } }));
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const principal = await app.oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${issued.token}` } }));
   if (principal instanceof Response) throw new Error("fixture unauthorized");
   const context = sessionContext(principal, { [OPENCODE_SESSION_META]: "root" });
   await app.mcp.sessions.bind(principal, context, { name: "be", create: true });
@@ -68,11 +71,11 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
   const config = restartConfig(dir);
   let app: ReturnType<typeof startServer> | undefined;
   try {
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     const { principal, context, lease } = await leasedRoot(app);
     await app.stop(); app = undefined;
     const alive = Date.now() - (scenario === "idle" ? 20 * 60_000 : 300_000);
-    const outage = new Database(config.dbPath);
+    const outage = new Database(config.store.path);
     try {
       if (scenario === "no-heartbeat") outage.run("DELETE FROM server_state");
       else outage.run("UPDATE server_state SET value = ? WHERE key = 'alive_at'", [alive]);
@@ -86,12 +89,12 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
       }
     } finally { outage.close(); }
     const before = Date.now();
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     const after = Date.now();
-    const rows = app.repo.hosted.all();
+    const rows = await app.repo.hosted.all(app.repo.read);
     const credits = restartCredits(app);
     const released = () => app!.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='released' AND detail='expired'").get()?.count;
-    expect(app.repo.hosted.aliveAt()).toBeGreaterThanOrEqual(before);
+    expect(await app.repo.hosted.aliveAt(app.repo.read)).toBeGreaterThanOrEqual(before);
     // Every start is audited, credited or not; a fresh database has no heartbeat.
     const starts = serverStarts(app);
     expect(starts).toHaveLength(2);
@@ -105,7 +108,7 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
       expect(rows).toEqual([]);
       expect(credits).toEqual([]);
       expect(released()).toBe(1);
-      app.mcp.sessions.sweep();
+      await app.mcp.sessions.sweep();
       expect(released()).toBe(1);
       return;
     }
@@ -135,7 +138,7 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
       }
     }
     expect(released()).toBe(0);
-    expect(app.application.hostedHolder("you@example.com/be")).toBeDefined();
+    expect(await app.application.aliasHolderId(app.application.repo.read, "you@example.com/be")).not.toBeNull();
     expect(app.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='bound'").get()?.count).toBe(1);
     if (scenario !== "idle") expect((await app.mcp.delivery.open(principal, context)).ownership).toBe(lease.ownership);
   } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
@@ -146,20 +149,20 @@ test("a clean stop records its time, so a quick restart credits nothing", async 
   const config = restartConfig(dir);
   let app: ReturnType<typeof startServer> | undefined;
   try {
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     await leasedRoot(app);
-    const deadline = app.repo.hosted.all().find(row => !row.root_session_id)!.lease_deadline!;
+    const deadline = (await app.repo.hosted.all(app.repo.read)).find(row => !row.root_session_id)!.lease_deadline!;
     const stopping = Date.now();
     await app.stop(); app = undefined;
     const stopped = Date.now();
-    const outage = new Database(config.dbPath);
+    const outage = new Database(config.store.path);
     try {
       const alive = outage.query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()!.value;
       expect(alive).toBeGreaterThanOrEqual(stopping);
       expect(alive).toBeLessThanOrEqual(stopped);
     } finally { outage.close(); }
-    app = startServer(config, { hostname, background: false });
-    expect(app.repo.hosted.all().find(row => !row.root_session_id)!.lease_deadline).toBe(deadline);
+    app = startServer(config, { hostname, background: false }); await app.ready;
+    expect((await app.repo.hosted.all(app.repo.read)).find(row => !row.root_session_id)!.lease_deadline).toBe(deadline);
     expect(restartCredits(app)).toEqual([]);
   } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -169,29 +172,29 @@ test("a second opener during a credited restart doesn't credit the outage again"
   const config = restartConfig(dir);
   let app: ReturnType<typeof startServer> | undefined, second: ReturnType<typeof startServer> | undefined;
   try {
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     await leasedRoot(app);
     await app.stop(); app = undefined;
     const alive = Date.now() - 300_000;
-    const outage = new Database(config.dbPath);
+    const outage = new Database(config.store.path);
     try {
       outage.run("UPDATE server_state SET value = ? WHERE key = 'alive_at'", [alive]);
       outage.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE root_session_id IS NULL", [alive + 20_000]);
     } finally { outage.close(); }
-    app = startServer(config, { hostname, background: false });
-    const credited = app.repo.hosted.all().find(row => !row.root_session_id)!.lease_deadline!;
-    second = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
+    const credited = (await app.repo.hosted.all(app.repo.read)).find(row => !row.root_session_id)!.lease_deadline!;
+    second = startServer(config, { hostname, background: false }); await second.ready;
     expect(restartCredits(second)).toEqual([expect.objectContaining({ before: alive + 20_000, after: credited })]);
-    expect(second.repo.hosted.all().find(row => !row.root_session_id)!.lease_deadline).toBe(credited);
+    expect((await second.repo.hosted.all(second.repo.read)).find(row => !row.root_session_id)!.lease_deadline).toBe(credited);
   } finally { await second?.stop(); await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("a running server's liveness heartbeat advances", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-heartbeat-"));
-  const app = startServer(restartConfig(dir), { hostname, background: false });
+  const app = startServer(restartConfig(dir), { hostname, background: false }); await app.ready;
   try {
-    const first = app.repo.hosted.aliveAt()!;
-    await until(() => app.repo.hosted.aliveAt()! > first, 5_000);
+    const first = (await app.repo.hosted.aliveAt(app.repo.read))!;
+    await until(async () => (await app.repo.hosted.aliveAt(app.repo.read))! > first, 5_000);
   } finally { await app.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -218,7 +221,7 @@ test("an explicit startup hostname binds the application's own fixture URL", asy
   let app: ReturnType<typeof startServer> | undefined;
   try {
     app = startServer({
-      dbPath: ":memory:", blobDir: dir, httpPort: 0,
+      store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0,
       googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl,
       messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     }, { hostname, background: false });
@@ -234,4 +237,160 @@ test("an explicit startup hostname binds the application's own fixture URL", asy
       rmSync(dir, { recursive: true, force: true });
     }
   }
+});
+
+test("a start option overrides the config's limit, and an explicit undefined one doesn't wipe it (#385 item 14)", () => {
+  const config = { helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedSubscriberLimit: { burst: 11, perSec: 5 } };
+  expect(startLimits(config, { helloLimit: undefined, hostedRequestLimit: undefined, hostedSubscriberLimit: undefined })).toMatchObject(config);
+  expect(startLimits(config, { hostedSubscriberLimit: { burst: 13, perSec: 6 } })).toMatchObject({ hostedSubscriberLimit: { burst: 13, perSec: 6 }, hostedRequestLimit: config.hostedRequestLimit });
+  expect(startLimits(config, { helloLimit: { burst: 9, perSec: 9 } })).toMatchObject({ helloLimit: { burst: 9, perSec: 9 }, hostedRequestLimit: config.hostedRequestLimit });
+  // delegate's limits come from the config too (#252).
+  const delegate = { delegateLimit: { burst: 5, perSec: 0.5 }, delegateOpenCap: 4 };
+  expect(startLimits({ ...config, ...delegate }, { delegateLimit: undefined })).toMatchObject(delegate);
+  expect(startLimits({ ...config, ...delegate }, { delegateOpenCap: 9 })).toMatchObject({ ...delegate, delegateOpenCap: 9 });
+});
+
+test("startLimits hands the configured global watch cap to the application's board observers (#805 F-06)", () => {
+  const hostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 5000, perSession: 64 } };
+  expect(startLimits({ helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedCaps }, {})).toMatchObject({ observerCap: 5000 });
+});
+
+test("a started server's hosted MCP surface takes its session caps from the config (#805 F-06)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-caps-"));
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    const hostedCaps = { sessions: { global: 5000, perUser: 300 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } };
+    app = startServer({ ...restartConfig(dir), hostedCaps }, { hostname, background: false }); await app.ready;
+    expect(app.mcp.sessions.limits).toMatchObject({ user: 300, global: 5000 });
+  } finally {
+    await app?.stop();
+    app?.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit observerCap start option overrides the configured watch cap (#805 F-06)", () => {
+  const hostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 5000, perSession: 64 } };
+  expect(startLimits({ helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedCaps }, { observerCap: 5 })).toMatchObject({ observerCap: 5 });
+});
+
+// #807 P3 A4: the startup writes are queued, and the listener serves nothing until they've committed: a request that
+// arrives first waits for `ready`. The pause holds `ready` open after the writes, so the request is in flight while it is.
+test("a request that arrives before the startup writes commit waits for them", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-ready-"));
+  const release = join(dir, "release");
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  process.env.BUS_TEST_PAUSE = "server:ready"; process.env.BUS_TEST_PAUSE_FILE = release;
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    app = startServer(restartConfig(dir), { hostname, background: false });
+    let ready = false;
+    void app.ready.then(() => { ready = true; });
+    await until(() => log.mock.calls.some(([line]) => String(line).includes("test pause hit: server:ready")), 5_000, "the startup pause");
+    let answered = false;
+    const health = fetch(`http://${hostname}:${app.server.port}/healthz`).then(res => { answered = true; return res.status; });
+    // A window, not a sync point: nothing in the server signals that a gated request is parked.
+    await Bun.sleep(200);
+    expect([ready, answered]).toEqual([false, false]);
+    writeFileSync(release, "");
+    expect(await health).toBe(200);
+    expect(ready).toBe(true);
+  } finally {
+    writeFileSync(release, "");
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    log.mockRestore();
+    await app?.stop(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A startup write that fails rejects `ready`; `stop` still resolves (it waits for the writes to settle, not to
+// succeed), and a request then gets the bare 500 rather than a served answer. The trigger fails hosted's downtime
+// credit, which writes the heartbeat row on every start.
+test("a startup write that fails rejects ready, and the server stops and serves nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-ready-fail-"));
+  const config = restartConfig(dir);
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    app = startServer(config, { hostname, background: false }); await app.ready;
+    await app.stop(); app = undefined;
+    const db = new Database(config.store.path);
+    // Not the open's own child-roots watermark (#540, db.ts recordChildRoots): failing that fails the open itself.
+    db.run("CREATE TRIGGER fail_state_insert BEFORE INSERT ON server_state WHEN NEW.key <> 'child_roots_audit_id' BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
+    db.run("CREATE TRIGGER fail_state_update BEFORE UPDATE ON server_state WHEN NEW.key <> 'child_roots_audit_id' BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
+    db.close();
+
+    app = startServer(config, { hostname, background: false });
+    expect(await app.ready.then(() => "resolved", (e: Error) => e.message)).toContain("startup write refused");
+    expect((await fetch(`http://${hostname}:${app.server.port}/healthz`)).status).toBe(500);
+    await app.stop(); app = undefined;
+  } finally {
+    log.mockRestore();
+    await app?.stop().catch(() => {}); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #1085: the startup leftover-session ends (#807 P3 A1) reject `ready` when their whole write fails, not only a
+// per-ID end, which rolls back alone in its savepoint and is audited id.end_failed. The triggers fail the leftover's
+// end and then that audit, which is written on the write's own Tx, so the write rolls back whole. Two untriggered
+// leftovers, one before the failing one in both rowid and id order, stay unended only if the whole write rolls back.
+test("a startup leftover-session ends write that fails rejects ready, and the server stops and serves nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-ready-ends-"));
+  const config = restartConfig(dir);
+  const leftover = "77777777-7777-4777-8777-777777777777";
+  const clean = ["00000000-0000-4000-8000-000000000000", "ffffffff-ffff-4fff-8fff-ffffffffffff"];
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    app = startServer(config, { hostname, background: false }); await app.ready;
+    await app.stop(); app = undefined;
+    const db = new Database(config.store.path);
+    for (const id of [clean[0], leftover, clean[1]]) db.run("INSERT INTO ids (id, started_at, last_seen) VALUES (?, ?, ?)", [id, Date.now(), Date.now()]);
+    db.run(`CREATE TRIGGER fail_leftover_end BEFORE UPDATE ON ids WHEN OLD.id = '${leftover}' BEGIN SELECT RAISE(ABORT, 'leftover end refused'); END`);
+    db.run("CREATE TRIGGER fail_end_audit BEFORE INSERT ON access_log WHEN NEW.action = 'id.end_failed' BEGIN SELECT RAISE(ABORT, 'ends write refused'); END");
+    db.close();
+
+    app = startServer(config, { hostname, background: false });
+    expect(await app.ready.then(() => "resolved", (e: Error) => e.message)).toContain("ends write refused");
+    expect((await fetch(`http://${hostname}:${app.server.port}/healthz`)).status).toBe(500);
+    await app.stop(); app = undefined;
+    const after = new Database(config.store.path, { readonly: true });
+    for (const id of [leftover, ...clean]) expect(after.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(id)).toEqual({ ended_at: null });
+    after.close();
+  } finally {
+    log.mockRestore();
+    await app?.stop().catch(() => {}); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// F-04: a dev sign-in token must not outlive dev auth. A restart without it
+// revokes every dev token, and turning dev auth back on doesn't revive them;
+// a token from the real sign-in survives.
+test("a server started without dev auth revokes dev sign-in tokens for good", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-dev-revoke-"));
+  const config = restartConfig(dir);
+  let app: ReturnType<typeof startServer> | undefined;
+  const whoami = (token: string) => fetch(`http://${hostname}:${app!.server.port}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } }).then(res => res.status);
+  try {
+    app = startServer(config, { hostname, background: false }); await app.ready;
+    const login = await fetch(`http://${hostname}:${app.server.port}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "you@example.com" }) });
+    expect(login.status).toBe(200);
+    const dev = (await login.json() as { session_token: string }).session_token;
+    const real = mintToken();
+    const repo = app.repo;
+    await seed(repo, async tx => repo.sessions.create(tx, (await repo.users.upsertByEmail(tx, "them@example.com", null)).id, hashToken(real), "grayboard/1.0"));
+    expect(await whoami(dev)).toBe(200);
+    await app.stop(); app = undefined;
+
+    app = startServer({ ...config, devAuth: false }, { hostname, background: false }); await app.ready;
+    expect(await whoami(dev)).toBe(401);
+    expect(await whoami(real)).toBe(200);
+    const revoked = app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'auth.dev_sessions_revoked'").all();
+    expect(revoked.map(row => JSON.parse(row.detail))).toEqual([{ count: 1 }]);
+    await app.stop(); app = undefined;
+
+    app = startServer(config, { hostname, background: false }); await app.ready;
+    expect(await whoami(dev)).toBe(401);
+    expect(await whoami(real)).toBe(200);
+  } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
 });

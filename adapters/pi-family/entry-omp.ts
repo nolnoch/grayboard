@@ -1,7 +1,7 @@
 // grayboard's hosted extension for omp (server mode, #280). `grayboard setup
 // --server <url>` bundles this file and installs it as
-// <agentDir>/extensions/grayboard.js; local mode keeps adapters/omp/grayboard.ts
-// with an enabled mcp.json entry. `@oh-my-pi/pi-coding-agent` stays external:
+// <agentDir>/extensions/grayboard.js; local mode bundles adapters/omp/grayboard.ts
+// with a disabled mcp.json entry. `@oh-my-pi/pi-coding-agent` stays external:
 // omp resolves an extension's import of it to the running host, so the agent
 // directory is omp's own (profiles, PI_CODING_AGENT_DIR, XDG).
 //
@@ -15,8 +15,9 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi
 import { version } from "../../package.json" with { type: "json" };
 import type { Level } from "../hosted-core/src/client.ts";
 import { loadMode } from "../hosted-core/src/proxy.ts";
-import { COMMAND, createGrayboard, toolArgs, toolResult, type Grayboard, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
+import { COMMAND, createGrayboard, factReader, toolArgs, toolResult, type Grayboard, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
 import { registry, rootOf } from "./omp-ancestry.ts";
+import { instructionHooks, modelName } from "./omp-instructions.ts";
 
 // omp's MCP naming (tool-bridge.ts mintMCPToolName): grayboard's tool names
 // are already lowercase snake case, so `mcp__grayboard_<tool>`, as the local
@@ -29,6 +30,25 @@ export default function grayboard(pi: ExtensionAPI) {
   let current: Grayboard | undefined, currentId: string | undefined;
   let agent: ExtensionContext["agent"] | undefined;
   let disposed = false; // session_shutdown ran: no session starts after it
+  // The current instructions, or undefined when there are none; the
+  // extension bounds the fetch (INSTRUCTIONS_WAIT_MS), so a model call never
+  // waits out a connect timeout for them.
+  const instructions = async (): Promise<string | undefined> => current?.instructions();
+
+  // On screen when there is one, else on stderr.
+  const show = (message: string, level: Level) => {
+    if (ctx?.hasUI) ctx.ui.notify(message, level);
+    else console.error(message);
+  };
+  const hooks = instructionHooks<ExtensionContext>({ instructions, logger: pi.logger, show: message => show(message, "warning") });
+  // Always into omp's log file; on screen too.
+  const notify = (message: string, level: Level) => {
+    if (level === "error") pi.logger.error(message);
+    else if (level === "warning") pi.logger.warn(message);
+    else pi.logger.info(message);
+    show(message, level);
+  };
+  const readFacts = factReader(message => notify(message, "warning"));
 
   // Read at each register, so a subagent revived after its main session
   // moved on (/new) registers under the root that is live now.
@@ -57,7 +77,7 @@ export default function grayboard(pi: ExtensionAPI) {
           approval: "write",
           strict: false,
           loadMode: loadMode(tool),
-          execute: async (_id, params) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params))),
+          execute: async (_id, params, signal) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params), signal)),
         });
       }
     },
@@ -66,14 +86,23 @@ export default function grayboard(pi: ExtensionAPI) {
     // wait, hidden, for the next turn.
     deliver: (content, wake) => pi.sendMessage({ customType: "grayboard", content, display: true },
       wake ? { deliverAs: "aside", triggerTurn: true } : { deliverAs: "nextTurn" }),
-    // Always into omp's log file; on screen too when there is one.
-    notify: (message: string, level: Level) => {
-      if (level === "error") pi.logger.error(message);
-      else if (level === "warning") pi.logger.warn(message);
-      else pi.logger.info(message);
-      if (ctx?.hasUI) ctx.ui.notify(message, level);
-      else console.error(message);
+    notify,
+    // tui and rpc outlive a sign-in's browser round trip; print and json exit after one run.
+    interactive: () => ctx?.mode === "tui" || ctx?.mode === "rpc",
+    // omp points its session manager at the next session before it emits
+    // session_switch, so a receipt landing in between would go into that
+    // session's file: only the session the record names gets it.
+    record: data => {
+      if (ctx?.sessionManager.getSessionId() === data.root) pi.appendEntry("grayboard-delivery", data);
+      else pi.logger.warn("grayboard: a delivery record for a session no longer current; logged here, not in its file", { ...data });
     },
+    // Like `record`: between omp's switch and session_switch, ctx already
+    // shows the next session's model, so only the session it names answers.
+    // omp's `inherit` names no level of its own: it's none, and clears the server's (#558).
+    facts: sessionID => ctx?.sessionManager.getSessionId() === sessionID ? readFacts(sessionID, {
+      model: () => ctx?.model ? modelName(ctx.model) : null,
+      effort: () => { const effort = pi.getThinkingLevel(); return effort && effort !== "inherit" ? effort : null; },
+    }) : undefined,
   });
 
   const begin = async (context: ExtensionContext, reason: StartReason) => {
@@ -121,8 +150,24 @@ export default function grayboard(pi: ExtensionAPI) {
   // a subagent receives none, so only a main session gets them.
   pi.on("before_agent_start", async (event, context) => {
     if (context.agent.kind !== "main") return undefined;
-    const text = await current?.instructions();
-    return text ? { systemPrompt: [...event.systemPrompt, text] } : undefined;
+    return hooks.beforeAgentStart(event);
+  });
+  // A turn a push started skips before_agent_start, so each main request is
+  // brought to the current instructions here. A system prompt omp rebuilt
+  // (/resume, /new, /fork) holds no grayboard element: that one request gets
+  // the instructions as a hidden message (omp cloned the messages for it),
+  // last, since omp marks a context-added message per-call and Anthropic's
+  // cache checkpoints stop before the first such message.
+  pi.on("context", async (event, context) => {
+    if (context.agent.kind !== "main") return undefined;
+    return hooks.context(event, context);
+  });
+  // One that still holds the text last appended, now stale (a bind since),
+  // gets it rewritten in the payload, in place: the return value stays
+  // undefined, since some providers ignore it or need their own object.
+  pi.on("before_provider_request", async (event, context) => {
+    if (context.agent.kind !== "main") return undefined;
+    return hooks.beforeProviderRequest(event, context);
   });
   pi.registerCommand("grayboard", { ...COMMAND, handler: async (args, context) => { ctx = context; await current?.command(args); } });
 }

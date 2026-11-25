@@ -6,25 +6,28 @@
 // they checked of the plugin itself (frames, reconnects, file paths and
 // presentation) has no live surface to compare, so it isn't here.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import type { SendResult } from "../../src/server/application.ts";
+import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { board, direct } from "../support/events.ts";
 import { HostedToolError } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
+import { accessAudits } from "../support/audit.ts";
+import { drained, row, rows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
 const C = "carol@example.com";
 let srv: TestServer;
 
-beforeEach(() => {
+beforeEach(async () => {
   // Inbox polling spends hosted requests.
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
 });
 afterEach(() => srv.stop());
 
@@ -68,12 +71,10 @@ test("dm_ack takes a list: unknown ids are reported beside the acked, and all un
   await expect(be.call("dm_ack", { message_id: [mine] })).rejects.toThrow(/no message/);
 });
 
-// The application's refusal (forbidden, HUMAN_RESERVED's fix) is asserted at
-// application level in slack_org.test.ts; hosted bind refuses on its own
-// check (hosted.ts), with bad_request and a shorter reason.
+// The hosted bind reaches the application's refusal (bindNow: forbidden, HUMAN_RESERVED), also asserted at application level in slack_org.test.ts.
 test("a bind to the reserved human name is refused and leaves the session unbound", async () => {
   const s = await srv.hosted(A, null);
-  await expect(s.bind("human")).rejects.toMatchObject({ code: "bad_request", message: "human is reserved for the trusted bridge" });
+  await expect(s.bind("human")).rejects.toMatchObject({ code: "forbidden", message: HUMAN_RESERVED });
   expect(await s.call("whoami")).toHaveProperty("unbound", true);
 });
 
@@ -122,6 +123,33 @@ test("login and logout use GRAYBOARD_CREDENTIALS, not ~/.grayboard", async () =>
   expect(existsSync(join(home, ".grayboard"))).toBe(false);
 });
 
+// #88: login leaves an existing 0644 file at 0600; a read of a loose file warns.
+test("login sets the credentials file to 0600 even when it already existed; a loose one is warned about", async () => {
+  const creds = join(mkdtempSync(join(srv.dir, "gb-creds-")), "credentials");
+  const env = cleanEnv({ HOME: mkdtempSync(join(srv.dir, "gb-home-")), GRAYBOARD_CREDENTIALS: creds });
+  writeFileSync(creds, "", { mode: 0o644 });
+  chmodSync(creds, 0o644);
+  const loose = await runCli(["team", "list"], { env });
+  expect(loose.err).toContain(`${creds} is readable by other users (mode 0644); run: chmod 600 ${creds}`);
+  const r = await runCli(["login", "--dev", A, "--server", srv.base], { env });
+  expect(r.code, r.err).toBe(0);
+  expect(statSync(creds).mode & 0o777).toBe(0o600);
+  expect((await runCli(["team", "list"], { env })).err).not.toContain("readable by other users");
+});
+
+// #87: a corrupt file, or one naming no server, is cleared without a server call.
+test("logout clears a corrupt or serverless credentials file", async () => {
+  const creds = join(mkdtempSync(join(srv.dir, "gb-creds-")), "credentials");
+  const env = cleanEnv({ HOME: mkdtempSync(join(srv.dir, "gb-home-")), GRAYBOARD_CREDENTIALS: creds });
+  for (const bad of ["{not json", JSON.stringify({ session_token: "t", user_email: A })]) {
+    writeFileSync(creds, bad, { mode: 0o600 });
+    const r = await runCli(["logout"], { env });
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toContain("No valid sign-in was stored; the local credentials file is cleared.");
+    expect(readFileSync(creds, "utf8")).toBe("");
+  }
+});
+
 test("grayboard claim acts as one of your identities; a watching session is woken", async () => {
   const alice = await srv.login(A);
   const bob = await srv.login(B);
@@ -167,14 +195,13 @@ test("attachments: a DM and a post carry uploaded files to their readers, and th
 
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
   const file = await be.upload("shot.png", png);
-  const posted = await be.call<BoardPostResult>("board_post", { board: "e2e", body: "@sim shot", attachment_ids: [file] });
+  const posted = await be.call<BoardPostResult>("board_post", { board: "e2e", body: `@${C}/sim shot`, attachment_ids: [file] });
   expect(posted.attachments).toEqual([shotInfo(file)]);
-  const pushed = await sim.next(board((i) => i.kind === "push" && i.post.body === "@sim shot"));
+  const pushed = await sim.next(board((i) => i.kind === "push" && i.post.body === `@${C}/sim shot`));
   expect(pushed.event.item.kind === "push" && pushed.event.item.post.attachments).toEqual([shotInfo(file)]);
   expect(await sim.download(file)).toEqual(png);
 
-  const bound = (srv.app.db.query("SELECT target, detail FROM access_log WHERE action = 'attachment.bound' ORDER BY id").all() as { target: string; detail: string }[])
-    .map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
+  const bound = (await accessAudits(srv, "attachment.bound")).map((r): Record<string, unknown> => ({ target: r.target, ...r.detail }));
   expect(bound).toEqual([
     { target: `attachment:${shot}`, identity: `${A}/be`, message_id: sent.message_id, recipient: `${B}/fe` },
     { target: `attachment:${notes}`, identity: `${A}/be`, message_id: sent.message_id, recipient: `${B}/fe` },
@@ -189,8 +216,8 @@ test("a repeat of a dm_send with `as`, holds unchanged, replays the first result
   await be.bind("ops", { create: true });
   const first = await be.send("be", "as ops", { as: "ops" });
   const retry = await be.send("be", "as ops", { as: "ops" });
-  const rows = srv.app.db.query("SELECT id, sender FROM messages WHERE body = 'as ops'").all() as { id: number; sender: string }[];
-  expect(rows).toEqual([{ id: first.message_id, sender: `${A}/ops` }]);
+  const sent = await rows<{ id: number; sender: string }>(srv, "SELECT id, sender FROM messages WHERE body = 'as ops'");
+  expect(sent).toEqual([{ id: first.message_id, sender: `${A}/ops` }]);
   expect(retry).toMatchObject({ message_id: first.message_id, replayed: { ref: { kind: "message", id: first.message_id } } });
 });
 
@@ -217,14 +244,16 @@ test("a send or post the server refuses binds none of its uploads; releasing the
   const refused = async (tool: string, args: Record<string, unknown>) => {
     const id = await be.upload("notes.md", "# notes");
     await expect(be.call(tool, { ...args, attachment_ids: [id] })).rejects.toBeInstanceOf(HostedToolError);
-    expect(srv.app.db.query("SELECT message_id, post_id FROM attachments WHERE id = ?").get(id)).toEqual({ message_id: null, post_id: null });
+    expect(await row(srv, "SELECT message_id, post_id FROM attachments WHERE id = ?", id)).toEqual({ message_id: null, post_id: null });
     await be.release(id);
   };
   await refused("dm_send", { to: "nobody@example.com/x", body: "x" });
   await refused("board_post", { board: "nope", body: "x" });
-  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM attachments").get()).toEqual({ n: 0 });
-  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 0 });
-  expect(srv.app.db.query("SELECT action FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id").all()).toEqual([
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM attachments")).toEqual({ n: 0 });
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM attachment_blobs")).toEqual({ n: 0 });
+  // An audit row can be a post, queued behind the response on Postgres.
+  await drained(srv);
+  expect(await rows(srv, "SELECT action FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id")).toEqual([
     { action: "attachment.uploaded" }, { action: "attachment.released" },
     { action: "attachment.uploaded" }, { action: "attachment.released" },
   ]);
@@ -246,7 +275,7 @@ test("a repeat after the session's holds changed replays while its sender is unc
   const resent = await be.send("be", "once", { resend: true });
   expect(resent).not.toHaveProperty("replayed");
   expect((await be.send("be", "once")).replayed?.ref.id).toBe(resent.message_id);
-  expect(srv.app.db.query("SELECT sender FROM messages WHERE body = 'once' ORDER BY id").all()).toEqual([
+  expect(await rows(srv, "SELECT sender FROM messages WHERE body = 'once' ORDER BY id")).toEqual([
     { sender: `${A}/be` }, { sender: `${A}/ops` }, { sender: `${A}/be` },
   ]);
 
@@ -254,6 +283,6 @@ test("a repeat after the session's holds changed replays while its sender is unc
   const post = await be.call<BoardPostResult>("board_post", { board: "e2e", body: "posted once" });
   expect(await be.call("board_post", { board: "e2e", body: "posted once" })).toMatchObject({ replayed: { ref: { kind: "post", id: post.post_id } } });
   expect(await be.call("board_post", { board: "e2e", body: "posted once", resend: true })).not.toHaveProperty("replayed");
-  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM posts WHERE body = 'posted once'").get()).toEqual({ n: 2 });
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM posts WHERE body = 'posted once'")).toEqual({ n: 2 });
 });
 

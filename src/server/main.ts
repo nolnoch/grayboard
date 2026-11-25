@@ -1,6 +1,9 @@
+import "./zod_config.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { loadConfig } from "./config.ts";
+import { describeBlobs, describeReauth, describeStore, loadConfig } from "./config.ts";
+import { pgTlsMode } from "./store/pg/sql.ts";
 import { startServer } from "./app.ts";
+import { DatabaseOpenError, openRepo } from "./open_repo.ts";
 import { BUILTIN_CLIENT_IDS } from "./oauth-config.ts";
 
 // Before loadConfig, which refuses to run without the server's env.
@@ -10,7 +13,18 @@ if (process.argv.includes("--version")) {
 }
 
 const config = loadConfig();
-const { server, stop } = startServer(config);
+// The open migrates a Postgres store (#807 P3 C11b): a failure there is a failed startup, before anything listens.
+let repo;
+try {
+  repo = await openRepo(config);
+} catch (e) {
+  // Only the database half names the store (#1609): an attachment store's or STS's refusal names itself.
+  const where = e instanceof DatabaseOpenError ? `opening ${describeStore(config.store)}: ` : "";
+  const cause = e instanceof DatabaseOpenError ? e.cause : e;
+  console.error(`grayboard server: startup failed: ${where}${(cause as Error)?.stack ?? cause}`);
+  process.exit(1);
+}
+const { server, stop, metrics, ready } = startServer(config, { repo });
 
 // Handlers go in before the listening line: a supervisor (or test) that
 // signals on seeing it must reach shutdown, not the default kill (#422).
@@ -29,9 +43,25 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
+// The listening line means ready: the startup writes have committed and requests are served (#807 P3 A4).
+try {
+  await ready;
+} catch (e) {
+  console.error(`grayboard server: startup failed: ${(e as Error).stack ?? e}`);
+  await stop().catch(() => {});
+  process.exit(1);
+}
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
+console.log(`grayboard server: store ${describeStore(config.store, { writers: config.databaseWriters, ...(config.store.kind === "postgres" ? { tls: pgTlsMode(config.store.url) } : {}) })}`);
+console.log(`grayboard server: attachments ${describeBlobs(config)}`);
+// An unauthenticated listener: say where it bound, every start.
+console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${metrics.port}` : "off"}`);
 // Write-capable hosted clients are a trust decision (#414, #429); say which at every start.
 const sourced = (config.oauthClients ?? []).filter(c => c.sessionSource).map(c => c.clientId);
 console.log(`grayboard server: operator clients with sessionSource: ${sourced.length ? sourced.join(", ") : "none"}`);
 console.log(`grayboard server: built-in clients: ${BUILTIN_CLIENT_IDS.join(", ")}`);
+// A provider with no directory check leaves an offboarded user's grants working until the re-auth window ends (#930).
+console.log(`grayboard server: IdP re-auth: ${describeReauth(config)}`);
+const cimdClients = config.oauthCimdClients ?? [];
+console.log(`grayboard server: metadata-document clients: ${cimdClients.length ? cimdClients.join(", ") : "none"}`);
 

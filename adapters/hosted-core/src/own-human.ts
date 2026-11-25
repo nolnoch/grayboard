@@ -1,0 +1,20 @@
+import { z } from "zod";
+import { HUMAN_NAME } from "../../../src/shared/addressing.ts";
+import type { Identity } from "./model.js";
+
+// Validate the inbox discriminants and sender fields, not the rest of core's
+// notification shape. V2 keeps the original JSON value, including extra fields.
+export const InboxEvent = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("direct"), message: z.looseObject({ id: z.number(), sender: z.string(), body: z.string() }) }),
+  z.object({ kind: z.literal("board"), item: z.discriminatedUnion("kind", [
+    z.looseObject({ kind: z.literal("push"), post: z.looseObject({ author: z.string(), body: z.string() }) }),
+    z.looseObject({ kind: z.literal("digest"), board: z.string() }),
+  ]) }),
+]);
+
+// A digest's latest author is context, never authority for the aggregate.
+export function isOwnHuman(event: z.infer<typeof InboxEvent>, identity: Identity): boolean {
+  const human = `${identity.user.email}/${HUMAN_NAME}`;
+  return event.kind === "direct" ? event.message.sender === human
+    : event.item.kind === "push" && event.item.post.author === human;
+}

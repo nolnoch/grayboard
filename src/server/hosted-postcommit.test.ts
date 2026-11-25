@@ -1,10 +1,12 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { until } from "../../tests/support/until.ts";
 import { AppSession, type AppEvent } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { openDatabase } from "./db.ts";
 import { createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
@@ -13,6 +15,8 @@ import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { afterCommit } from "../core/sqlite.ts";
+import { seed } from "../../tests/support/seed.ts";
+import type { Tx } from "./store/tx.ts";
 
 const origin = "https://grayboard.example.com";
 let dir: string;
@@ -34,35 +38,33 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-postcommit-"));
   const path = join(dir, "bus.db");
   database = openDatabase(path, { blobDir: join(dir, "blobs") });
-  const issued = issueOAuth(database.repo, `${origin}/mcp`, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const issued = await issueOAuth(database.repo, `${origin}/mcp`, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   token = issued.token;
-  oauth = createOAuthServer(database.repo, { dbPath: path, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: origin, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
-  application = createApplication(database.repo, database.db);
+  oauth = createOAuthServer(database.repo, { store: { kind: "sqlite" as const, path: path }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: origin, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+  application = createApplication(database.repo);
   mcp = createHostedMcp(application, oauth, { trustedOrigin: origin });
-  const authenticated = oauth.authenticate(new Request(`${origin}/mcp`, { headers: { Authorization: `Bearer ${token}` } }), ["grayboard:tools"]);
+  const authenticated = await oauth.authenticate(new Request(`${origin}/mcp`, { headers: { Authorization: `Bearer ${token}` } }), ["grayboard:tools"]);
   if (authenticated instanceof Response) throw new Error("fixture authentication");
   principal = authenticated;
   await mcp.sessions.bind(principal, context(), { name: "fe", create: true });
-  recipient = new AppSession(application, principal.authed, "launcher");
+  recipient = new AppSession(application, database.repo, principal.authed, "launcher", { launcher: true });
   await recipient.connect();
-  // The launcher flag is only the ids.launcher column since #282 (it was hello's `launcher: true`).
-  database.db.query("UPDATE ids SET launcher = 1 WHERE id = ?").run(recipient.id);
   events = recipient.events;
 });
 afterEach(async () => {
-  await mcp.close(); oauth.close(); application.stopExpiry(); database.db.close();
+  await mcp.close(); oauth.close(); await application.stopExpiry(); database.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
 function failAudit(action: string) {
   database.db.exec(`CREATE TRIGGER fail_late_audit BEFORE INSERT ON access_log WHEN NEW.action = '${action}' BEGIN SELECT RAISE(ABORT, 'forced late audit failure'); END`);
 }
-const delegate = (session: Parameters<typeof application.delegate>[0]) => application.delegate(session, { persona: "researcher", task: "inspect commit boundary", to: "launcher" });
+const delegate = (session: Parameters<typeof application.delegate>[1], tx: Tx) => application.delegate(tx, session, { persona: "researcher", task: "inspect commit boundary", to: "launcher" });
 
 for (const tool of ["dm_send", "delegate"]) test(`${tool}: late hosted audit rollback discards live payload`, async () => {
   failAudit("hosted.write");
-  await expect(mcp.sessions.run(principal, context(), tool, session => tool === "delegate" ? delegate(session) : application.send(session, "launcher", "no ghost"))).rejects.toThrow("forced late audit failure");
-  expect(application.history(recipient.session)).toEqual([]);
+  await expect(mcp.sessions.run(principal, context(), tool, (session, tx) => tool === "delegate" ? delegate(session, tx) : application.send(tx, session, "launcher", "no ghost"))).rejects.toThrow("forced late audit failure");
+  expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
   expect(events).toEqual([]);
   expect(database.db.query("SELECT * FROM write_receipts").all()).toEqual([]);
   expect(database.db.query("SELECT action FROM access_log WHERE action IN ('request.replayed', 'request.resent', 'delegation.requested')").all()).toEqual([]);
@@ -80,100 +82,114 @@ test("actual HTTP delegation audit rollback cannot publish a launcher request", 
   expect(response.status).toBe(200);
   expect(JSON.parse(body)).toMatchObject({ id: "rollback", result: { isError: true, content: [{ type: "text", text: "error: internal error" }] } });
   expect(body).not.toContain("forced late audit");
-  expect(application.history(recipient.session)).toEqual([]); expect(events).toEqual([]);
+  expect(await application.history(database.repo.read, recipient.session)).toEqual([]); expect(events).toEqual([]);
 });
 
 test("live sink sees committed message and both delegation audits on a separate connection", async () => {
-  const reader = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
+  // A plain read-only connection: a second openDatabase would run the schema step, whose launcher sweep (#521 5)
+  // clears the mark AppSession declares without a hosted row.
+  const reader = new Database(join(dir, "bus.db"), { readonly: true });
   let visible = false;
   recipient.session.sink.deliver = event => {
     expect(database.db.inTransaction).toBe(false);
     expect(event.kind).toBe("direct");
-    expect(reader.repo.messages.history(["you@example.com/launcher"])).toHaveLength(1);
-    expect(reader.db.query("SELECT action FROM access_log WHERE action IN ('hosted.write', 'delegation.requested')").all()).toHaveLength(2);
+    expect(reader.query("SELECT id FROM messages WHERE recipient = 'you@example.com/launcher'").all()).toHaveLength(1);
+    expect(reader.query("SELECT action FROM access_log WHERE action IN ('hosted.write', 'delegation.requested')").all()).toHaveLength(2);
     visible = true; events.push(event);
   };
   try {
     await mcp.sessions.run(principal, context(), "delegate", delegate);
     expect(visible).toBe(true); expect(events).toHaveLength(1);
-  } finally { reader.db.close(); }
+  } finally { reader.close(); }
 });
 
 test("postcommit sink failure cannot fail or roll back a committed native message", async () => {
   const log = spyOn(console, "error").mockImplementation(() => {});
   recipient.session.sink.deliver = () => { throw new Error("closed transport"); };
   try {
-    const sent = await mcp.sessions.run(principal, context(), "dm_send", session => application.send(session, "launcher", "durable despite sink"));
+    const sent = await mcp.sessions.run(principal, context(), "dm_send", (session, tx) => application.send(tx, session, "launcher", "durable despite sink"));
     expect(sent.message_id).toBeGreaterThan(0);
-    expect(application.history(recipient.session)).toHaveLength(1);
+    expect(await application.history(database.repo.read, recipient.session)).toHaveLength(1);
     expect(database.db.query("SELECT action FROM access_log WHERE action='hosted.write'").all()).toHaveLength(1);
     expect(log).toHaveBeenCalled();
   } finally { log.mockRestore(); }
 });
 
-test("nested savepoint success waits for outer transaction commit; outer rollback discards payload and invalidation", () => {
+test("nested savepoint success waits for outer transaction commit; outer rollback discards payload and invalidation", async () => {
   let invalidations = 0;
   const unsubscribe = database.repo.hosted.subscribe(() => { invalidations++; });
+  const id = context().id!;
+  // The hub's view of the session (its live holder) changes only after a commit: reconcile closes it then.
+  const closed = spyOn(application, "close");
   try {
-    expect(() => database.db.transaction(() => {
-      database.repo.hosted.atomic(() => {
-        application.send(recipient.session, "launcher", "rolled back nested");
-        database.repo.hosted.end(context().id!, "closed", Date.now());
+    await expect(seed(database.repo, async tx => {
+      await tx.savepoint(async sp => {
+        await application.send(sp, recipient.session, "launcher", "rolled back nested");
+        await database.repo.hosted.end(sp, context().id!, "closed", Date.now());
       });
-      expect(application.hostedHolder("you@example.com/fe")?.active).toBe(true);
+      expect(closed).not.toHaveBeenCalled();
       expect(events).toEqual([]); expect(invalidations).toBe(0);
       throw new Error("outer rollback");
-    }).immediate()).toThrow("outer rollback");
+    })).rejects.toThrow("outer rollback");
     expect(events).toEqual([]); expect(invalidations).toBe(0);
-    expect(application.hostedHolder("you@example.com/fe")?.active).toBe(true);
-    expect(database.repo.hosted.get(context().id!)).toBeDefined();
-    expect(application.history(recipient.session)).toEqual([]);
-    database.db.transaction(() => {
-      database.repo.hosted.atomic(() => application.send(recipient.session, "launcher", "committed nested"));
+    expect(closed).not.toHaveBeenCalled();
+    expect(await database.repo.hosted.get(database.repo.read, context().id!)).toBeDefined();
+    expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
+    // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
+    await seed(database.repo, async tx => {
+      await tx.savepoint(async sp => { await application.send(sp, recipient.session, "launcher", "committed nested"); await database.repo.hosted.touch(sp, id, Date.now()); });
       expect(events).toEqual([]); expect(invalidations).toBe(0);
-    }).exclusive();
-    expect(events).toHaveLength(1); expect(invalidations).toBe(1);
-  } finally { unsubscribe(); }
+    });
+    expect(events).toHaveLength(1); expect(invalidations).toBe(0);
+    await seed(database.repo, async tx => {
+      await tx.savepoint(sp => database.repo.hosted.end(sp, id, "closed", Date.now()));
+      expect(invalidations).toBe(0);
+    });
+    expect(invalidations).toBe(1);
+    expect(closed).toHaveBeenCalled();
+  } finally { unsubscribe(); closed.mockRestore(); }
 });
 
-test("caught inner rollback discards only inner effects and preserves outer effect ordering", () => {
+test("caught inner rollback discards only inner effects and preserves outer effect ordering", async () => {
   const observed: string[] = [];
-  database.db.transaction(() => {
+  await seed(database.repo, async tx => {
     afterCommit(database.db, () => { observed.push("outer-first"); });
-    expect(() => database.db.transaction(() => {
-      application.send(recipient.session, "launcher", "inner ghost");
+    await expect(tx.savepoint(async sp => {
+      await application.send(sp, recipient.session, "launcher", "inner ghost");
       throw new Error("inner rollback");
-    }).deferred()).toThrow("inner rollback");
-    database.repo.hosted.atomic(() => application.send(recipient.session, "launcher", "outer durable"));
+    })).rejects.toThrow("inner rollback");
+    await tx.savepoint(sp => application.send(sp, recipient.session, "launcher", "outer durable"));
     afterCommit(database.db, () => { observed.push("outer-last"); });
     expect(events).toEqual([]);
-  })();
+  });
   expect(observed).toEqual(["outer-first", "outer-last"]);
-  expect(events).toHaveLength(1); expect(application.history(recipient.session).map(message => message.body)).toEqual(["outer durable"]);
+  expect(events).toHaveLength(1); expect((await application.history(database.repo.read, recipient.session)).map(message => message.body)).toEqual(["outer durable"]);
 });
 
 test("rolled-back board post neither publishes payload nor invalidates observers or inflight state", async () => {
-  application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
-  application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+  await seed(database.repo, async tx => {
+    await application.call(tx, recipient.session, "board_create", { name: "updates", purpose: "test" });
+    await application.call(tx, recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+  });
   const observer = mock(() => {});
   application.observeBoard(recipient.session, "updates", { changed: observer });
   events.length = 0;
   failAudit("hosted.write");
-  await expect(mcp.sessions.run(principal, context(), "board_post", session => application.call(session, "board_post", { board: "updates", body: "no ghost post" }))).rejects.toThrow();
+  await expect(mcp.sessions.run(principal, context(), "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "updates", body: "no ghost post" }))).rejects.toThrow();
   expect(events).toEqual([]); expect(observer).not.toHaveBeenCalled(); expect(recipient.session.inflight.size).toBe(0);
   database.db.exec("DROP TRIGGER fail_late_audit");
-  await mcp.sessions.run(principal, context(), "board_post", session => application.call(session, "board_post", { board: "updates", body: "committed post" }));
+  await mcp.sessions.run(principal, context(), "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "updates", body: "committed post" }));
   expect(events.some(event => event.kind === "board")).toBe(true); expect(observer).toHaveBeenCalled();
 });
 
-test("failed SQLite COMMIT discards queued payload and leaves the connection reusable", () => {
+test("failed SQLite COMMIT discards queued payload and leaves the connection reusable", async () => {
   database.db.exec("CREATE TABLE commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE commit_child(parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)");
-  expect(() => database.db.transaction(() => {
-    application.send(recipient.session, "launcher", "commit must fail");
+  await expect(seed(database.repo, async tx => {
+    await application.send(tx, recipient.session, "launcher", "commit must fail");
     database.db.run("INSERT INTO commit_child(parent) VALUES (1)");
-  }).immediate()).toThrow();
-  expect(events).toEqual([]); expect(application.history(recipient.session)).toEqual([]);
-  database.db.transaction(() => { application.send(recipient.session, "launcher", "next commit succeeds"); })();
+  })).rejects.toThrow();
+  expect(events).toEqual([]); expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
+  await seed(database.repo, tx => application.send(tx, recipient.session, "launcher", "next commit succeeds"));
   expect(events).toHaveLength(1);
 });
 
@@ -181,27 +197,32 @@ test("a failing postcommit effect does not suppress later effects or retain boar
   const log = spyOn(console, "error").mockImplementation(() => {});
   const observed: string[] = [];
   try {
-    database.repo.hosted.atomic(() => {
+    await seed(database.repo, tx => {
       afterCommit(database.db, () => { throw new Error("first failed"); });
       afterCommit(database.db, async () => { throw new Error("async failed"); });
       afterCommit(database.db, () => { observed.push("last delivered"); });
     });
     expect(observed).toEqual(["last delivered"]);
-    application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
-    application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
-    recipient.session.sink.deliver = () => { throw new Error("board sink failed"); };
-    await mcp.sessions.run(principal, context(), "board_post", session => application.call(session, "board_post", { board: "updates", body: "durable post" }));
+    await seed(database.repo, async tx => {
+      await application.call(tx, recipient.session, "board_create", { name: "updates", purpose: "test" });
+      await application.call(tx, recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+    });
+    // The board drain runs after the commit, off the post's call (#807 P3 B5a1): wait for its failed delivery.
+    let failed = false;
+    recipient.session.sink.deliver = () => { failed = true; throw new Error("board sink failed"); };
+    await mcp.sessions.run(principal, context(), "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "updates", body: "durable post" }));
+    await until(() => failed);
     expect(recipient.session.inflight.size).toBe(0);
     recipient.session.sink.deliver = event => { events.push(event); };
     application.wake([recipient.session.identityFull]);
-    expect(events.some(event => event.kind === "board")).toBe(true);
+    await until(() => events.some(event => event.kind === "board"));
     expect(log).toHaveBeenCalled();
   } finally { log.mockRestore(); }
 });
 
 // #452: a refusal thrown inside `hosted.run`'s transaction rolls its audit row back with the call, so the row is written after the unwind.
 const refusals = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'delegation.refused'").all() as { actor: string; target: string; detail: string }[];
-const refused = (request: Parameters<typeof application.delegate>[1]) => mcp.sessions.run(principal, context(), "delegate", session => application.delegate(session, request));
+const refused = (request: Parameters<typeof application.delegate>[2]) => mcp.sessions.run(principal, context(), "delegate", (session, tx) => application.delegate(tx, session, request));
 
 test("hosted delegate: an unresolvable `to` leaves its refusal audit row", async () => {
   await expect(refused({ persona: "researcher", task: "x", to: "nobody-here" })).rejects.toThrow();

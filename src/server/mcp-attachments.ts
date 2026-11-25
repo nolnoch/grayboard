@@ -1,44 +1,41 @@
-import type { CoreDb } from "../core/boards.ts";
 import { ApplicationError } from "./application.ts";
 import { sourceContext, type HostedSessions } from "./hosted.ts";
 import type { Repo } from "./db.ts";
+import type { Read } from "./store/tx.ts";
 import { attachmentDownload, attachmentRelease, attachmentUpload } from "./http.ts";
 import type { createOAuthServer } from "./oauth.ts";
 import type { UploadGate } from "./uploads.ts";
+import { permitsOrigin } from "./origin.ts";
+import { countRefusal } from "./metrics.ts";
+import { hostedFailure } from "./hosted-diagnostics.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 
 class Refusal extends Error {
   constructor(readonly response: Response) { super("attachment request refused"); }
 }
 
+const OPERATION = { POST: "attachments.upload", GET: "attachments.download", DELETE: "attachments.release" } as const;
+const failed = (req: Request, cause: unknown) => hostedFailure(OPERATION[req.method as keyof typeof OPERATION] ?? "attachments.upload", cause);
 const error = (code: string, message: string, status: number) => Response.json({ code, message }, { status });
 const privateResponse = (response: Response) => {
   response.headers.set("Cache-Control", "private, no-store");
   return response;
 };
 
-export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
+export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
   const origin = new URL(opts.trustedOrigin).origin;
   const paths = new Set(["/mcp/attachments", `${new URL(oauth.resource).pathname}/attachments`]);
   const pending = new Set<Promise<Response>>();
   const shutdown = new AbortController();
   let closed = false;
-  // Match MCP's serialized-origin policy; its validator is private to that router.
-  const permitsOrigin = (value: string | null) => {
-    if (value === null) return true;
-    if (!/^https?:\/\/[^\s/@?#,\\]+$/.test(value)) return false;
-    try {
-      const parsed = new URL(value);
-      return value.replace(parsed.protocol === "https:" ? /:443$/ : /:80$/, "") === parsed.origin && parsed.origin === origin;
-    } catch { return false; }
-  };
 
   async function handle(req: Request, url: URL, id: string | undefined): Promise<Response> {
     try {
       if (closed) return error("unavailable", "server closing", 503);
-      if (!permitsOrigin(req.headers.get("Origin"))) return error("forbidden", "invalid origin", 403);
-      const principal = oauth.authenticate(req, ["grayboard:tools"]);
+      if (!permitsOrigin(req.headers.get("Origin"), origin)) return error("forbidden", "invalid origin", 403);
+      const principal = await oauth.authenticate(req, ["grayboard:tools"]);
       if (principal instanceof Response) return principal;
-      if (pending.size >= 128) return error("unavailable", "too many attachment requests", 503);
+      if (pending.size >= 128) { countRefusal("attachment_requests"); return error("unavailable", "too many attachment requests", 503); }
       if (url.hash || url.search.length > 2048 || /%(?![0-9a-f]{2})/i.test(url.search)) return error("bad_request", "invalid query", 400);
       const allowed = req.method === "POST" ? ["identity", "filename"] : ["identity"];
       const seen = new Set<string>();
@@ -68,19 +65,34 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
         // The HTTP routes act as `as` (#284): the hosted session's name.
         selected.searchParams.delete("identity");
         selected.searchParams.set("as", session.identityFull);
-        const guard = () => {
+        const live = () => {
           if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
-          const current = oauth.authenticate(req, ["grayboard:tools"]);
-          if (current instanceof Response) throw new Refusal(current);
-          bindingGuard();
-          if (!repo.aliases.find(session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
         };
-        guard();
-        const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, db, uploads, guard, signal)
-          : req.method === "GET" ? await attachmentDownload(id!, selected, principal.authed, repo, db, guard)
-          : await attachmentRelease(id!, selected, principal.authed, repo, db, guard);
+        // Every read on `r`, the handle of the context it runs in: the pool here, a body's own Tx inside one (#1053).
+        // The binding and alias reads run after the token read's await: inside a body, on its Tx as of the token check
+        // (the body holds the write queue); on the pool, on whatever committed meanwhile. A close or abort while it
+        // awaited refuses (#807 P3 A7d2a).
+        const guard = async (r: Read) => {
+          live();
+          const current = await oauth.authenticate(req, ["grayboard:tools"], r);
+          await testPauseAsync("attachments:guard:checked");
+          live();
+          if (current instanceof Response) throw new Refusal(current);
+          // The binding guard's own token check awaits too (#807 P3 A7d2b), and its row reads follow that await.
+          await bindingGuard(r);
+          live();
+          // The alias read awaits too (#807 P3 A7f3): a close or abort during it refuses before its answer is used.
+          const alias = await repo.aliases.find(r, session.identityFull);
+          await testPauseAsync("attachments:guard:alias-read");
+          live();
+          if (!alias) throw new Refusal(error("not_found", "identity not found", 404));
+        };
+        await guard(repo.read);
+        const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, uploads, guard, signal)
+          : req.method === "GET" ? await attachmentDownload(id!, selected, principal.authed, repo, guard)
+          : await attachmentRelease(id!, selected, principal.authed, repo, guard);
         if (req.method === "POST" && req.body && !req.body.locked) await req.body.cancel();
-        guard();
+        await guard(repo.read);
         return response;
       });
     } catch (cause) {
@@ -88,6 +100,9 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
       if (cause instanceof ApplicationError) return error(cause.code, cause.message, cause.code === "unauthenticated" ? 401 : 403);
       if (req.signal.aborted && cause === req.signal.reason) return error("cancelled", "request cancelled", 499);
       // Cancellation is not evidence that a simultaneous storage fault was auth failure.
+      // The client gets a bare 500; the operator's log gets a line (#1608). Hosted diagnostics carry no message or
+      // stack (#386): an auth read's SQL error or a blob path can carry private values. The cause is in access_log.
+      failed(req, cause);
       return error("internal", "internal error", 500);
     }
   }
@@ -106,7 +121,8 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
           // Refusals before quota/body reading still own the original source.
           if (response.status >= 400 && req.method === "POST" && req.body) await req.body.cancel();
           return privateResponse(response);
-        } catch {
+        } catch (cause) {
+          failed(req, cause);
           return privateResponse(error("internal", "internal error", 500));
         }
       })();

@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import { busMode, makeClient } from "./api.ts";
 import { actingName, busHandle } from "./claim.ts";
 
-export type ListedClaim = { key: string; holder: string; note: string | null; acquired_at: number; expires_at: number };
+export type ListedClaim = { key: string; holder: string | null; note: string | null; acquired_at: number; expires_at: number };
 
 // Local mode reads the bus file directly; it never creates one.
 async function localClaims(prefix: string | undefined): Promise<ListedClaim[]> {
@@ -39,7 +39,7 @@ async function self(mode: "local" | "server", as?: string): Promise<string | und
 
 export function formatClaim(c: ListedClaim): string {
   const until = new Date(c.expires_at).toISOString().slice(0, 16);
-  return `${c.key} held by ${c.holder} until ${until}Z${c.note ? `: ${c.note}` : ""}`;
+  return `${c.key} held by ${c.holder ?? "someone you can't see"} until ${until}Z${c.note ? `: ${c.note}` : ""}`;
 }
 
 export async function runClaims(opts: { prefix?: string; json?: boolean; includeSelf?: boolean; as?: string }): Promise<number> {

@@ -6,13 +6,15 @@
 // calls only `POST /v1/messages` (streamed); any other route gets a 404 and
 // lands in `unhandled`, so a new route fails visibly.
 //
-// Claude Code folds a turn's tool results and a channel message that arrives
-// mid-turn into one user message, so a rule decides whether it already acted
-// by its tool-use id (derived from what it answers), not by message roles.
+// A channel message that arrives mid-turn reaches the model in that turn's
+// next request (2.1.316: a system-role "A message arrived … while you were
+// working" block; earlier, folded into the tool results' user message), so a
+// rule decides whether it already acted by its tool-use id (derived from what
+// it answers), not by message roles.
 
 export type Block = { type: string; text?: string; id?: string; name?: string; input?: unknown; content?: unknown; tool_use_id?: string };
 export type Message = { role: string; content: string | Block[] };
-export type MessagesRequest = { model: string; stream?: boolean; messages: Message[]; tools?: { name: string }[] };
+export type MessagesRequest = { model: string; stream?: boolean; system?: string | Block[]; messages: Message[]; tools?: { name: string }[]; output_config?: { effort?: string } };
 export type Recorded<B> = { method: string; path: string; body: B };
 /** A text reply ends the turn; a tool reply calls `tool` under the tool-use id `id`. */
 export type Reply = { text: string } | { tool: string; id: string; input: Record<string, unknown> };
@@ -22,6 +24,11 @@ const blocks = (m: Message): Block[] => (typeof m.content === "string" ? [{ type
 /** The text blocks of every user message, newest last. */
 export const userTexts = (req: MessagesRequest): string[] =>
   req.messages.filter((m) => m.role === "user").flatMap((m) => blocks(m).filter((b) => b.type === "text").map((b) => b.text ?? ""));
+/** The actual system guidance sent to Anthropic, independent of persisted transcript text. */
+export const systemText = (req: MessagesRequest): string => typeof req.system === "string" ? req.system : (req.system ?? []).map(block => block.text ?? "").join("\n");
+/** The text blocks of every message the model didn't write (user and system), newest last: where a channel message can arrive. */
+const inboundTexts = (req: MessagesRequest): string[] =>
+  req.messages.filter((m) => m.role !== "assistant").flatMap((m) => blocks(m).filter((b) => b.type === "text").map((b) => b.text ?? ""));
 const toolNames = (req: MessagesRequest): string[] => (req.tools ?? []).map((t) => t.name);
 /** Whether an earlier assistant turn already made the tool call `id`. */
 export const called = (req: MessagesRequest, id: string): boolean =>
@@ -46,6 +53,32 @@ export function onUserText(trigger: string, server: string, tool: string, input:
 const WAIT = "WaitForMcpServers";
 
 /**
+ * Makes the tool calls `steps` in order, one per request, in a conversation
+ * whose user messages contain `trigger`, under the tool-use ids
+ * `toolu_<trigger>_<i>`. Like onUserText, it waits for `server` first. A
+ * subagent's conversation is its own: its user message is the prompt it was
+ * given, so a trigger in that prompt scripts the subagent.
+ */
+export function onUserSteps(trigger: string, server: string, steps: { tool: string; input: Record<string, unknown> }[]): Rule {
+  const base = `toolu_${trigger.replace(/\W/g, "_")}`;
+  return (req) => {
+    if (!userTexts(req).some((t) => t.includes(trigger))) return undefined;
+    const i = steps.findIndex((_, i) => !called(req, `${base}_${i}`));
+    if (i < 0) return undefined;
+    const { tool, input } = steps[i]!;
+    if (toolNames(req).includes(tool)) return { tool, id: `${base}_${i}`, input };
+    if (!toolNames(req).includes(WAIT)) return undefined;
+    return { tool: WAIT, id: `${base}_${i}_wait_${req.messages.length}`, input: { servers: [server] } };
+  };
+}
+
+/** The text of each tool_result the model was sent for the tool_use `id`. */
+export const toolResults = (model: FakeAnthropic, id: string): string[] =>
+  model.requests.flatMap((r) => r.body.messages.flatMap((m) => typeof m.content === "string" ? [] : m.content))
+    .filter((b) => b.type === "tool_result" && b.tool_use_id === id)
+    .map((b) => typeof b.content === "string" ? b.content : JSON.stringify(b.content));
+
+/**
  * Answers each Claude Code channel DM from a handle ending in `/from` once, with
  * the tool call `reply` makes from its message id and body. `source` is the
  * channel's server name (`plugin:grayboard:grayboard` for the plugin).
@@ -53,7 +86,7 @@ const WAIT = "WaitForMcpServers";
 export function onChannelDm(source: string, from: string, reply: (messageId: number, body: string) => { tool: string; input: Record<string, unknown> }): Rule {
   const dm = new RegExp(`<channel source="${RegExp.escape(source)}" message_id="(\\d+)" from="[^"]*/${RegExp.escape(from)}"[^>]*>\\n?([\\s\\S]*?)\\n?</channel>`, "g");
   return (req) => {
-    for (const text of userTexts(req)) {
+    for (const text of inboundTexts(req)) {
       for (const [, id, body] of text.matchAll(dm)) {
         const useId = `toolu_dm_${id}`;
         if (!called(req, useId)) return { ...reply(Number(id), body!), id: useId };

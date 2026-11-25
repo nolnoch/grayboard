@@ -11,15 +11,27 @@
 // delivers the child's channel notifications into the session and puts its
 // instructions in the system prompt.
 //
+// Subagents (#523 step 5): pi-subagents' detached runner is a process of its
+// own that loads this extension, so its child is told the id of the session
+// that launched it (BUS_PARENT_SESSION) and acts as that session's child
+// while that session lives, till it binds a name of its own. Its foreground
+// children run in this process and get no ambient extensions, but an agent
+// can name this one explicitly (#557): such a child's session header names
+// the launching session's file (parentSession), which a process-wide map
+// resolves to that session's top root, and its own child is told that root's
+// id the same way.
+//
 // Install: copy into ~/.pi/agent/extensions/ (grayboard setup does this). The
 // command and env come from the mcpServers.grayboard entry in
 // ~/.pi/agent/mcp.json, which setup writes with "enabled": false so pi's MCP
 // client doesn't serve a second set of the same tools.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 type ChannelParams = { content: string; meta?: Record<string, string> };
 type McpEntry = { command?: string; args?: string[]; env?: Record<string, string>; url?: string; type?: string; enabled?: boolean };
@@ -29,10 +41,51 @@ type CallResult = { content?: Content[]; structuredContent?: { instructions?: st
 type Rpc = { id?: number; method?: string; params?: unknown; result?: any; error?: { message: string } };
 
 const SERVER = process.env.GRAYBOARD_MCP_NAME ?? "grayboard";
-const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+// pi's agent directory as pi resolves it (src/shared/pi.ts piAgentDir, which
+// this raw-installed file can't import; a test holds the two equal): an EMPTY
+// PI_CODING_AGENT_DIR is unset to pi, so it must not make this read ./mcp.json
+// from the cwd and run a repo's command (#437).
+export function agentDir(env: Record<string, string | undefined> = process.env, home = homedir()): string {
+  const dir = env.PI_CODING_AGENT_DIR;
+  if (!dir) return join(home, ".pi", "agent");
+  if (dir === "~") return home;
+  if (dir.startsWith("~/")) return join(home, dir.slice(2));
+  if (dir.startsWith("file://")) return fileURLToPath(dir);
+  return dir;
+}
+const AGENT_DIR = agentDir();
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
 // MCP call renderer treat these as they treat any MCP server's tools.
 const PREFIX = `mcp__${SERVER}__`.replace(/[^A-Za-z0-9_]/g, "_");
+// Keep the local omp adapter's restart policy: each unexpected exit uses
+// the next delay; a process that ran STABLE_MS starts the count over.
+// Both adapters install as one raw file, so neither can import a helper.
+const RESTART_DELAYS_MS = [0, 1_000, 5_000];
+const STABLE_MS = 60_000;
+// How long a new child gets to answer initialize and finish its session
+// handshake before it is killed and restarted as an exit is (#559): a wedged
+// child would otherwise hold every waiting call and the first turn.
+// Under STABLE_MS, so a child that never initializes uses up its restarts.
+// BUS_TEST_INIT_DEADLINE_MS shortens it for tests.
+const INIT_DEADLINE_MS = Number(process.env.BUS_TEST_INIT_DEADLINE_MS) > 0 ? Number(process.env.BUS_TEST_INIT_DEADLINE_MS) : 30_000;
+// How long a killed child gets to exit before SIGKILL, as in the omp adapter.
+const EXIT_WAIT_MS = 1_500;
+// How long a child gets to end its session after its stdin closes at
+// session_shutdown, before it is killed. pi awaits the handler unbounded.
+const END_WAIT_MS = 3_000;
+
+// Ends a child that is still running: SIGTERM, then SIGKILL after EXIT_WAIT_MS
+// (logged, so a forced kill doesn't read as a slow end), then its exit.
+async function terminate(proc: ChildProcess, log: (text: string) => void): Promise<void> {
+  const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+  if (proc.exitCode !== null || proc.signalCode !== null || !proc.pid) return;
+  proc.kill();
+  const force = setTimeout(() => {
+    log(`grayboard: process ${proc.pid} still running ${EXIT_WAIT_MS} ms after SIGTERM; sent SIGKILL`);
+    proc.kill("SIGKILL");
+  }, EXIT_WAIT_MS);
+  try { await exited; } finally { clearTimeout(force); }
+}
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -64,6 +117,37 @@ const ENTRY = readEntry(join(AGENT_DIR, "mcp.json"));
 const [CMD, ...ARGS] = ENTRY?.command ? [ENTRY.command, ...(ENTRY.args ?? [])] : ["grayboard", "mcp"];
 const ENV: Record<string, string | undefined> = { ...process.env, ...ENTRY?.env };
 delete ENV.BUS_PUSH;
+// pi-subagents' detached runner (PI_SUBAGENT_CHILD=1) is passed the id of the
+// session that launched it (src/runs/background/async-execution.js), whose
+// child this one is: that session's adapter gives its own child the same id
+// (BUS_HARNESS_SESSION, below). The hosted entry reads the same marker
+// (adapters/pi-family/entry-pi.ts).
+const PARENT_SESSION = (process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_SUBAGENT_PARENT_SESSION || undefined : undefined) ?? (ENV.BUS_PARENT_SESSION || undefined);
+
+// The live sessions of this pi process that run this extension, keyed by
+// session file (or "id:" + id for an in-memory one), each to the pi session
+// id of its top root, for a foreground subagent's lookup of its header's
+// parentSession (#557). A header names only a file, so a session without
+// one (pi --no-session) leaves its foreground children no parent to find:
+// they start as roots, as before #557. Every session gets its own instance of this
+// extension, maybe its own module, so the map sits on globalThis under a
+// namespaced Symbol.for, as the hosted pi adapter's does.
+const LIVE_KEY = Symbol.for("io.github.nolnoch.grayboard/pi-local-sessions");
+const LIVE: Map<string, string> = ((globalThis as unknown as Record<symbol, Map<string, string> | undefined>)[LIVE_KEY] ??= new Map());
+// In a process whose env makes its session keyed (BUS_SESSION_KEY) or the
+// human's (BUS_HUMAN=1), the live session that holds that key or identity,
+// by session key: only one can (#1075). Every other session this process
+// starts while it lives is its subagent, found or not by header (a
+// --no-session root's children have none).
+const HOLDER_KEY = Symbol.for("io.github.nolnoch.grayboard/pi-local-holder");
+const HOLDER: { key: string; id: string }[] = ((globalThis as unknown as Record<symbol, { key: string; id: string }[] | undefined>)[HOLDER_KEY] ??= []);
+const KEYED = ENV.BUS_SESSION_KEY !== undefined;
+const HUMAN = ENV.BUS_HUMAN === "1";
+// A subagent never speaks as the human. Its own unbound session would be an
+// ordinary one under this pi process, which would carry a sibling
+// subagent's names through the process's name record, so it gets no tools.
+const HUMAN_CHILD = "grayboard: this subagent runs under the human's pi session (BUS_HUMAN=1), and a subagent never acts as the human handle, so it has no grayboard session; the human's session does";
+const sessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionFile() ?? `id:${ctx.sessionManager.getSessionId()}`;
 
 // The file whose entry pi's own MCP client would run, if one does: its tools
 // would collide with these by name (pi warns, and the last registration wins),
@@ -120,13 +204,35 @@ type Child = {
   call(method: string, params: object, signal?: AbortSignal): Promise<any>;
 };
 
+// Teardown aborts the run before session_shutdown: neither a backoff nor
+// initialization may keep the tool alive until that shared wait finishes.
+function waitReady(ready: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return ready;
+  if (signal.aborted) return Promise.reject(new Error("aborted"));
+  const waiter = Promise.withResolvers<void>();
+  const onAbort = () => waiter.reject(new Error("aborted"));
+  signal.addEventListener("abort", onAbort, { once: true });
+  return Promise.race([ready, waiter.promise]).finally(() => signal.removeEventListener("abort", onAbort));
+}
+
 export default function grayboard(pi: ExtensionAPI) {
   const tools = loadTools();
   let child: Child | undefined;
   let exitReason: string | undefined;
+  let restarts = 0;
+  let restart: { ready: Promise<void>; cancel(): void } | undefined;
+  // The exit of the last child fail() killed; no replacement starts before it.
+  let stopping: Promise<void> | undefined;
   let instructions: string | undefined;
   let registered = false;
   let refused: string | undefined;
+  const owner = randomUUID();
+  const mode = ARGS.indexOf("--mode");
+  const local = !ARGS.some(arg => arg === "--server" || arg.startsWith("--server=") || (arg.startsWith("--mode=") && arg !== "--mode=local")) && (mode < 0 || ARGS[mode + 1] === "local");
+  // A child (a runner's, or a foreground one, per selection) doesn't own delivery.
+  const owns = local && !KEYED && !HUMAN;
+  let epoch = 0;
+  let selected: { id: string; epoch: number; ctx: ExtensionContext; key: string; parent?: string; holds?: true; excluded?: string } | undefined;
 
   const deliver = (params: ChannelParams) => {
     // Direct messages, mentions, thread replies: act on them (starts a turn
@@ -139,15 +245,28 @@ export default function grayboard(pi: ExtensionAPI) {
     );
   };
 
-  const report = (ctx: ExtensionContext, text: string) => {
-    if (ctx.hasUI) ctx.ui.notify(text, "error");
+  const report = (ctx: ExtensionContext, text: string, type: "error" | "warning" = "error") => {
+    if (ctx.hasUI) ctx.ui.notify(text, type);
     else console.error(text);
   };
 
   // Started per session, not at load: until something can receive them,
   // messages wait in grayboard rather than in this process.
   const start = (ctx: ExtensionContext): Child => {
-    const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env: ENV, stdio: ["pipe", "pipe", "inherit"] });
+    const startedAt = Date.now();
+    const selection = selected!;
+    const protocol = owns && selection.parent === undefined;
+    // The session's own id, which its subagent runners' children find it by,
+    // and its root's id in a child; set (or cleared) per start, since /new,
+    // /resume and fork change the id.
+    const env: Record<string, string | undefined> = { ...ENV, BUS_HARNESS_SESSION: selection.id, BUS_PARENT_SESSION: selection.parent, BUS_ADAPTER_OWNER: protocol ? owner : undefined };
+    // A keyed root's subagent is its child (#1075): the key and its harness
+    // are the root's, and grayboard mcp refuses them with BUS_PARENT_SESSION.
+    if (local && selection.parent !== undefined) {
+      delete env.BUS_SESSION_KEY;
+      delete env.BUS_HARNESS_PID;
+    }
+    const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env, stdio: ["pipe", "pipe", "inherit"] });
     const pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
     let next = 1;
     let gone: Error | undefined;
@@ -170,14 +289,49 @@ export default function grayboard(pi: ExtensionAPI) {
         pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
         send({ id, method, params });
       });
+    // Fail the calls in flight, then take the names back from the name
+    // record through a new child under the same pi process (a subagent's
+    // child keeps no record and comes back unbound, #1078).
     const fail = (reason: string) => {
+      if (gone) return;
       gone = new Error(reason);
       for (const p of pending.values()) p.reject(gone);
       pending.clear();
       if (child?.proc !== proc) return;
       child = undefined;
-      exitReason = reason;
-      report(ctx, `${reason}; restart pi to reconnect`);
+      // EPIPE can happen while the child is still alive. Kill it and wait for
+      // its exit (SIGKILL after EXIT_WAIT_MS) before a replacement, so it
+      // can't linger as a second delivery owner or keep its names (#599).
+      const ending = terminate(proc, (text) => report(ctx, text, "warning"));
+      stopping = ending;
+      if (Date.now() - startedAt >= STABLE_MS) restarts = 0;
+      const attempt = restarts;
+      if (attempt >= RESTART_DELAYS_MS.length) {
+        exitReason = reason;
+        report(ctx, `${reason} after ${attempt} restarts; restart pi to reconnect`);
+        return;
+      }
+      restarts = attempt + 1;
+      exitReason = `${reason}; restarting it`;
+      report(ctx, `${reason}; restarting it (${attempt + 1} of ${RESTART_DELAYS_MS.length})`, "warning");
+      // The replacement waits for both the backoff and the old child's exit.
+      const delay = Promise.withResolvers<void>();
+      const timer = setTimeout(delay.resolve, RESTART_DELAYS_MS[attempt]);
+      let cancelled = false;
+      const ready = Promise.all([delay.promise, ending]).then(() => {
+        if (cancelled) return;
+        restart = undefined;
+        if (selected === selection) child = start(selection.ctx);
+      });
+      restart = {
+        ready,
+        cancel() {
+          cancelled = true;
+          clearTimeout(timer);
+          restart = undefined;
+          delay.resolve();
+        },
+      };
     };
     // JSON-RPC over stdio is LF-delimited; split on "\n" only (readline would
     // also split on U+2028/2029, which are valid inside JSON strings).
@@ -195,7 +349,14 @@ export default function grayboard(pi: ExtensionAPI) {
           continue;
         }
         if (msg.method === "notifications/claude/channel") {
-          deliver(msg.params as ChannelParams);
+          const params = msg.params as ChannelParams;
+          const meta = params.meta ?? {};
+          let accepted = child?.proc === proc && selected === selection && selection.ctx.sessionManager.getSessionId() === selection.id &&
+            (!meta.grayboard_session || meta.grayboard_session === selection.id) &&
+            (!meta.grayboard_epoch || meta.grayboard_epoch === String(selection.epoch));
+          try { if (accepted) deliver(params); }
+          catch (error) { accepted = false; report(ctx, `grayboard: couldn't deliver a channel notification: ${String(error)}`); }
+          if (meta.grayboard_delivery) void call("grayboard/delivery", { owner, token: meta.grayboard_delivery, accepted }).catch(error => report(ctx, String(error)));
         } else if (msg.id !== undefined && pending.has(msg.id)) {
           const p = pending.get(msg.id)!;
           pending.delete(msg.id);
@@ -215,15 +376,25 @@ export default function grayboard(pi: ExtensionAPI) {
       capabilities: {},
       clientInfo: { name: "pi-grayboard", version: "1" },
     }).then(async (result: { instructions?: string }) => {
-      instructions = result.instructions;
+      if (selected === selection) instructions = result.instructions;
       send({ method: "notifications/initialized" });
       const served = ((await call("tools/list", {})) as { tools: Tool[] }).tools;
       const diff = toolDiff(tools, served);
       if (diff.length) report(ctx, `grayboard: the running grayboard serves different tools than \`grayboard tools\` listed at load: ${diff.join(", ")}`);
+      if (protocol && selected === selection) {
+        const result = await call("grayboard/session", { owner, epoch: selection.epoch, session: selection.id });
+        if (result?.session !== selection.id || result?.epoch !== selection.epoch || typeof result?.id !== "string" || !Array.isArray(result?.instructions) || !result.instructions.every((value: unknown) => typeof value === "string")) throw new Error("grayboard: invalid session transition acknowledgement");
+        if (selected !== selection) return;
+        instructions = result.instructions.join(" ");
+        await call("grayboard/session/ready", { owner, epoch: selection.epoch });
+      }
     });
-    // A call that awaits ready gets the failure; this only keeps an unawaited
-    // rejection from crashing pi when no call is waiting.
-    ready.catch(() => {});
+    // A handshake that fails without the process exiting (an error reply, an
+    // invalid acknowledgement) restarts it as an exit does (#1142). fail()
+    // ignores its own rejections and a child that's no longer current.
+    ready.catch((e: Error) => fail(`grayboard process failed to initialize: ${e.message}`));
+    const deadline = setTimeout(() => fail(`grayboard process didn't initialize within ${INIT_DEADLINE_MS / 1000} s`), INIT_DEADLINE_MS);
+    ready.then(() => clearTimeout(deadline), () => clearTimeout(deadline));
     return { proc, ready, call };
   };
 
@@ -237,10 +408,13 @@ export default function grayboard(pi: ExtensionAPI) {
         parameters: { ...tool.inputSchema, type: tool.inputSchema.type ?? "object", properties: tool.inputSchema.properties ?? {} } as any,
         namespace: { name: `mcp__${SERVER.replace(/-/g, "_")}`, aliases: [SERVER] },
         async execute(_id, params, signal, _onUpdate, ctx) {
-          if (exitReason) throw new Error(exitReason);
+          if (!child && restart) await waitReady(restart.ready, signal);
+          if (!child && exitReason) throw new Error(exitReason);
           child ??= start(ctx);
           const c = child;
-          await c.ready;
+          const selection = selected;
+          await waitReady(c.ready, signal);
+          if (child !== c || selected !== selection) throw new Error("grayboard: the selected pi conversation changed before this call");
           const result = (await c.call("tools/call", { name: tool.name, arguments: params ?? {} }, signal)) as CallResult;
           const content = (result.content ?? []).filter((b) => b.type === "text" || b.type === "image");
           if (result.isError && !content.some((b) => b.type === "text" && b.text)) {
@@ -249,16 +423,38 @@ export default function grayboard(pi: ExtensionAPI) {
           // A result carries the instructions when the name changed (#182
           // decision 13): bind's, or the next one after a bind whose result
           // was lost (cancelled, timed out) or a lost name. Errors included.
-          if (result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
+          if (child === c && selected === selection && result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
           return { content, details: { server: SERVER, tool: tool.name }, ...(result.isError ? { isError: true } : {}) };
         },
       });
     }
   };
 
-  pi.on("session_start", async (_event, ctx) => {
-    // Registered once per pi process; /new, /resume and fork start the
-    // session again under the same tools.
+  pi.on("session_start", async (event, ctx) => {
+    // pi restarted this extension and its child before new/resume/fork.
+    // The selected conversation's actual ID, not its outgoing process, owns
+    // restoration; the MCP startup chooses its snapshot before PID carry.
+    if (["new", "resume", "fork"].includes(event.reason)) restarts = 0;
+    const id = ctx.sessionManager.getSessionId();
+    if (selected?.id === id) selected.ctx = ctx;
+    else {
+      // A runner's env wins; else a foreground subagent's header names its
+      // launching session, live in this process (a fork's names the session
+      // it left, whose entry that session's shutdown deleted). Not found, it
+      // starts as a root. In a keyed or human process, the session holding
+      // the key or identity is the root, and every other one its subagent.
+      const key = sessionKey(ctx);
+      const from = owns ? ctx.sessionManager.getHeader()?.parentSession : undefined;
+      const holder = local && (KEYED || HUMAN) && PARENT_SESSION === undefined ? HOLDER.find(h => h.key !== key) : undefined;
+      const sub = PARENT_SESSION ?? holder?.id;
+      const parent = owns ? PARENT_SESSION ?? (from ? LIVE.get(from) : undefined) : local && HUMAN ? undefined : sub;
+      const excluded = local && HUMAN && sub !== undefined ? HUMAN_CHILD : undefined;
+      const holds = local && (KEYED || HUMAN) && sub === undefined;
+      selected = { id, epoch: ++epoch, ctx, key, ...(parent ? { parent } : {}), ...(holds ? { holds } : {}), ...(excluded ? { excluded } : {}) };
+      if (holds) HOLDER.push({ key, id });
+      // Its own subagents (grandchildren too) resolve to its top root.
+      LIVE.set(key, parent ?? id);
+    }
     if (!registered && !refused) {
       const path = enabledEntry(ctx);
       if (path) {
@@ -269,28 +465,40 @@ export default function grayboard(pi: ExtensionAPI) {
       }
     }
     if (refused) return report(ctx, refused);
-    exitReason = undefined;
-    child ??= start(ctx);
+    exitReason = selected?.excluded;
+    if (!exitReason) child ??= start(ctx);
   });
 
   // pi leaves MCP server instructions out of the prompt for direct tools, and
   // they're what tells the model what a <channel> message is. A prompt sent
   // as pi starts can beat the child's initialize; the first turn waits for it.
   pi.on("before_agent_start", async (event) => {
+    await restart?.ready;
     await child?.ready.catch(() => {});
     if (instructions) event.systemPromptOptions.sections.grayboard = instructions;
   });
 
   // Also fires before /new, /resume, and fork, which start the session again:
   // wait for the child to exit so the next one can take the name.
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    // /new, /resume, fork and quit must not leave a backoff that can spawn
+    // a child for the outgoing session after the next session starts.
+    restart?.cancel();
+    // First, before any await: a /fork's start must not find this session.
+    if (selected && LIVE.get(selected.key) === (selected.parent ?? selected.id)) LIVE.delete(selected.key);
+    const held = selected?.holds ? HOLDER.findIndex(h => h.key === selected!.key && h.id === selected!.id) : -1;
+    if (held >= 0) HOLDER.splice(held, 1);
+    selected = undefined;
+    instructions = undefined;
+    // A child fail() killed must be gone before the next session's starts.
+    await stopping;
     const c = child;
     if (!c) return;
     child = undefined;
     const { proc } = c;
     const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
     proc.stdin!.end();
-    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 3000))]);
-    if (proc.exitCode === null) proc.kill();
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, END_WAIT_MS))]);
+    await terminate(proc, (text) => report(ctx, text, "warning"));
   });
 }

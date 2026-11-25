@@ -1,22 +1,23 @@
 // Delegation (#184): local-mode sessions (separate `grayboard mcp --mode
 // local` children) over real processes, and the server's: a requester on a
-// hosted MCP session, a launcher on an application session, since a hosted
-// session can't be a launcher yet (#451). The launcher opt-in, the delegate
+// hosted MCP session, a launcher on an application session declared as a hosted
+// request's launcher declaration is (#473). The launcher opt-in, the delegate
 // tool's resolution rules, the payload's harness-neutrality, the human
 // fallback, refusals and their audit rows (kept by a hosted call since #452),
 // and result-return through the pending/promise machinery.
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
-import type { AppSession } from "../support/app_session.ts";
+import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession } from "../support/mcp.ts";
-import { TestServer } from "../support/server.ts";
+import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { drained, exec, row, rows as sqlRows, txSpy } from "../support/repo_sql.ts";
 
 let dir: string;
 
@@ -24,17 +25,15 @@ type Peer = { handle: string; launcher?: true };
 type Delegated = { to: string; message_id: number; delivered_now: boolean; human_fallback?: true; note: string };
 type Inbox = { unanswered?: { id: number; from: string }[]; promised?: { to: string }[] };
 // A server whose hosted sessions can poll their inbox freely.
-const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) => new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
+const serve = (o: TestServerOverrides = {}) => TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
+// The server's access_log rows, once the writes queued before the read have landed (an audit row is often a post,
+// which Postgres always queues).
+const logRows = async (srv: TestServer, sql: string, ...args: unknown[]): Promise<any[]> => { await drained(srv); return sqlRows(srv, sql, ...args); };
+const logRow = async (srv: TestServer, sql: string, ...args: unknown[]): Promise<any> => (await logRows(srv, sql, ...args))[0] ?? null;
 
-// The hello's launcher flag is gone with the hello (#282), so nothing in a
-// hosted session sets ids.launcher yet (#451): the fixture sets the row the
-// delegate resolution and peer_list read, on a connected application session.
-async function launcher(srv: TestServer, token: string, identity: string): Promise<AppSession> {
-  const s = srv.appSession(token, identity);
-  await s.connect();
-  srv.app.db.query(`UPDATE ids SET launcher = 1 WHERE id = ?`).run(s.id);
-  return s;
-}
+// A connected application session declared a launcher, as a hosted
+// request's launcher declaration does (#473).
+const launcher = (srv: TestServer, token: string, identity: string): Promise<AppSession> => srv.connected(token, identity, { launcher: true });
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-delegate-"));
@@ -115,6 +114,23 @@ test("local: a delegate request lands on the live launcher, harness-neutral, tra
   }
 }, 30_000);
 
+// #337: a fresh launcher can take work before it picks a name: delegation
+// reaches it by its session ID, by auto-pick and by an explicit to.
+test("local: an unbound launcher is delegable by its ID", async () => {
+  const fresh = await localSession(dir, undefined, { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim");
+  const id = (await call(fresh.c, "whoami")).id as string;
+  expect(id).toMatch(/^id:/);
+
+  const auto = await call(sim.c, "delegate", { persona: "a researcher", task: "t1" });
+  expect(auto.to).toBe(id);
+  expect(auto.delivered_now).toBe(true);
+  const named = await call(sim.c, "delegate", { persona: "a researcher", task: "t2", to: id });
+  expect(named.to).toBe(id);
+  await until(() => fresh.pushes.length >= 2, 10_000, "both requests pushed to the unbound launcher");
+  expect(String(fresh.pushes[0]!.content)).toContain("[delegation request from sim]");
+}, 30_000);
+
 test("local: an explicit to that isn't a launcher is refused, naming the flag", async () => {
   const sim = await localSession(dir, "sim");
   await localSession(dir, "ad"); // live, not a launcher
@@ -123,6 +139,16 @@ test("local: an explicit to that isn't a launcher is refused, naming the flag", 
     throw new Error("expected a refusal");
   } catch (e) {
     expect((e as Error).message).toContain("isn't a launcher session");
+  }
+}, 20_000);
+
+test("local: a launcher naming itself is refused as self-delegation, not as offline (#253)", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  try {
+    await call(be.c, "delegate", { persona: "p", task: "t", to: "be" });
+    throw new Error("expected a refusal");
+  } catch (e) {
+    expect((e as Error).message).toContain("can't delegate to itself");
   }
 }, 20_000);
 
@@ -143,9 +169,8 @@ test("local: no live launcher surfaces the request to the declared human", async
   expect(thread[0].body).toContain("BUS_LAUNCHER=1");
 }, 30_000);
 
-// hosted twin: #451 (the launcher)
 test("server: the launcher flag on a session's ID records the capability; delegate delivers", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const token = await srv.login("you@example.com");
     const be = await launcher(srv, token, "be");
@@ -188,8 +213,24 @@ test("server: the launcher flag on a session's ID records the capability; delega
   }
 }, 30_000);
 
+test("server: a launcher naming itself is refused as self-delegation, and nothing is sent (#253)", async () => {
+  const srv = await serve();
+  try {
+    const token = await srv.login("you@example.com");
+    const be = await launcher(srv, token, "be");
+    // Its primary, and a second alias it holds: before the fix the second
+    // was online to the server and the request went to the session itself.
+    expect((await refusal(be.delegate({ persona: "p", task: "t", to: "be" }))).message).toContain("can't delegate to itself");
+    await be.bind("be2", { create: true });
+    expect((await refusal(be.delegate({ persona: "p", task: "t", to: "be2" }))).message).toContain("can't delegate to itself");
+    expect((await row(srv, `SELECT COUNT(*) AS n FROM messages`) as { n: number }).n).toBe(0);
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
 test("server: delegation stays within the requester's user (review 1-2)", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     // Two users, one launcher each. alice's launcher sorts before bob's.
     const alice = await srv.login("alice@example.com");
@@ -206,14 +247,179 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     expect(r.human_fallback).toBeUndefined();
 
     // An explicit cross-user `to` is refused, naming the scope...
-    await expect(bobSim.call("delegate", { persona: "p", task: "t", to: "alice@example.com/be" })).rejects.toThrow(/own user|authority ruling/);
+    await expect(bobSim.call("delegate", { persona: "p", task: "t", to: "alice@example.com/be" })).rejects.toThrow(/belongs to another user/);
     // ...and nothing landed on alice's launcher.
     await aliceBe.none(direct());
 
     // The audit names the refusals and the request (review 4).
-    const audits = srv.app.db.query(`SELECT action, actor, target FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
+    const audits = await logRows(srv, `SELECT action, actor, target FROM access_log WHERE action LIKE 'delegation.%' ORDER BY id`) as any[];
     expect(audits.some((a) => a.action === "delegation.requested" && a.target === "bob@b.com/be")).toBe(true);
     expect(audits.some((a) => a.action === "delegation.refused")).toBe(true);
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+// Security audit F-01: a team alias is shared by every member, so a
+// requester on `eng/sim` is judged by its signed-in user, not by the
+// `eng/` its handle shares with a teammate's launcher.
+test("server: a team alias doesn't carry delegation to a teammate's launcher", async () => {
+  const srv = await serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const bobLauncher = await launcher(srv, bob, "eng/launcher");
+    const aliceSim = await srv.hosted("alice@example.com", "eng/sim");
+
+    // Auto-pick finds no launcher of alice's (bob's is live, and shares the
+    // scope), and alice has no reachable human: refused, nothing sent.
+    await expect(aliceSim.call("delegate", { persona: "a researcher", task: "t" })).rejects.toThrow(/no live launcher session/);
+    // Naming bob's launcher is refused as another user's.
+    await expect(aliceSim.call("delegate", { persona: "p", task: "t", to: "eng/launcher" })).rejects.toThrow(/belongs to another user/);
+    await bobLauncher.none(direct());
+
+    // Alice's own launcher under a team name takes it.
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const r = await aliceSim.call<Delegated>("delegate", { persona: "a researcher", task: "t" });
+    expect(r.to).toBe("eng/builder");
+    expect((await aliceLauncher.next(direct())).message.sender).toBe("eng/sim");
+    await bobLauncher.none(direct());
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+// #807 P1c-13: a delegate's peer resolution (a bare name in or outside the sender's scope) and its hidden-team-alias
+// check read aliases on the request's Tx, not the pool.
+test("server: a delegate reads aliases on its body's Tx (#807 P1c-13)", async () => {
+  const srv = await serve();
+  const repo = srv.app.repo;
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const tx = txSpy(srv);
+  const spies = (["find", "findAllByName"] as const).map((name) => {
+    const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
+    return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (new Error().stack?.includes("handleDelegate")) checks.push({ op: name, inTxn: tx.open, handle: r === repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    const alice = await srv.login("alice@example.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    await launcher(srv, alice, "eng/builder");
+    const sim = await srv.connected(alice, "eng/sim");
+    await sim.delegate({ persona: "p", task: "t", to: "builder" });
+    await sim.delegate({ persona: "p", task: "t", to: "eng/builder" });
+    expect((await refusal(sim.delegate({ persona: "p", task: "t", to: "nobody" }))).code).toBe("not_found");
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+    tx.restore();
+    await srv.stop();
+  }
+  expect(checks.map((c) => c.op)).toEqual(expect.arrayContaining(["find", "findAllByName"]));
+  expect(checks.filter((c) => !c.inTxn || c.handle !== "tx")).toEqual([]);
+}, 30_000);
+
+// #807 P1c-14b, P3 B4b: a delegate's facts (the launchers, their users and open-request counts), the target's user, and
+// every messages read in its body run on the request's Tx, not the pool; core's decision reads nothing itself.
+test("server: a delegate reads its facts and messages on its body's Tx (#807 P1c-14b, P3 B4b)", async () => {
+  const srv = await serve();
+  const repo = srv.app.repo;
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const tx = txSpy(srv);
+  let route = "";
+  const spy = <S extends object>(store: S, names: readonly (keyof S & string)[]) => names.map((name) => {
+    const original = (store[name] as (...a: unknown[]) => unknown).bind(store);
+    return spyOn(store, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (route) checks.push({ op: `${route}:${name}`, inTxn: tx.open, handle: r === repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  const spies = [...spy(repo.messages, ["undeliveredFrom", "getById"] as const), ...spy(repo.delegation, ["addressUser", "facts"] as const)];
+  const coreOn = spyOn(repo, "coreOn");
+  try {
+    const alice = await srv.login("alice@example.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    await launcher(srv, alice, "eng/builder");
+    const sim = await srv.connected(alice, "eng/sim");
+    coreOn.mockClear();
+    route = "explicit";
+    await sim.delegate({ persona: "p", task: "t", to: "builder" });
+    route = "auto";
+    await sim.delegate({ persona: "p", task: "t2" });
+    route = "";
+    // The decision and the reach read through repo.delegation only.
+    expect(coreOn.mock.calls.length).toBe(0);
+  } finally {
+    for (const s of spies) s.mockRestore();
+    coreOn.mockRestore();
+    tx.restore();
+    await srv.stop();
+  }
+  const ops = checks.map((c) => c.op);
+  expect(ops).toEqual(expect.arrayContaining(["explicit:addressUser", "explicit:facts", "auto:facts"]));
+  expect(ops).not.toContain("auto:addressUser");
+  expect(checks.filter((c) => !c.inTxn || c.handle !== "tx")).toEqual([]);
+}, 30_000);
+
+// #393 1 (docs/vision.md principle 11): a repeat inside the dedup window
+// re-checks authority over the launcher the first call picked, so a team
+// launcher name that has since moved to a teammate's session is refused,
+// not answered with the first call's result.
+test("server: a delegate repeat after its launcher's name moved to another user is refused, not replayed", async () => {
+  const srv = await serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const aliceSim = await srv.connected(alice, "eng/sim");
+    const req = { persona: "a researcher", task: "t", to: "eng/builder" };
+    const first = await aliceSim.delegate(req);
+    expect(((await aliceSim.delegate(req)) as Delegated & { replayed?: unknown }).replayed).toBeDefined();
+
+    await aliceLauncher.unbind("eng/builder");
+    await srv.connected(bob, "eng/builder");
+    const replays = async () => (await logRow(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'`) as { n: number }).n;
+    const before = await replays();
+    await expect(aliceSim.delegate(req)).rejects.toThrow(/"eng\/builder" belongs to another user/);
+    expect(await replays()).toBe(before);
+    const refused = await logRow(srv, `SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY id DESC LIMIT 1`) as { detail: string };
+    expect(JSON.parse(refused.detail)).toMatchObject({ to: "eng/builder" });
+    // The first call's message stands, and the receipt with it.
+    expect(await row(srv, `SELECT COUNT(*) AS n FROM messages WHERE id = ?`, first.message_id)).toEqual({ n: 1 });
+    expect(await row(srv, `SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'`)).toEqual({ n: 1 });
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+// The auto-pick half: the caller never named the launcher, so the refusal
+// says what the first call picked and how to pick afresh, and the audit row
+// names the pick.
+test("server: an auto-pick delegate repeat after its pick moved to another user names the pick and resend", async () => {
+  const srv = await serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const aliceSim = await srv.connected(alice, "eng/sim");
+    const req = { persona: "a researcher", task: "t" };
+    expect((await aliceSim.delegate(req)).to).toBe("eng/builder");
+
+    await aliceLauncher.unbind("eng/builder");
+    await srv.connected(bob, "eng/builder");
+    const refusedRows = async () => await logRows(srv, `SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY id`) as { detail: string }[];
+    const before = (await refusedRows()).length;
+    await expect(aliceSim.delegate(req)).rejects.toThrow(/auto-picked "eng\/builder".*resend: true/);
+    const rows = await refusedRows();
+    expect(rows.length).toBe(before + 1);
+    expect(JSON.parse(rows[rows.length - 1].detail)).toMatchObject({ to: "eng/builder" });
   } finally {
     await srv.stop();
   }
@@ -225,7 +431,7 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
   const before = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
   expect(before.find((p) => p.handle === "be")?.launcher).toBe(true);
 
-  // A sidecar under the launcher's name without BUS_LAUNCHER — the §13
+  // A sidecar under the launcher's name without BUS_LAUNCHER — the delegation.md
   // subagent pattern — must not clear the owner's opt-in.
   await localSession(dir, "be", { extra: { BUS_PUSH: "off" } });
   const after = (await call(sim.c, "peer_list", { include_offline: true })).peers as { handle: string; launcher?: true }[];
@@ -259,12 +465,12 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
 
 test("server: the human fallback checks Slack reachability (review 10)", async () => {
   // No launcher live, human not linked: refused with the undo.
-  const srv = serve();
+  const srv = await serve();
   try {
     const sim = await srv.hosted("you@example.com", "sim");
     await expect(sim.call("delegate", { persona: "p", task: "t" })).rejects.toThrow(/no live launcher session/);
     // The refusal is audited with its reason.
-    const refused = srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid DESC`).get() as any;
+    const refused = await logRow(srv, `SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY id DESC`) as any;
     expect(JSON.parse(refused.detail).reason).toMatch(/no live launcher session/);
   } finally {
     await srv.stop();
@@ -315,13 +521,14 @@ test("local: a re-pick retracts the missed pick's message and returns the new on
 test("server: a reachable human fallback delivers end to end, and every refusal is audited (review 4/10)", async () => {
   const { FakeSlack } = await import("./fake_slack.ts");
   const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
-  const srv = serve({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
+  const srv = await serve({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
   try {
     await srv.app.slackReady;
     const token = await srv.login("alice@example.com");
     // Link, so the human is really reachable: the bridge is running and the
     // user is linked (review 10's reachability, not a last_seen row).
     const r = await srv.api(token, "POST", "/api/slack/link");
+    slack.emails.set("U0ALICE", "alice@example.com");
     slack.say(`link ${r.body.code}`);
     await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
 
@@ -332,7 +539,7 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     expect(req.note).toContain("settle the thread");
 
     // The request is audited with its via (review 4).
-    const audits = srv.app.db.query(`SELECT action, target, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
+    const audits = await logRows(srv, `SELECT action, target, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY id`) as any[];
     const requested = audits.filter((a) => a.action === "delegation.requested");
     expect(requested).toHaveLength(1);
     expect(JSON.parse(requested[0]!.detail).via).toBe("human_fallback");
@@ -341,16 +548,16 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     // A refusal never masquerades as a request: with the human's alias
     // row gone (a broken unlink's state), the send is refused — and the
     // audit says refused, with no id-less requested row beside it.
-    srv.app.db.exec(`DELETE FROM aliases WHERE name = 'human'`);
+    await exec(srv, `DELETE FROM aliases WHERE name = 'human'`);
     await expect(sim.call("delegate", { persona: "p", task: "t" })).rejects.toThrow(/not found/);
-    const after = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
+    const after = await logRows(srv, `SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY id`) as any[];
     expect(after.filter((a) => a.action === "delegation.requested")).toHaveLength(1);
     const lastRefused = after.filter((a) => a.action === "delegation.refused").at(-1)!;
     expect(JSON.parse(lastRefused.detail).reason).toMatch(/not found/);
 
     // An unresolvable `to` is audited as a refusal too (review 4).
     await expect(sim.call("delegate", { persona: "p", task: "t", to: "ghost" })).rejects.toThrow();
-    const final = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid`).all() as any[];
+    const final = await logRows(srv, `SELECT action, detail FROM access_log WHERE action = 'delegation.refused' ORDER BY id`) as any[];
     expect(JSON.parse(final.at(-1)!.detail).reason).toBeTruthy();
   } finally {
     await srv.stop();
@@ -358,9 +565,21 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
   }
 }, 40_000);
 
+// #272: a local `to` resolves as the server resolves it: case doesn't matter,
+// for delegate and dm_send alike.
+test("local: a mixed-case to reaches the launcher, by delegate and by dm_send", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim");
+  const r = await call(sim.c, "delegate", { persona: "p", task: "mixed t", to: "Be" });
+  expect(r).toMatchObject({ to: "be", delivered_now: true });
+  await until(() => be.pushes.some((p) => String(p.content).includes('"task": "mixed t"')), 10_000, "the delegate push");
+  const d = await call(sim.c, "dm_send", { to: "BE", body: "mixed dm" });
+  expect(d).toMatchObject({ delivered_now: true });
+  await until(() => be.pushes.some((p) => String(p.content).includes("mixed dm")), 10_000, "the dm push");
+}, 40_000);
+
 // #284 PR 4: the launcher flag is the session's, so it stands behind every
 // alias the session holds; a delegate to its second alias lands on it.
-// hosted twin: #451 (multi-alias holds, the launcher)
 test("local and server: a delegate to a launcher session's second alias is accepted", async () => {
   const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
   await call(be.c, "bind", { name: "be2", create: true });
@@ -369,7 +588,7 @@ test("local and server: a delegate to a launcher session's second alias is accep
   expect(r).toMatchObject({ to: "be2", delivered_now: true });
   await until(() => be.pushes.some((p) => String(p.content).includes('"task": "local t"')), 10_000, "the local push");
 
-  const srv = serve();
+  const srv = await serve();
   try {
     const token = await srv.login("you@example.com");
     const sbe = await launcher(srv, token, "be");

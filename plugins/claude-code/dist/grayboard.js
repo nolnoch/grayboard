@@ -6922,8 +6922,8 @@ var require_dist2 = __commonJS(function(exports, module) {
 });
 
 // plugins/claude-code/src/main.ts
-import { readdirSync as readdirSync2 } from "fs";
-import { join as join6 } from "path";
+import { readdirSync as readdirSync4 } from "fs";
+import { join as join10 } from "path";
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js
 import process2 from "process";
@@ -14157,7 +14157,7 @@ class StdioServerTransport {
 // package.json
 var package_default = {
   name: "grayboard",
-  version: "2.3.0",
+  version: "3.2.0",
   description: "Durable Claude-to-Claude message bus over the channels protocol",
   type: "module",
   private: true,
@@ -14168,8 +14168,8 @@ var package_default = {
   scripts: {
     server: "bun src/server/main.ts",
     cli: "bun src/cli/main.ts",
-    typecheck: "tsc --noEmit",
-    test: "bun test --timeout 30000 ./src ./tests",
+    typecheck: "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json",
+    test: "bun test --timeout 30000 --parallel ./src ./tests",
     "test:opencode": "bash scripts/e2e.sh hosted-strict",
     "test:opencode:host": "bash scripts/e2e.sh hosted-host",
     "test:opencode:config": "bash scripts/e2e.sh hosted-config",
@@ -14180,25 +14180,26 @@ var package_default = {
   dependencies: {
     "@modelcontextprotocol/core": "2.4.0",
     "@modelcontextprotocol/server": "2.4.0",
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
     commander: "^12.0.0",
     jose: "^5.0.0",
     "jsonc-parser": "^3.3.1",
-    zod: "^4.0.0"
+    zod: "^4.2.0"
   },
   devDependencies: {
-    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.5.2",
     "@modelcontextprotocol/client": "2.4.0",
     "@oh-my-pi/pi-coding-agent": "18.14.0",
     "@opencode-ai/plugin": "1.19.4",
     "@types/bun": "latest",
+    "opencode-ai": "1.19.4",
     typescript: "^5.0.0"
   }
 };
 
 // adapters/hosted-core/src/login.ts
 import { createHash as createHash3, randomBytes as randomBytes2 } from "crypto";
-import { mkdir as mkdir2 } from "fs/promises";
+import { mkdir as mkdir2, rm as rm2 } from "fs/promises";
 import { createServer } from "http";
 import { dirname as dirname2, join as join2 } from "path";
 // adapters/hosted-core/src/lock.ts
@@ -14215,13 +14216,13 @@ class LockTimeout extends Error {
 }
 var SQLITE_BUSY = 5;
 var held = new Set;
-function tryAcquire(path) {
+function tryAcquire(path, busyMs = 50) {
   const file = resolve(path);
   if (held.has(file))
     return;
   const db = new DatabaseSync(file);
   try {
-    db.exec("PRAGMA busy_timeout=50");
+    db.exec(`PRAGMA busy_timeout=${Math.max(0, Math.trunc(busyMs))}`);
     db.exec("BEGIN EXCLUSIVE");
   } catch (error) {
     db.close();
@@ -14247,16 +14248,17 @@ function tryAcquire(path) {
   };
 }
 async function acquire(path, options) {
-  const deadline = Date.now() + options.deadlineMs;
+  const deadline = performance.now() + options.deadlineMs;
   for (;; ) {
     options.signal?.throwIfAborted();
-    const lock = tryAcquire(path);
+    const lock = tryAcquire(path, 0);
     if (lock)
       return lock;
-    const left = deadline - Date.now();
+    await options.onBusy?.();
+    const left = deadline - performance.now();
     if (left <= 0)
       throw new LockTimeout(resolve(path));
-    await sleep(Math.min(100, left), undefined, options.signal ? { signal: options.signal } : undefined);
+    await sleep(Math.min(100 + Math.random() * 10, left), undefined, options.signal ? { signal: options.signal } : undefined);
   }
 }
 
@@ -31556,7 +31558,12 @@ var StreamableHTTPClientTransport = class {
 
 // adapters/hosted-core/src/wire.ts
 import { setTimeout as sleep3 } from "timers/promises";
+import { connect as tcpConnect } from "net";
 var DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
+var LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
+var MODEL_META = "io.github.nolnoch.grayboard/model";
+var EFFORT_META = "io.github.nolnoch.grayboard/effort";
+var SUGGESTED_META = "io.github.nolnoch.grayboard/suggested";
 
 class SubscriberError extends Error {
   code;
@@ -31570,13 +31577,21 @@ class SubscriberError extends Error {
   }
 }
 var shownText = (value) => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f\u202A-\u202E\u2066-\u2069]/.test(value);
+var SERVER_TEXT_LIMIT = 512;
+var serverText = (text) => text.length <= SERVER_TEXT_LIMIT ? text : `${text.slice(0, SERVER_TEXT_LIMIT)}\u2026 (${text.length - SERVER_TEXT_LIMIT} more characters cut)`;
+function capServerText(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof Error && e.message.length > SERVER_TEXT_LIMIT)
+      e.message = serverText(e.message);
+  }
+}
 
 class LeaseUnavailable extends SubscriberError {
   constructor(code = "not_found") {
     super(code);
   }
 }
-var domainCodes = new Set(["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity"]);
+var domainCodes = new Set(["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration"]);
 function subscriberError(value, leaseOperation) {
   const code = value?.code;
   const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";
@@ -31597,7 +31612,7 @@ class ConnectRefused extends SubscriberError {
     super(typeof code === "string" && domainCodes.has(code) ? code : "invalid_response");
     this.status = status;
     this.body = body;
-    this.message = `Server refused the connection (HTTP ${status}): ${body}`;
+    this.message = `Server refused the connection (HTTP ${status}): ${serverText(body)}`;
   }
 }
 
@@ -31605,6 +31620,26 @@ class ServerUnreachable extends Error {
   constructor(cause) {
     super("Server unreachable", { cause });
   }
+}
+
+class ServerBusy extends ServerUnreachable {
+  retryAfterMs;
+  constructor(retryAfterMs) {
+    const ms = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000;
+    super(new Error(`server at capacity (rate_limited); retry after ${ms} ms`));
+    this.retryAfterMs = ms;
+    this.message = "Server at capacity";
+  }
+}
+
+class OutcomeUnknown extends ServerUnreachable {
+  constructor(cause) {
+    super(cause);
+    this.message = "Server unreachable mid-call; it may have taken effect, so check (dm_history, board_read, claim_list) before calling it again";
+  }
+}
+
+class ConnectProbeFailed extends ServerUnreachable {
 }
 
 class SubscriptionClosed extends Error {
@@ -31625,7 +31660,8 @@ function scopeRefusal(error) {
   }
   return false;
 }
-var networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+var networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
+var connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 var gatewayStatuses = new Set([502, 503, 504]);
 function unreachable(error) {
   for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
@@ -31641,7 +31677,71 @@ function unreachable(error) {
   }
   return false;
 }
+var LISTEN_CAPACITY = "MCP listen capacity reached";
+function listenCapacity(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof SdkHttpError && e.status === 429 && e.data.text === LISTEN_CAPACITY)
+      return true;
+  }
+  return false;
+}
+function outcome(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof ServerUnreachable)
+      return error;
+    const code = e.code;
+    if (typeof code === "string" && connectCodes.has(code))
+      return error;
+  }
+  return unreachable(error) ? new OutcomeUnknown(error) : error;
+}
+function abortOf(error, signal) {
+  if (!signal.aborted)
+    return false;
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e === signal.reason || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout && e.message === String(signal.reason))
+      return true;
+  }
+  return false;
+}
 var connectMethods = new Set(["server/discover", "initialize"]);
+var connectProbe = {
+  deadlineMs: 5000,
+  coldMs: 30000,
+  lookup: undefined,
+  open: (host, port) => tcpConnect({ host, port, autoSelectFamily: true, ...connectProbe.lookup && { lookup: connectProbe.lookup } })
+};
+function proxied(url) {
+  const env = typeof process === "undefined" ? {} : process.env;
+  const names = url.protocol === "https:" ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+  return names.some((n) => !!env[n]);
+}
+function probe(url, signal) {
+  const host = url.hostname.replace(/^\[(.*)\]$/, "$1");
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const socket = connectProbe.open(host, port);
+    const done = (error) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      socket.destroy();
+      if (error === undefined)
+        resolve();
+      else
+        reject(error);
+    };
+    const ms = connectProbe.deadlineMs;
+    const timer = setTimeout(() => done(Object.assign(new Error(`connect to ${host}:${port} timed out after ${ms} ms`), { code: "ETIMEDOUT" })), ms);
+    const onAbort = () => done(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    socket.once("connect", () => done());
+    socket.once("error", () => done());
+  });
+}
 async function methodOf(request) {
   if (request.method !== "POST")
     return;
@@ -31658,6 +31758,9 @@ class Connection {
   admissionRetryAfterMs;
   connect;
   refusal;
+  busy;
+  answeredAt = -Infinity;
+  probes = false;
   constructor(wireOptions, authProvider, signal, beforeRetry) {
     this.wireOptions = wireOptions;
     this.signal = signal;
@@ -31675,29 +31778,47 @@ class Connection {
         this.decorate(outgoing);
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
+        const connecting = method !== undefined && connectMethods.has(method);
+        if (this.probes && method === "tools/call" && performance.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
+          try {
+            await probe(endpoint, signal);
+          } catch (error) {
+            throw signal.aborted ? error : new ConnectProbeFailed(error);
+          }
+        }
         for (let attempt = 0;; attempt++) {
           if (attempt) {
-            await beforeRetry?.();
-            const token = await authProvider.token();
-            if (token)
-              outgoing.set("Authorization", `Bearer ${token}`);
-            else
-              outgoing.delete("Authorization");
+            try {
+              await beforeRetry?.();
+              const token = await authProvider.token();
+              if (token)
+                outgoing.set("Authorization", `Bearer ${token}`);
+              else
+                outgoing.delete("Authorization");
+            } catch (error) {
+              if (connecting)
+                this.busy = undefined;
+              throw error;
+            }
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
-          if (method && connectMethods.has(method) && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
+          this.answeredAt = performance.now();
+          if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
-          if (response.status !== 429)
-            return response;
-          const body = await response.clone().json().catch(() => {
+          const body = response.status === 429 ? await response.clone().json().catch(() => {
             return;
-          });
+          }) : undefined;
           const data = body?.error?.data;
-          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0)
+          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) {
+            if (connecting)
+              this.busy = undefined;
             return response;
+          }
           this.admissionRetryAfterMs = data.retry_after_ms;
+          if (connecting)
+            this.busy = new ServerBusy(data.retry_after_ms);
           if (attempt === 7)
             return response;
           await response.body?.cancel().catch(() => {});
@@ -31715,24 +31836,45 @@ class Connection {
       try {
         await this.reachable(this.client.connect(transport, { signal, timeout: 1e4 }));
       } catch (error) {
-        throw this.refusal ?? error;
+        throw this.refusal ?? (!this.signal.aborted || this.signal.reason?.name === "TimeoutError" ? this.busy : undefined) ?? error;
       }
     };
   }
   declaration() {
-    return this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {};
+    return { ...this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}, ...this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {} };
+  }
+  facts(sessionID) {
+    let f, suggested;
+    try {
+      f = this.wireOptions.facts?.(sessionID);
+    } catch {
+      f = undefined;
+    }
+    try {
+      suggested = this.wireOptions.suggested?.(sessionID);
+    } catch {
+      suggested = undefined;
+    }
+    const wire = (v) => v === null ? "" : typeof v === "string" && v ? v : undefined;
+    const model = wire(f?.model), effort = wire(f?.effort);
+    return {
+      ...model === undefined ? {} : { [MODEL_META]: model },
+      ...effort === undefined ? {} : { [EFFORT_META]: effort },
+      ...typeof suggested === "string" && suggested ? { [SUGGESTED_META]: suggested } : {}
+    };
   }
   async reachable(pending) {
     try {
       return await pending;
     } catch (error) {
+      capServerText(error);
       if (!(error instanceof ConnectRefused) && scopeRefusal(error))
         throw new InsufficientScope(error);
       throw !this.signal.aborted && !(error instanceof ServerUnreachable) && unreachable(error) ? new ServerUnreachable(error) : error;
     }
   }
-  options() {
-    return { signal: this.signal, timeout: 1e4 };
+  options(signal) {
+    return { signal: signal ? AbortSignal.any([this.signal, signal]) : this.signal, timeout: 1e4 };
   }
   async close() {
     await this.client.close();
@@ -31752,10 +31894,13 @@ class Wire extends Connection {
       headers.set("X-Grayboard-Lease", this.capability);
   }
   meta() {
-    return { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration() };
+    return this.wireOptions.ending ? {} : this.named();
+  }
+  named() {
+    return this.wireOptions.ending ? { [this.wireOptions.sessionKey]: this.sessionID } : { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) };
   }
   async read(uri) {
-    const value = await this.reachable(this.client.readResource({ uri, _meta: this.meta() }, this.options())).catch((error) => {
+    const value = await this.reachable(this.client.readResource({ uri, _meta: this.named() }, this.options())).catch((error) => {
       if (error?.code === -32602 || error?.code === -32603)
         throw subscriberError(error.data, uri === "grayboard://inbox");
       throw error;
@@ -31765,7 +31910,7 @@ class Wire extends Connection {
     return JSON.parse(value.contents[0].text);
   }
   async call(name, args = {}) {
-    const value = await this.reachable(this.client.callTool({ name, arguments: args, _meta: this.meta() }, this.options()));
+    const value = await this.reachable(this.client.callTool({ name, arguments: args, _meta: this.named() }, this.options()));
     if (value.isError) {
       throw subscriberError(value.structuredContent, name.startsWith("delivery_"));
     }
@@ -31775,6 +31920,17 @@ class Wire extends Connection {
     if (!Array.isArray(content) || content.length !== 1 || content[0]?.type !== "text")
       throw new Error("Invalid delivery response");
     return JSON.parse(content[0].text);
+  }
+  async takes(tool, arg) {
+    let cursor;
+    do {
+      const page = await this.reachable(this.client.listTools(cursor === undefined ? {} : { cursor }, this.options()));
+      const found = page.tools.find((t) => t.name === tool);
+      if (found)
+        return Object.hasOwn(found.inputSchema.properties ?? {}, arg);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return false;
   }
   async listen() {
     const subscription = await this.reachable(this.client.listen({ resourceSubscriptions: ["grayboard://inbox"] }, this.options()));
@@ -31791,10 +31947,11 @@ class NativeWire extends Connection {
   constructor(options, authProvider, signal, sessionID, beforeRetry) {
     super(options, authProvider, signal, beforeRetry);
     this.sessionID = sessionID;
+    this.probes = true;
   }
   decorate() {}
   meta() {
-    return { ...this.sessionID === undefined ? {} : { [this.wireOptions.sessionKey]: this.sessionID }, ...this.declaration() };
+    return { ...this.sessionID === undefined ? {} : { [this.wireOptions.sessionKey]: this.sessionID, ...this.facts(this.sessionID) }, ...this.declaration() };
   }
   instructions() {
     return this.client.getInstructions();
@@ -31809,13 +31966,48 @@ class NativeWire extends Connection {
     } while (cursor);
     return tools;
   }
-  async callTool(name, args, sessionID) {
-    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration() } }, this.options()));
+  async callTool(name, args, sessionID, signal) {
+    const call = this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal));
+    return this.reachable(call.catch((error) => {
+      throw this.signal.aborted ? error : outcome(error);
+    }));
   }
 }
 
+// src/shared/addressing.ts
+var MAX_IDENTITY_LENGTH = 32;
+var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
+var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
+var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
+var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
+function isValidEmail(email) {
+  return DIRECT_RE.test(`${email.toLowerCase()}/x`);
+}
+function isValidIdentityName(name) {
+  return NAME_RE.test(name.toLowerCase());
+}
+function shownName(raw) {
+  const clean = raw.replace(/\p{Cc}/gu, "");
+  return clean.length > 64 ? `${clean.slice(0, 64)}\u2026` : clean;
+}
+var HUMAN_NAME = "human";
+var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
+
+// adapters/hosted-core/src/own-human.ts
+var InboxEvent = discriminatedUnion("kind", [
+  object({ kind: literal("direct"), message: looseObject({ id: number2(), sender: string2(), body: string2() }) }),
+  object({ kind: literal("board"), item: discriminatedUnion("kind", [
+    looseObject({ kind: literal("push"), post: looseObject({ author: string2(), body: string2() }) }),
+    looseObject({ kind: literal("digest"), board: string2() })
+  ]) })
+]);
+function isOwnHuman(event, identity) {
+  const human = `${identity.user.email}/${HUMAN_NAME}`;
+  return event.kind === "direct" ? event.message.sender === human : event.item.kind === "push" && event.item.post.author === human;
+}
+
 // adapters/hosted-core/src/model.ts
-var ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
+var ADDRESS = /^[^\x00-\x20\x7f-\x9f\u202a-\u202e\u2066-\u2069]{1,160}$/;
 var MAX_HELD = 64;
 var validAddress = (value) => typeof value === "string" && ADDRESS.test(value);
 var validHeld = (value) => Array.isArray(value) && value.length <= MAX_HELD && value.every(validAddress) && new Set(value).size === value.length;
@@ -31924,7 +32116,7 @@ async function admitPrefix(items, admit, receipt) {
 // adapters/hosted-core/src/storage.ts
 import { createHash as createHash2, randomBytes } from "crypto";
 import { chmod, mkdir, open as open2, readFile, rename, rm } from "fs/promises";
-import { mkdirSync } from "fs";
+import { constants, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { setTimeout as sleep4 } from "timers/promises";
 var sha256 = (text) => createHash2("sha256").update(text).digest("hex");
@@ -31938,6 +32130,33 @@ async function readJson(path) {
     throw error;
   }
   return JSON.parse(text);
+}
+
+class FileRefused extends Error {
+}
+async function readSmallJson(path, maxBytes) {
+  let file;
+  try {
+    file = await open2(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  } catch (error) {
+    const code = error.code;
+    if (code === "ENOENT")
+      return;
+    if (code === "ELOOP")
+      throw new FileRefused("is a symbolic link");
+    throw error;
+  }
+  try {
+    if (!(await file.stat()).isFile())
+      throw new FileRefused("isn't a regular file");
+    const buffer = Buffer.alloc(maxBytes + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > maxBytes)
+      throw new FileRefused(`is over ${maxBytes} bytes`);
+    return JSON.parse(buffer.toString("utf8", 0, bytesRead));
+  } finally {
+    await file.close();
+  }
 }
 async function writeJsonAtomic(path, value) {
   const dir = dirname(path);
@@ -32000,14 +32219,14 @@ class FileStorage {
     return raw === undefined ? {} : SessionState.parse(raw);
   }
 }
-function tryDelivery(path) {
+function tryDelivery(path, busyMs) {
   mkdirSync(dirname(path), { recursive: true, mode: 448 });
-  return tryAcquire(path);
+  return tryAcquire(path, busyMs);
 }
 async function waitDelivery(path, signal, intervalMs = 5000) {
   for (;; ) {
     signal.throwIfAborted();
-    const lock = tryDelivery(path);
+    const lock = tryDelivery(path, 0);
     if (lock)
       return lock;
     await sleep4(intervalMs, undefined, { signal });
@@ -32031,13 +32250,39 @@ function canonicalEndpoint(raw) {
     return;
   return u;
 }
+function issuerEndpoint(raw) {
+  const u = canonicalEndpoint(raw);
+  if (!u || raw.endsWith("/") || u.pathname.includes("//"))
+    return;
+  const portless = raw.replace(/^(https:\/\/[^/]+):443(?=\/|$)/, "$1").replace(/^(http:\/\/[^/]+):80(?=\/|$)/, "$1");
+  return u.href === portless || u.pathname === "/" && u.href === `${portless}/` ? u : undefined;
+}
+
+// src/shared/signin.ts
+var SIGN_IN_FLOW_MS = 10 * 60000;
+var SIGN_IN_URL_MAX = 2048;
+function signInUrl(text) {
+  if (text.length > SIGN_IN_URL_MAX)
+    return { failed: `longer than ${SIGN_IN_URL_MAX}` };
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return { failed: "not a URL" };
+  }
+  if (url.username || url.password)
+    return { failed: "carries credentials" };
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK.has(url.hostname)))
+    return { failed: "neither HTTPS nor loopback HTTP" };
+  return { url };
+}
 
 // adapters/hosted-core/src/login.ts
 var SCOPES = "grayboard:tools grayboard:delivery";
-var FLOW_MS = 10 * 60000;
 var REFRESH_MARGIN_MS = 60000;
 var REFRESH_LOCK_MS = 15000;
 var WATCH_MS = 2000;
+var LINK_BYTES = 8192;
 
 class LoginFailed extends Error {
 }
@@ -32076,7 +32321,7 @@ var TokenResponse = object({
   refresh_token: Credential
 });
 var OAuthRefusal = strictObject({ error: string2() });
-var connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
+var connectCodes2 = new Set(["ECONNREFUSED", "ConnectionRefused", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 function codeOf(e) {
   const code = e && typeof e === "object" && "code" in e ? e.code : undefined;
   return typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : undefined;
@@ -32084,7 +32329,7 @@ function codeOf(e) {
 function connectFailure(error) {
   for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
     const code = codeOf(e);
-    if (code && connectCodes.has(code))
+    if (code && connectCodes2.has(code))
       return true;
   }
   return false;
@@ -32116,11 +32361,38 @@ function refusalOf(response, text) {
 var printable = (text) => /^[\x20-\x7e]{1,128}$/.test(text) ? text : "unprintable";
 var escapeHTML = (text) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 var form = (fields) => ({ method: "POST", redirect: "error", headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }, body: new URLSearchParams(fields) });
+async function getJson(url, timeoutMs) {
+  let response;
+  try {
+    response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
+  } catch (error) {
+    throw new ServerUnreachable(error);
+  }
+  if (response.status >= 500 || response.status === 429) {
+    await response.body?.cancel();
+    throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`));
+  }
+  if (response.status !== 200) {
+    await response.body?.cancel();
+    throw new Error(`${url} answered HTTP ${response.status}`);
+  }
+  return response.json();
+}
+async function resourceMetadata(resource, timeoutMs) {
+  const r = new URL(resource);
+  const prm = ResourceMetadata.parse(await getJson(`${r.origin}/.well-known/oauth-protected-resource${r.pathname === "/" ? "" : r.pathname}`, timeoutMs));
+  if (prm.resource !== resource)
+    throw new Error(`Protected resource metadata names ${prm.resource}, expected ${resource}`);
+  return prm;
+}
 
 class Login {
   config;
   resource;
   path;
+  get stateKey() {
+    return this.config.clientId;
+  }
   refreshing;
   signingIn;
   constructor(config) {
@@ -32134,6 +32406,9 @@ ${config.clientId}`)}.json`);
   }
   get refreshLock() {
     return `${this.path}.refresh.lock`;
+  }
+  get linkPath() {
+    return `${this.path}.login.url`;
   }
   expired(reason = "login_required") {
     return new AccessExpired(this.config.harness, this.config.loginAction, reason);
@@ -32164,9 +32439,17 @@ ${config.clientId}`)}.json`);
   }
   async token() {
     const s = await this.live();
-    if (s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS)
-      return s.access;
-    return this.refresh();
+    return this.serve(s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS ? s.access : await this.refresh());
+  }
+  served;
+  rotations = new Set;
+  serve(access) {
+    const was = this.served;
+    this.served = access;
+    if (was !== undefined && was !== access)
+      for (const changed of [...this.rotations])
+        changed();
+    return access;
   }
   async unauthorized(token) {
     const s = await this.live();
@@ -32305,30 +32588,13 @@ ${config.clientId}`)}.json`);
     }
     return { remaining, cause: cause ?? "none" };
   }
-  async getJson(url, timeoutMs) {
-    let response;
-    try {
-      response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
-    } catch (error) {
-      throw new ServerUnreachable(error);
-    }
-    if (response.status >= 500) {
-      await response.body?.cancel();
-      throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`));
-    }
-    if (response.status !== 200) {
-      await response.body?.cancel();
-      throw new Error(`${url} answered HTTP ${response.status}`);
-    }
-    return response.json();
-  }
   async serverMetadata(issuer, timeoutMs) {
     const at = canonicalEndpoint(issuer), origin = new URL(this.resource).origin;
     if (!at)
       throw new Error("OAuth issuer must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     if (at.origin !== origin)
       throw new Error(`OAuth issuer ${issuer} is not on ${origin}`);
-    const meta = ServerMetadata.parse(await this.getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
+    const meta = ServerMetadata.parse(await getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
     if (meta.issuer !== issuer)
       throw new Error(`OAuth metadata names issuer ${meta.issuer}, expected ${issuer}`);
     for (const endpoint of [meta.authorization_endpoint, meta.token_endpoint, meta.revocation_endpoint]) {
@@ -32338,10 +32604,7 @@ ${config.clientId}`)}.json`);
     return meta;
   }
   async discover() {
-    const r = new URL(this.resource);
-    const prm = ResourceMetadata.parse(await this.getJson(`${r.origin}/.well-known/oauth-protected-resource${r.pathname === "/" ? "" : r.pathname}`, 1e4));
-    if (prm.resource !== this.resource)
-      throw new Error(`Protected resource metadata names ${prm.resource}, expected ${this.resource}`);
+    const prm = await resourceMetadata(this.resource, 1e4);
     const meta = await this.serverMetadata(prm.authorization_servers[0], 1e4);
     if (!meta.code_challenge_methods_supported.includes("S256"))
       throw new Error("OAuth server does not support PKCE S256");
@@ -32363,28 +32626,102 @@ ${config.clientId}`)}.json`);
     const waited = !lock;
     if (!lock) {
       this.config.notify(`sign-in in progress in another ${this.config.harness} session`);
-      lock = await acquire(lockPath, { deadlineMs: FLOW_MS + 60000, ...signal ? { signal } : {} });
+      lock = await this.waitFor(lockPath, signal);
     }
     try {
+      await this.unlink();
       const now = await this.read();
       if (waited) {
         if (live(now))
-          return;
+          return "signed in";
         throw new LoginFailed(`sign-in in another ${this.config.harness} session ended without signing in`);
       }
-      if (live(now) && (ifSignedOut || now.epoch !== before))
-        return;
+      if (live(now) && ifSignedOut)
+        return "current";
+      if (live(now) && now.epoch !== before)
+        return "signed in";
       await this.flow(signal);
+      return "signed in";
     } finally {
       lock.release();
+    }
+  }
+  async waitFor(lockPath, signal) {
+    const origin = new URL(this.resource).origin;
+    const seen = new Set;
+    let refused = false, failure;
+    const stop = new AbortController;
+    const refuse = (why) => {
+      if (!refused)
+        this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login_link", code: "refused" });
+      refused = true;
+    };
+    const onBusy = async () => {
+      try {
+        await this.poll(seen, origin, refuse, (error) => {
+          failure ??= { error };
+          stop.abort();
+        });
+      } finally {
+        this.config.polled?.();
+      }
+    };
+    try {
+      return await acquire(lockPath, { deadlineMs: SIGN_IN_FLOW_MS + 60000, signal: signal ? AbortSignal.any([signal, stop.signal]) : stop.signal, onBusy });
+    } catch (error) {
+      if (failure)
+        throw failure.error;
+      throw error;
+    }
+  }
+  async poll(seen, origin, refuse, failed) {
+    let raw;
+    try {
+      raw = await readSmallJson(this.linkPath, LINK_BYTES);
+    } catch (error) {
+      refuse(error instanceof SyntaxError ? "the link file isn't JSON" : error instanceof FileRefused ? `the link file ${error.message}` : `the link file is unreadable (${String(error.code ?? "error")})`);
+      return;
+    }
+    if (raw === undefined)
+      return;
+    const text = raw && typeof raw === "object" && "url" in raw && typeof raw.url === "string" ? raw.url : undefined;
+    if (text === undefined) {
+      refuse("the link file holds no URL");
+      return;
+    }
+    if (seen.has(text))
+      return;
+    seen.add(text);
+    const checked = signInUrl(text);
+    const why = "failed" in checked ? checked.failed : checked.url.origin !== origin ? "not on this server's origin" : undefined;
+    if (why || !("url" in checked)) {
+      refuse(why ?? "not a sign-in link");
+      return;
+    }
+    const presented = Promise.resolve().then(() => this.config.present(checked.url.href));
+    presented.catch(failed);
+  }
+  async share(url) {
+    try {
+      await writeJsonAtomic(this.linkPath, { url, at: Date.now() });
+    } catch (error) {
+      this.config.diagnostic({ state: "degraded", message: `Couldn't share the sign-in link with other ${this.config.harness} sessions (${failureCause(error, 0)}); they say only that a sign-in is in progress`, operation: "login_link", code: "operation_failed" });
+    }
+  }
+  async unlink() {
+    try {
+      await rm2(this.linkPath, { force: true });
+    } catch (error) {
+      this.config.diagnostic({ state: "degraded", message: `Couldn't remove the shared sign-in link (${failureCause(error, 0)}); other ${this.config.harness} sessions may show a link whose sign-in ended`, operation: "login_link", code: "operation_failed" });
     }
   }
   async flow(outer) {
     const meta = await this.discover();
     await this.drain(meta);
-    const signal = AbortSignal.any([AbortSignal.timeout(FLOW_MS), ...outer ? [outer] : []]);
+    const signal = AbortSignal.any([AbortSignal.timeout(SIGN_IN_FLOW_MS), ...outer ? [outer] : []]);
     const verifier = randomBytes2(32).toString("base64url"), state = randomBytes2(16).toString("base64url");
     const callback = await this.callback(state, signal);
+    const answered = new AbortController;
     let params;
     try {
       const url = new URL(meta.authorization_endpoint);
@@ -32398,9 +32735,13 @@ ${config.clientId}`)}.json`);
         code_challenge: createHash3("sha256").update(verifier).digest("base64url"),
         code_challenge_method: "S256"
       }).toString();
-      await this.config.present(url.href);
-      params = await callback.result;
+      await this.share(url.href);
+      const presented = Promise.resolve().then(() => this.config.present(url.href, answered.signal));
+      presented.catch(() => {});
+      params = await Promise.race([presented.then(() => callback.result), callback.result]);
     } finally {
+      answered.abort();
+      await this.unlink();
       callback.close();
     }
     const iss = params.get("iss");
@@ -32604,6 +32945,13 @@ ${config.clientId}`)}.json`);
       unauthorized: async (e, token) => {
         await check(e);
         await this.unauthorized(token);
+      },
+      rotated: (_e, changed) => {
+        const listener = () => changed();
+        this.rotations.add(listener);
+        return { dispose: () => {
+          this.rotations.delete(listener);
+        } };
       }
     };
   }
@@ -32819,15 +33167,101 @@ function claudeChannels({ env, parentCmd, entry, files }) {
   return unknown ? { state: "unknown", reason: unknown } : { state: "on" };
 }
 
+// src/shared/proc.ts
+import { readFileSync as readFileSync2 } from "fs";
+function statFields(pid) {
+  try {
+    const stat = readFileSync2(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  } catch {
+    return null;
+  }
+}
+function ps(column, pids) {
+  const out = new Map;
+  if (pids.length === 0)
+    return out;
+  try {
+    const r = Bun.spawnSync(["ps", "-o", `pid=,${column}=`, "-p", pids.join(",")], { env: { ...process.env, LC_ALL: "C" } });
+    if (r.exitCode !== 0 && r.exitCode !== 1) {
+      warnOnce(`ps:${r.exitCode}`, `ps exited ${r.exitCode ?? r.signalCode}: ${r.stderr.toString().trim()}`);
+      return null;
+    }
+    for (const line of r.stdout.toString().split(`
+`)) {
+      const m = line.trim().match(/^(\d+)\s+(.*)$/);
+      if (m)
+        out.set(Number(m[1]), m[2].trim());
+    }
+  } catch (e) {
+    warnOnce("ps:spawn", `ps failed to run: ${e.message}`);
+    return null;
+  }
+  return out;
+}
+var warned = new Set;
+function warnOnce(key, text) {
+  if (warned.has(key))
+    return;
+  warned.add(key);
+  console.error(`[grayboard] ${text}`);
+}
+function procStarts(pids) {
+  const out = new Map;
+  if (process.platform !== "linux") {
+    const lines = ps("stat=,lstart", pids);
+    for (const pid of pids) {
+      const m = lines?.get(pid)?.match(/^(\S+)\s+(.*)$/);
+      if (m && exited(m[1]))
+        continue;
+      if (m)
+        out.set(pid, m[2]);
+      else if (pidExists(pid))
+        out.set(pid, null);
+    }
+    return out;
+  }
+  for (const pid of pids) {
+    const fields = statFields(pid);
+    if (fields && exited(fields[0]))
+      continue;
+    const start = fields?.[19];
+    if (start)
+      out.set(pid, start);
+    else if (pidExists(pid))
+      out.set(pid, null);
+  }
+  return out;
+}
+function exited(state) {
+  return state.startsWith("Z") || state.startsWith("X");
+}
+function procStart(pid) {
+  const starts = procStarts([pid]);
+  return starts.has(pid) ? starts.get(pid) : undefined;
+}
+function pidExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+var SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "env"]);
+var LAUNCHERS = new Set(["timeout", "nice", "ionice", "nohup", "stdbuf", "uvx"]);
+var LAUNCHER_VERBS = { direnv: new Set(["exec"]), mise: new Set(["x", "exec"]), uv: new Set(["run"]) };
+var VALUE_OPTS = new Set(["-C", "--cd", "--directory", "--project", "-E", "--env", "-p", "--python"]);
+
 // src/shared/toolguard.ts
-import { readFileSync as readFileSync2, statSync } from "fs";
+import { readFileSync as readFileSync3, statSync } from "fs";
 function channelsOffNotice(reason) {
   return `Warning: this Claude Code session is tools-only: grayboard can't push messages or board posts to it, because ${reason}, and peers see it as offline. Tell the user; what's pending arrives once a session with channels on holds this name. Until then, check dm_inbox and board_read yourself.`;
 }
 function parentCommandLine() {
   try {
     if (process.platform === "linux") {
-      return readFileSync2(`/proc/${process.ppid}/cmdline`, "utf8").split("\x00").join(" ").trim() || null;
+      return readFileSync3(`/proc/${process.ppid}/cmdline`, "utf8").split("\x00").join(" ").trim() || null;
     }
     const r = Bun.spawnSync(["ps", "-o", "args=", "-p", String(process.ppid)]);
     return r.exitCode === 0 ? r.stdout.toString().trim() || null : null;
@@ -32838,6 +33272,8 @@ function parentCommandLine() {
 
 // plugins/claude-code/src/plugin.ts
 import { randomUUID as randomUUID2 } from "crypto";
+import { mkdirSync as mkdirSync3, watch } from "fs";
+import { join as join9 } from "path";
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-compat.js
 function isZ4Schema(s) {
   const schema = s;
@@ -34273,13 +34709,18 @@ class Server extends Protocol2 {
 
 // src/shared/attachments.ts
 import { createHash as createHash5, randomUUID } from "crypto";
-import { constants, realpathSync } from "fs";
-import { link, mkdir as mkdir3, open as open3, rm as rm2, writeFile } from "fs/promises";
+import { constants as constants2, realpathSync } from "fs";
+import { link, mkdir as mkdir3, open as open3, rm as rm3, writeFile } from "fs/promises";
 import { homedir as homedir2 } from "os";
 import { basename, delimiter, extname, isAbsolute, join as join4, parse as parse6, relative, resolve as resolve2, sep } from "path";
 
 // src/core/errors.ts
 class CoreError extends Error {
+  refusalCode;
+  constructor(message, refusalCode) {
+    super(message);
+    this.refusalCode = refusalCode;
+  }
 }
 
 class TooLargeError extends CoreError {
@@ -34479,7 +34920,7 @@ async function readAttachmentFiles(paths, roots, opts = {}) {
 async function readChecked(real, label, tally) {
   let fh;
   try {
-    fh = await open3(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    fh = await open3(real, constants2.O_RDONLY | (constants2.O_NOFOLLOW ?? 0) | (constants2.O_NONBLOCK ?? 0));
   } catch (e) {
     throw new CoreError(`${label}: can't be opened (${e.code ?? "error"})`);
   }
@@ -34520,11 +34961,11 @@ function checkAttachmentId(id) {
     throw new CoreError("id must be an attachment id");
   return id;
 }
-async function saveTarget(dir, roots, bus, env = process.env) {
+async function saveTarget(dir, roots, bus, env = process.env, cwd = process.cwd()) {
   if (dir !== undefined && typeof dir !== "string")
     throw new CoreError("dir must be a string");
   if (dir !== undefined)
-    return checkSaveDir(dir, roots);
+    return checkSaveDir(dir, roots, cwd);
   const target = join4(attachmentsDir(env), bus);
   await mkdir3(target, { recursive: true, mode: 448 });
   return target;
@@ -34603,13 +35044,13 @@ async function writeNew(dir, name, data) {
     }
     throw new CoreError(`can't save ${name} in ${dir}: ${MAX_NAME_TRIES} files by that name already exist`);
   } finally {
-    await rm2(tmp, { force: true });
+    await rm3(tmp, { force: true });
   }
 }
 async function isOwnCopy(path, data) {
   let fh;
   try {
-    fh = await open3(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fh = await open3(path, constants2.O_RDONLY | constants2.O_NOFOLLOW);
   } catch {
     return false;
   }
@@ -34627,6 +35068,11 @@ var ATTACHMENTS_PARAM = {
   type: "array",
   items: { type: "string" },
   description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`
+};
+var ATTACHMENT_IDS_PARAM = {
+  type: "array",
+  items: { type: "integer", exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
 };
 var ATTACHMENT_GET_TOOL = {
   name: "attachment_get",
@@ -34659,6 +35105,12 @@ function attachmentsDir(env = process.env) {
 }
 
 // src/shared/notifications.ts
+function fenceChannel(content) {
+  return content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;");
+}
+function viaLabel(via) {
+  return `subagent ${via}, harness-asserted`;
+}
 function addFiles(meta, list) {
   if (!list?.length)
     return;
@@ -34667,12 +35119,20 @@ function addFiles(meta, list) {
 }
 function dmNotification(msg, primary) {
   const meta = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (msg.via)
+    meta.via = msg.via;
   if (primary !== undefined && msg.recipient !== undefined && msg.recipient !== primary)
     meta.to = msg.recipient;
   if (msg.parent_id !== null)
     meta.parent_id = String(msg.parent_id);
   if (msg.kind)
     meta.kind = msg.kind;
+  if (msg.other_user)
+    meta.other_user = "true";
+  if (msg.ungranted)
+    meta.ungranted = "true";
+  if (msg.delegated)
+    meta.delegated = "true";
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }
@@ -34686,49 +35146,36 @@ function boardNotification(item) {
       reason: item.reason,
       created_at: String(p.created_at)
     };
+    if (p.via)
+      meta.via = p.via;
     if (p.parent_id !== null)
       meta.parent_id = String(p.parent_id);
+    if (p.other_user)
+      meta.other_user = "true";
+    if (p.ungranted)
+      meta.ungranted = "true";
     addFiles(meta, p.attachments);
     if (item.deferred)
       meta.deferred = "true";
+    if (item.claim)
+      meta.claim = item.claim;
     return { content: p.body, meta };
   }
   const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);
+  const from = item.latest.via ? `${item.latest.author} (${viaLabel(item.latest.via)})` : item.latest.author;
   return {
-    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${item.latest.author}: "${snippet}${item.latest.body.length > 160 ? "\u2026" : ""}" Call board_read if it's relevant.`,
-    meta: { board: item.board, kind: "digest", unread: String(item.unread) }
+    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${from}: "${snippet}${item.latest.body.length > 160 ? "\u2026" : ""}" Call board_read if it's relevant.`,
+    meta: { board: item.board, kind: "digest", unread: String(item.unread), ...item.latest.other_user ? { other_user: "true" } : {} }
   };
 }
 
-// src/shared/addressing.ts
-var MAX_IDENTITY_LENGTH = 32;
-var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
-var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
-var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
-var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
-var HUMAN_NAME = "human";
-var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
-
 // adapters/hosted-core/src/channel.ts
-var InboxEvent = discriminatedUnion("kind", [
-  object({ kind: literal("direct"), message: looseObject({ id: number2(), sender: string2(), body: string2() }) }),
-  object({ kind: literal("board"), item: discriminatedUnion("kind", [
-    looseObject({ kind: literal("push"), post: looseObject({ author: string2(), body: string2() }) }),
-    looseObject({ kind: literal("digest"), board: string2() })
-  ]) })
-]);
 function channelParams(item, identity) {
   const event = InboxEvent.parse(item.event);
-  const human = `${identity.user.email}/${HUMAN_NAME}`;
-  if (event.kind === "direct") {
-    const params = dmNotification(event.message, identity.identity_full);
-    if (event.message.sender === human)
-      params.meta.human = "true";
-    return params;
-  }
-  const params = boardNotification(event.item);
-  if (event.item.kind === "push" && event.item.post.author === human)
+  const params = event.kind === "direct" ? dmNotification(event.message, identity.identity_full) : boardNotification(event.item);
+  if (isOwnHuman(event, identity))
     params.meta.human = "true";
+  params.content = fenceChannel(params.content);
   return params;
 }
 
@@ -34743,12 +35190,14 @@ class DeliveryStopped extends Error {
 var key = "diagnostics:v1";
 var fields = ["state", "message", "sessionID", "time", "held", "ownership", "operation", "code", "failure"];
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
-var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register"];
+var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link", "recover"];
 var operations = new Set(OPERATIONS);
-var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
+var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration", "invalid_response", "server_unreachable", "server_busy", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
   if (error instanceof DeliveryStopped)
     return "retry_exhausted";
+  if (error instanceof ServerBusy)
+    return "server_busy";
   if (error instanceof ServerUnreachable)
     return "server_unreachable";
   if (error instanceof SubscriptionClosed)
@@ -34771,6 +35220,10 @@ function failureCode(error) {
 function failureMessage(error, resumeHint) {
   if (error instanceof DeliveryStopped)
     return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; ${resumeHint}`;
+  if (error instanceof OutcomeUnknown)
+    return error.message;
+  if (error instanceof ServerBusy)
+    return `Server at capacity; ${resumeHint}`;
   if (error instanceof ServerUnreachable)
     return `Server unreachable; ${resumeHint}`;
   if (error instanceof AccessExpired || error instanceof ServerOutdated || error instanceof DeliveryHeldElsewhere)
@@ -34805,11 +35258,18 @@ function data(value, allowed) {
   }
 }
 var clock = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= Date.now() + 60000;
-function failureDTO(value) {
+var codeShaped = (value) => typeof value === "string" && /^[a-z0-9_]{1,64}$/.test(value);
+function codeOf2(value, restored) {
+  if (typeof value === "string" && codes.has(value))
+    return value;
+  return restored && codeShaped(value) ? "operation_failed" : undefined;
+}
+function failureDTO(value, restored) {
   const d = data(value, ["operation", "code", "time"]);
-  if (!d || typeof d.operation !== "string" || !operations.has(d.operation) || typeof d.code !== "string" || !codes.has(d.code) || !clock(d.time))
+  const code = d && codeOf2(d.code, restored);
+  if (!d || typeof d.operation !== "string" || !operations.has(d.operation) || !code || !clock(d.time))
     return;
-  return { operation: d.operation, code: d.code, time: d.time };
+  return { operation: d.operation, code, time: d.time };
 }
 function project(value, restored = false) {
   const d = data(value, fields);
@@ -34821,15 +35281,16 @@ function project(value, restored = false) {
     return;
   if (d.ownership !== undefined && (typeof d.ownership !== "number" || !Number.isSafeInteger(d.ownership) || d.ownership <= 0))
     return;
-  if (d.code !== undefined && (typeof d.code !== "string" || !codes.has(d.code)))
+  const code = d.code === undefined ? undefined : codeOf2(d.code, restored);
+  if (d.code !== undefined && !code)
     return;
-  const failure = d.failure === undefined ? undefined : failureDTO(d.failure);
+  const failure = d.failure === undefined ? undefined : failureDTO(d.failure, restored);
   if (d.failure !== undefined && !failure)
     return;
   if (typeof d.message !== "string" || d.message.length > 16384)
     return;
-  const message = restored ? `Saved ${d.state} status${d.held?.length ? ` for ${d.held.join(", ")}` : ""}${d.code ? ` (${d.code})` : ""}; approval is unchanged` : d.message;
-  return { state: d.state, message, operation: d.operation, time: d.time, ...typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}, ...d.held !== undefined ? { held: d.held } : {}, ...typeof d.ownership === "number" ? { ownership: d.ownership } : {}, ...typeof d.code === "string" ? { code: d.code } : {}, ...failure ? { failure } : {} };
+  const message = restored ? `Saved ${d.state} status${d.held?.length ? ` for ${d.held.join(", ")}` : ""}${code ? ` (${code})` : ""}; approval is unchanged` : d.message;
+  return { state: d.state, message, operation: d.operation, time: d.time, ...typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}, ...d.held !== undefined ? { held: d.held } : {}, ...typeof d.ownership === "number" ? { ownership: d.ownership } : {}, ...code ? { code } : {}, ...failure ? { failure } : {} };
 }
 class Diagnostics {
   storage;
@@ -34872,7 +35333,7 @@ class Diagnostics {
     const d = data(input, fields);
     const previous = this.records.get(typeof d?.sessionID === "string" ? d.sessionID : "background");
     const time = Date.now();
-    const failure = d?.code ? failureDTO({ operation: d.operation, code: d.code, time }) : failureDTO(previous?.failure);
+    const failure = d?.code ? failureDTO({ operation: d.operation, code: d.code, time }, false) : failureDTO(previous?.failure, false);
     const record = project({ ...d, ...failure ? { failure } : {}, time }) ?? { state: "degraded", message: "Diagnostic record unavailable; approval is unchanged", operation: "delivery", time };
     this.records.delete(record.sessionID ?? "background");
     this.records.set(record.sessionID ?? "background", record);
@@ -35032,6 +35493,27 @@ var native_tools_default = [
     }
   },
   {
+    name: "board_archive",
+    description: "board_archive(board, archived?): retire a board you created once its work is done: it leaves board_list and takes no new top-level posts, while replies, reads by name and subscriptions go on. archived false reopens it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: {
+          type: "string",
+          description: 'Board name, with or without the "#": "e2e" or "#e2e".'
+        },
+        archived: {
+          type: "boolean",
+          description: "Default true; false reopens the board."
+        }
+      },
+      required: [
+        "board"
+      ],
+      additionalProperties: false
+    }
+  },
+  {
     name: "board_post",
     description: "board_post(board, body, parent_id?, attachment_ids?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
     inputSchema: {
@@ -35049,16 +35531,7 @@ var native_tools_default = [
           type: "number",
           description: "Optional. post_id to reply to."
         },
-        resend: {
-          type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes."
-        },
-        as: {
-          type: "string",
-          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
-        },
         attachment_ids: {
-          $schema: "https://json-schema.org/draft/2020-12/schema",
           type: "array",
           items: {
             type: "integer",
@@ -35066,6 +35539,14 @@ var native_tools_default = [
             maximum: 9007199254740991
           },
           description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+        },
+        resend: {
+          type: "boolean",
+          description: "true sends again even if an identical call landed in the last 10 minutes."
+        },
+        as: {
+          type: "string",
+          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
         }
       },
       required: [
@@ -35283,20 +35764,23 @@ var native_tools_default = [
   },
   {
     name: "dm_send",
-    description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
+    description: "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
     inputSchema: {
       type: "object",
       properties: {
         to: {
-          type: "string"
+          type: "string",
+          description: "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
         },
         body: {
-          type: "string"
+          type: "string",
+          description: "Message body. Plain text or markdown."
         },
         parent_id: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Optional. message_id this is replying to; sets the thread parent."
         },
         pending: {
           type: "boolean",
@@ -35324,13 +35808,15 @@ var native_tools_default = [
         "to",
         "body"
       ],
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
+    },
+    _meta: {
+      "anthropic/alwaysLoad": true
     }
   },
   {
     name: "delegate",
-    description: "delegate(persona, task, to?, context?, resend?): hand work to a launcher session \u2014 one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Delegation stays within your own user. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
+    description: "delegate(persona, task, to?, context?, resend?): hand work to a launcher session \u2014 one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Auto-pick stays within your own user; `to` may name a teammate's launcher under a delegating team. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
     inputSchema: {
       type: "object",
       properties: {
@@ -35344,7 +35830,7 @@ var native_tools_default = [
         },
         to: {
           type: "string",
-          description: "Optional. A specific launcher's handle (your user's). Default: any live launcher of yours."
+          description: "Optional. A specific launcher's handle: your user's, or a teammate's under a delegating team. Default: any live launcher of yours."
         },
         context: {
           type: "string",
@@ -35364,43 +35850,48 @@ var native_tools_default = [
   },
   {
     name: "dm_history",
-    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID.",
+    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session; delivered_at: when it was handed to the recipient's harness.",
     inputSchema: {
       type: "object",
       properties: {
         peer: {
-          type: "string"
+          type: "string",
+          description: "Optional. Only return messages between you and this peer identity."
         },
         limit: {
-          type: "number"
+          type: "number",
+          description: "Max messages to return (default 20, max 200)."
         },
         before_id: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Return messages with id strictly less than this; use for pagination."
         }
       },
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
     }
   },
   {
     name: "dm_thread",
-    description: "A whole direct-message thread you participate in.",
+    description: "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
     inputSchema: {
       type: "object",
       properties: {
         thread: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Any message_id in the thread."
         }
       },
       required: [
         "thread"
       ],
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
+    },
+    _meta: {
+      "anthropic/alwaysLoad": true
     }
   },
   {
@@ -35487,9 +35978,170 @@ function describeFetchError(e, ms) {
   return e instanceof Error && e.name === "TimeoutError" ? `no answer within ${Math.round(ms / 1000)}s` : e.message;
 }
 
+// adapters/hosted-core/src/attachments.ts
+class AttachmentRefused extends Error {
+  status;
+  code;
+  constructor(status, code, message) {
+    super(serverText(message));
+    this.status = status;
+    this.code = code;
+  }
+}
+
+class HostedAttachments {
+  options;
+  constructor(options) {
+    this.options = options;
+  }
+  async send(paths, sessionID, send, signal) {
+    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(signal), cwd: this.options.cwd });
+    return sendWithUploads(files, this.transport(sessionID, signal), send);
+  }
+  async get(args, sessionID, signal) {
+    const id = checkAttachmentId(args.id);
+    const target = await saveTarget(args.dir, this.options.roots, serverBusDir(this.options.resource.href), this.options.env, this.options.cwd);
+    return downloadAttachment(id, target, (await this.options.limits(signal)).file, this.transport(sessionID, signal));
+  }
+  transport(sessionID, signal) {
+    const base = `${this.options.resource.href.replace(/\/$/, "")}/attachments`;
+    return {
+      upload: async (file) => {
+        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data, signal);
+        const stored = object({ id: number2().int().positive() }).safeParse(await response.json().catch(() => {
+          return;
+        }));
+        if (!stored.success)
+          throw new Error("Invalid attachment upload response");
+        return stored.data.id;
+      },
+      release: async (id) => {
+        try {
+          const response = await this.http("DELETE", `${base}/${id}`, sessionID, HTTP_TIMEOUT_MS);
+          await response.body?.cancel();
+          return true;
+        } catch (error) {
+          if (error instanceof AttachmentRefused && error.status === 404)
+            return false;
+          throw error;
+        }
+      },
+      download: async (id, maxBytes) => {
+        const ms = transferTimeoutMs(maxBytes);
+        const response = await this.http("GET", `${base}/${id}`, sessionID, ms, undefined, signal);
+        const reader = response.body?.getReader();
+        if (!reader)
+          throw new Error(`attachment ${id}: empty download`);
+        const chunks = [];
+        let size = 0;
+        try {
+          for (;; ) {
+            const chunk = await reader.read();
+            if (chunk.done)
+              break;
+            size += chunk.value.length;
+            if (size > maxBytes)
+              throw new Error(`attachment ${id}: exceeds the ${formatSize(maxBytes)} limit per file`);
+            chunks.push(chunk.value);
+          }
+          const data = new Uint8Array(size);
+          let offset = 0;
+          for (const chunk of chunks) {
+            data.set(chunk, offset);
+            offset += chunk.length;
+          }
+          return { headers: response.headers, data };
+        } catch (error) {
+          throw this.fetchFailure(error, ms);
+        } finally {
+          await reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+      },
+      unreleased: this.options.unreleased
+    };
+  }
+  async http(method, url, sessionID, ms, body, call) {
+    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.options.signal, ...call ? [call] : []]);
+    for (let attempt = 0;; attempt++) {
+      const token = await this.options.auth.token();
+      if (!token)
+        throw new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
+      const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(sessionID) });
+      if (body) {
+        headers.set("Content-Type", "application/octet-stream");
+        headers.set("Content-Length", String(body.length));
+      }
+      let response;
+      try {
+        response = await fetch(url, { method, headers, body: body ? new Uint8Array(body) : undefined, redirect: "error", signal });
+      } catch (error) {
+        throw this.fetchFailure(error, ms);
+      }
+      if (response.ok)
+        return response;
+      if (response.status === 401 && attempt === 0 && this.options.auth.onUnauthorized) {
+        await response.body?.cancel();
+        await this.options.auth.onUnauthorized({ response, serverUrl: this.options.resource, fetchFn: fetch });
+        continue;
+      }
+      if (response.status === 401 || response.status === 403 && /insufficient_scope/.test(response.headers.get("www-authenticate") ?? "")) {
+        await response.body?.cancel();
+        throw new AccessExpired(this.options.harness, this.options.loginAction, response.status === 401 ? "expired" : "login_required");
+      }
+      const refusal = object({ code: string2(), message: string2() }).safeParse(await response.json().catch(() => {
+        return;
+      }));
+      if (refusal.success)
+        throw new AttachmentRefused(response.status, refusal.data.code, refusal.data.message);
+      if ([502, 503, 504].includes(response.status))
+        throw new ServerUnreachable(new Error(`HTTP ${response.status}`));
+      throw new Error(`grayboard server at ${this.options.resource.origin}: HTTP ${response.status}`);
+    }
+  }
+  fetchFailure(error, ms) {
+    if (!this.options.signal.aborted && unreachable(error))
+      return new ServerUnreachable(error);
+    return new Error(`grayboard server at ${this.options.resource.origin}: ${describeFetchError(error, ms)}`, { cause: error });
+  }
+}
+
+// adapters/hosted-core/src/results.ts
+function outputOf(result) {
+  if (result.structuredContent !== undefined)
+    return result.structuredContent;
+  const only = result.content.length === 1 ? result.content[0] : undefined;
+  if (only?.type !== "text")
+    return;
+  try {
+    return JSON.parse(only.text);
+  } catch {
+    return only.text;
+  }
+}
+function refusalOf2(result) {
+  const output = outputOf(result);
+  const code = typeof output === "object" && typeof output?.code === "string" ? output.code : undefined;
+  if (typeof output === "object" && typeof output?.message === "string")
+    return { code, why: output.message };
+  const text = typeof output === "string" ? output : result.content.find((c) => c.type === "text")?.text;
+  return { code, why: text && !isJson(text) ? text.replace(/^error: /, "") : "no reason given" };
+}
+function isJson(text) {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // src/shared/session_meta.ts
 var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
 var GRAYBOARD_ALIAS_LOST_META = "io.github.nolnoch.grayboard/alias_lost";
+function validSourceId(raw) {
+  return typeof raw === "string" && raw.length > 0 && raw.length <= 1024 && !/[\x00-\x1f\x7f]/.test(raw);
+}
 
 // adapters/hosted-core/src/proxy.ts
 var NativeToolSchema = strictObject({
@@ -35508,33 +36160,11 @@ function hostTools(native) {
 }
 function withPaths(tool) {
   const properties = Object.fromEntries(Object.entries(tool.inputSchema.properties ?? {}).map(([key, value]) => key === "attachment_ids" ? ["attachments", ATTACHMENTS_PARAM] : [key, value]));
-  const description = tool.description?.replace("attachment_ids?", "attachments?").replace(" Attachments are uploaded IDs, not paths.", " Attachments are local file paths.");
+  const description = tool.description?.replace("attachment_ids?", "attachments?");
   return { ...tool, ...description === undefined ? {} : { description }, inputSchema: { ...tool.inputSchema, properties } };
-}
-function outputOf(result) {
-  if (result.structuredContent !== undefined)
-    return result.structuredContent;
-  const only = result.content.length === 1 ? result.content[0] : undefined;
-  if (only?.type !== "text")
-    return;
-  try {
-    return JSON.parse(only.text);
-  } catch {
-    return only.text;
-  }
 }
 var text = (value) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 var failure2 = (message) => ({ ...text(`error: ${message}`), isError: true });
-
-class AttachmentRefused extends Error {
-  status;
-  code;
-  constructor(status, code, message) {
-    super(message);
-    this.status = status;
-    this.code = code;
-  }
-}
 
 class Refused extends Error {
   result;
@@ -35543,11 +36173,37 @@ class Refused extends Error {
     this.result = result;
   }
 }
+
+class CallAborted extends Error {
+  constructor(options) {
+    super("aborted", options);
+    this.name = "CallAborted";
+  }
+}
+function unlessAborted(work, signal) {
+  if (!signal)
+    return work;
+  if (signal.aborted) {
+    work.then(undefined, () => {});
+    return Promise.reject(new CallAborted);
+  }
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new CallAborted);
+    signal.addEventListener("abort", abort, { once: true });
+    work.then((value) => {
+      signal.removeEventListener("abort", abort);
+      resolve(value);
+    }, (error) => {
+      signal.removeEventListener("abort", abort);
+      reject(error);
+    });
+  });
+}
 function broken(error) {
   if (!(error instanceof ServerUnreachable))
     return false;
   for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-    if (e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout)
+    if (e instanceof ConnectProbeFailed || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout)
       return false;
   }
   return true;
@@ -35560,16 +36216,24 @@ class ToolProxy {
   instructionsBySession = new Map;
   inflight = new Set;
   closing = new AbortController;
-  roots;
-  resource;
+  attachments;
   constructor(options) {
     this.options = options;
     const resource = canonicalEndpoint(options.wire.url);
     if (!resource)
       throw new Error("Grayboard MCP URL must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     this.current = hostTools(snapshotTools());
-    this.roots = options.roots ?? attachRoots();
-    this.resource = resource;
+    this.attachments = new HostedAttachments({
+      resource,
+      auth: options.auth,
+      harness: options.harness,
+      loginAction: options.loginAction,
+      signal: this.closing.signal,
+      roots: options.roots ?? attachRoots(),
+      env: options.env,
+      limits: (signal) => this.limits(signal),
+      unreleased: (id, error) => options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error }))
+    });
   }
   tools() {
     return this.current;
@@ -35580,8 +36244,8 @@ class ToolProxy {
     await this.open().ready;
     return this.current;
   }
-  call(name, args, sessionID) {
-    return this.track(this.invoke(name, args, sessionID));
+  call(name, args, sessionID, signal) {
+    return this.track(this.invoke(name, args, sessionID, signal));
   }
   instructions(sessionID) {
     const cached = this.instructionsBySession.get(sessionID);
@@ -35620,7 +36284,9 @@ class ToolProxy {
     work.then(settled, settled);
     return work;
   }
-  async invoke(name, args, sessionID) {
+  async invoke(name, args, sessionID, signal) {
+    if (signal?.aborted)
+      throw new CallAborted;
     const signedOut = await this.signedOut();
     if (signedOut)
       return failure2(signedOut.message);
@@ -35634,12 +36300,18 @@ class ToolProxy {
     }
     let outcome = { status: "error" }, lost = false;
     try {
-      const result = await this.dispatch(name, args, sessionID);
+      if (signal?.aborted)
+        throw new CallAborted;
+      const result = await this.dispatch(name, args, sessionID, signal);
       lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError)
         outcome = { status: "completed", output: outputOf(result) };
+      if (signal?.aborted)
+        throw new CallAborted;
       return result;
     } catch (error) {
+      if (signal?.aborted)
+        throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
       const expired = this.loginNeeded(error);
       if (expired)
         return failure2(expired.message);
@@ -35668,22 +36340,24 @@ class ToolProxy {
       await wire.close();
     }
   }
-  async dispatch(name, args, sessionID) {
+  async dispatch(name, args, sessionID, signal) {
     if (name === ATTACHMENT_GET_TOOL.name)
-      return this.attachmentGet(args, sessionID);
+      return this.attachmentGet(args, sessionID, signal);
     if ((name === "dm_send" || name === "board_post") && args.attachments !== undefined)
-      return this.withUploads(name, args, sessionID);
-    return this.forward(name, args, sessionID);
+      return this.withUploads(name, args, sessionID, signal);
+    return this.forward(name, args, sessionID, signal);
   }
-  async forward(name, args, sessionID) {
+  async forward(name, args, sessionID, signal) {
+    if (signal?.aborted)
+      throw new CallAborted;
     const native = this.native ?? this.open();
     native.users++;
     try {
-      const wire = await native.ready;
+      const wire = await unlessAborted(native.ready, signal);
       try {
-        return await wire.callTool(name, args, sessionID);
+        return await wire.callTool(name, args, sessionID, signal);
       } catch (error) {
-        if (broken(error))
+        if (!signal?.aborted && broken(error))
           this.drop(native);
         throw error;
       }
@@ -35692,20 +36366,21 @@ class ToolProxy {
         this.shut(native);
     }
   }
-  async limits() {
-    const wire = await (this.native ?? this.open()).ready;
+  async limits(signal) {
+    if (signal?.aborted)
+      throw new CallAborted;
+    const wire = await unlessAborted((this.native ?? this.open()).ready, signal);
     return publishedLimits(wire.client.getServerCapabilities()?.experimental) ?? DEFAULT_ATTACHMENT_LIMITS;
   }
-  async withUploads(name, args, sessionID) {
+  async withUploads(name, args, sessionID, signal) {
     const { attachments, ...rest } = args;
     try {
-      const files = await readAttachmentFiles(attachments, this.roots, { limits: await this.limits() });
-      return await sendWithUploads(files, this.transport(sessionID), async (ids) => {
-        const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID);
+      return await this.attachments.send(attachments, sessionID, async (ids) => {
+        const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID, signal);
         if (result.isError)
           throw new Refused(result);
         return result;
-      });
+      }, signal);
     } catch (error) {
       if (error instanceof Refused)
         return error.result;
@@ -35716,92 +36391,14 @@ class ToolProxy {
       return failure2(error.message);
     }
   }
-  async attachmentGet(args, sessionID) {
+  async attachmentGet(args, sessionID, signal) {
     try {
-      const id = checkAttachmentId(args.id);
-      const target = await saveTarget(args.dir, this.roots, serverBusDir(this.resource.href), this.options.env);
-      return text(await downloadAttachment(id, target, (await this.limits()).file, this.transport(sessionID)));
+      return text(await this.attachments.get(args, sessionID, signal));
     } catch (error) {
       if (this.transportFailure(error))
         throw error;
       return failure2(error.message);
     }
-  }
-  transport(sessionID) {
-    const base = `${this.resource.href.replace(/\/$/, "")}/attachments`;
-    return {
-      upload: async (file) => {
-        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data);
-        const stored = object({ id: number2().int().positive() }).safeParse(await response.json().catch(() => {
-          return;
-        }));
-        if (!stored.success)
-          throw new Error("Invalid attachment upload response");
-        return stored.data.id;
-      },
-      release: async (id) => {
-        try {
-          const response = await this.http("DELETE", `${base}/${id}`, sessionID, HTTP_TIMEOUT_MS);
-          await response.body?.cancel();
-          return true;
-        } catch (error) {
-          if (error instanceof AttachmentRefused && error.status === 404)
-            return false;
-          throw error;
-        }
-      },
-      download: async (id, maxBytes) => {
-        const ms = transferTimeoutMs(maxBytes);
-        const response = await this.http("GET", `${base}/${id}`, sessionID, ms);
-        try {
-          return { headers: response.headers, data: new Uint8Array(await response.arrayBuffer()) };
-        } catch (error) {
-          throw this.fetchFailure(error, ms);
-        }
-      },
-      unreleased: (id, error) => this.options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error }))
-    };
-  }
-  async http(method, url, sessionID, ms, body) {
-    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.closing.signal]);
-    for (let attempt = 0;; attempt++) {
-      const token = await this.options.auth.token();
-      if (!token)
-        throw new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(sessionID) });
-      if (body)
-        headers.set("Content-Type", "application/octet-stream");
-      let response;
-      try {
-        response = await fetch(url, { method, headers, body: body ? new Uint8Array(body) : undefined, redirect: "error", signal });
-      } catch (error) {
-        throw this.fetchFailure(error, ms);
-      }
-      if (response.ok)
-        return response;
-      if (response.status === 401 && attempt === 0 && this.options.auth.onUnauthorized) {
-        await response.body?.cancel();
-        await this.options.auth.onUnauthorized({ response, serverUrl: this.resource, fetchFn: fetch });
-        continue;
-      }
-      if (response.status === 401 || response.status === 403 && /insufficient_scope/.test(response.headers.get("www-authenticate") ?? "")) {
-        await response.body?.cancel();
-        throw new AccessExpired(this.options.harness, this.options.loginAction, response.status === 401 ? "expired" : "login_required");
-      }
-      const refusal = object({ code: string2(), message: string2() }).safeParse(await response.json().catch(() => {
-        return;
-      }));
-      if (refusal.success)
-        throw new AttachmentRefused(response.status, refusal.data.code, refusal.data.message);
-      if ([502, 503, 504].includes(response.status))
-        throw new ServerUnreachable(new Error(`HTTP ${response.status}`));
-      throw new Error(`grayboard server at ${this.resource.origin}: HTTP ${response.status}`);
-    }
-  }
-  fetchFailure(error, ms) {
-    if (!this.closing.signal.aborted && unreachable(error))
-      return new ServerUnreachable(error);
-    return new Error(`grayboard server at ${this.resource.origin}: ${describeFetchError(error, ms)}`, { cause: error });
   }
   open() {
     const native = { ready: this.listed(new NativeWire(this.options.wire, this.options.auth, this.closing.signal), () => this.native === native), users: 0, retired: false, closed: false };
@@ -35856,23 +36453,28 @@ class ToolProxy {
     }
   }
   loginNeeded(error) {
-    for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-      if (e instanceof AccessExpired)
-        return e;
-      if (e instanceof InsufficientScope)
-        return new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401)
-        return new AccessExpired(this.options.harness, this.options.loginAction, "expired");
-    }
-    return;
+    const cause = signOutCause(error);
+    return cause === undefined || cause instanceof AccessExpired ? cause : new AccessExpired(this.options.harness, this.options.loginAction, cause);
   }
   transportFailure(error) {
     return error instanceof ServerUnreachable || !!this.loginNeeded(error);
   }
 }
+function signOutCause(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    if (e instanceof AccessExpired)
+      return e;
+    if (e instanceof InsufficientScope)
+      return "login_required";
+    if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401)
+      return "expired";
+  }
+  return;
+}
 
 // adapters/hosted-core/src/client.ts
 var message = (error) => error?.message ?? String(error);
+var endFailedText = (id, error) => `couldn't end session ${id} on the server: ${message(error)}`;
 var DETAIL_MAX = 300;
 function failureText(error, hint) {
   const text = failureMessage(error, hint);
@@ -35901,10 +36503,22 @@ class HostedClient {
     return this.options.login;
   }
   wireOptions(mode) {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source } };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {}, ...this.options.facts ? { facts: this.facts } : {}, ...this.options.suggested ? { suggested: this.options.suggested } : {} };
   }
-  temporary = async (sessionID, run) => {
-    const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(1e4), sessionID);
+  factsFailed = new Set;
+  facts = (sessionID) => {
+    try {
+      return this.options.facts(sessionID);
+    } catch (error) {
+      if (!this.factsFailed.has(sessionID)) {
+        this.factsFailed.add(sessionID);
+        this.options.log(`couldn't read session ${sessionID}'s model and effort; the server gets none: ${message(error)}`, "warning");
+      }
+      return;
+    }
+  };
+  temporary = async (sessionID, run, ending) => {
+    const wire = new Wire({ ...this.wireOptions("poll"), ...ending ? { ending: true } : {} }, this.auth, AbortSignal.timeout(1e4), sessionID);
     try {
       await wire.connect();
       return await run(wire);
@@ -35914,9 +36528,9 @@ class HostedClient {
   };
   async endSession(id) {
     try {
-      await this.temporary(id, (wire) => wire.call("session_end"));
+      await this.temporary(id, (wire) => wire.call("session_end"), true);
     } catch (error) {
-      this.options.log(`couldn't end session ${id} on the server: ${message(error)}`, "warning");
+      this.options.log(endFailedText(id, error), "warning");
     }
   }
   proxy(mode, o) {
@@ -35954,10 +36568,12 @@ class HostedClient {
         this.options.log(`couldn't reach the server: ${message(error)}`, "warning");
     }
   }
-  async call(proxy, tool, args, sessionID) {
+  async call(proxy, tool, args, sessionID, signal) {
     try {
-      return await proxy.call(tool, args, sessionID);
+      return await proxy.call(tool, args, sessionID, signal);
     } catch (error) {
+      if (signal?.aborted)
+        throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
       return failure2(failureText(error, this.options.retryHint));
     }
   }
@@ -36003,15 +36619,116 @@ class HostedClient {
   }
 }
 
+// adapters/hosted-core/src/offer.ts
+var LINK_MS = 20000;
+var SCRUBBED = "the sign-in prompt failed";
+function present(state, url) {
+  const flow = state.flow;
+  if (flow) {
+    flow.url = url;
+    flow.show(url);
+  }
+  return flow;
+}
+function notify(state, message) {
+  const flow = state.flow;
+  if (flow)
+    flow.elsewhere = message;
+  return flow;
+}
+function start(state, login, o) {
+  if (state.flow)
+    return state.flow;
+  const abort = new AbortController;
+  let show;
+  const link = new Promise((resolve) => {
+    show = resolve;
+  });
+  const flow = { origin: o.origin, abort, link, show, browser: o.browser, done: Promise.resolve() };
+  state.flow = flow;
+  const finish = (outcome) => {
+    flow.outcome = outcome;
+    show(undefined);
+    if (state.flow === flow)
+      state.flow = undefined;
+  };
+  const settle = (outcome) => {
+    state.last = { origin: flow.origin, outcome, at: Date.now() };
+    finish(outcome);
+    return o.ended(flow, outcome);
+  };
+  flow.done = login.login(abort.signal, o.ifSignedOut).then((result) => {
+    if (result === "signed in")
+      return settle("signed in");
+    finish("current");
+    return o.current?.(flow);
+  }, (error) => {
+    if (abort.signal.aborted)
+      return settle("cancelled");
+    flow.failed = scrub(flow, message(error));
+    return settle(`failed: ${flow.failed}`);
+  });
+  flow.done.catch(() => {});
+  return flow;
+}
+async function offer(state, login, o) {
+  try {
+    await login.token();
+    return;
+  } catch (error) {
+    if (!accessExpiry(error) || !o.interactive)
+      return;
+  }
+  const flow = o.begin();
+  if (!flow)
+    return;
+  let timer;
+  const late = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), o.linkMs ?? LINK_MS);
+    timer.unref?.();
+  });
+  const url = await Promise.race([flow.link, late]).finally(() => clearTimeout(timer));
+  return note(flow, url, o.notes);
+}
+function note(flow, url, notes) {
+  if (flow.outcome === "signed in" || flow.outcome === "current" || flow.outcome === "cancelled")
+    return;
+  if (flow.outcome)
+    return `sign-in failed: ${flow.failed}`;
+  if (url)
+    return notes.started;
+  if (flow.elsewhere)
+    return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
+  return notes.starting;
+}
+function scrub(flow, why) {
+  if (!flow.url)
+    return why;
+  let secret;
+  try {
+    secret = new URL(flow.url).searchParams.get("state") || flow.url;
+  } catch {
+    secret = flow.url;
+  }
+  return why.includes(secret) ? SCRUBBED : why;
+}
+
 // adapters/hosted-core/src/controller.ts
 import { createHash as createHash6 } from "crypto";
 
 // adapters/hosted-core/src/sessions.ts
 class AncestryError extends Error {
 }
+var ENDED_LIMIT = 4096;
+
 class SessionRoutes {
+  limit;
   paths = new Map;
   ended = new Set;
+  orphans = new Set;
+  constructor(limit = ENDED_LIMIT) {
+    this.limit = limit;
+  }
   remember(path) {
     if (this.ended.has(path.sessionID) || this.ended.has(path.root))
       throw new AncestryError("Grayboard session ended during ancestry lookup");
@@ -36019,13 +36736,35 @@ class SessionRoutes {
     if (previous && previous.root !== path.root)
       throw new AncestryError("Grayboard session ancestry changed");
     this.paths.set(path.sessionID, { ...path, via: [...path.via] });
+    this.orphans.delete(path.sessionID);
+  }
+  get(sessionID) {
+    const path = this.paths.get(sessionID);
+    return path ? { ...path, via: [...path.via] } : undefined;
+  }
+  isEnded(sessionID) {
+    return this.ended.has(sessionID);
   }
   end(sessionID) {
     if (this.ended.has(sessionID))
       return;
     this.ended.add(sessionID);
+    if (this.ended.size > this.limit)
+      this.ended.delete(this.ended.values().next().value);
     const path = this.paths.get(sessionID);
     this.paths.delete(sessionID);
+    this.orphans.delete(sessionID);
+    if (path && path.root === sessionID) {
+      for (const [id, p] of this.paths)
+        if (p.root === sessionID)
+          this.orphans.add(id);
+      for (const id of this.orphans) {
+        if (this.orphans.size <= this.limit)
+          break;
+        this.orphans.delete(id);
+        this.paths.delete(id);
+      }
+    }
     return path ? { ...path, via: [...path.via] } : undefined;
   }
 }
@@ -36035,14 +36774,33 @@ async function register2(temporary, path) {
   await temporary(path.root, (wire) => wire.call("session_register", { child: path.child, ...path.via.length ? { via: path.via } : {} }));
 }
 async function end(temporary, path) {
-  await temporary(path.child, (wire) => wire.call("session_end"));
+  await temporary(path.child, (wire) => wire.call("session_end"), true);
 }
 
 // adapters/hosted-core/src/controller.ts
 var DRIFTED = "Grayboard credential changed";
+function graceLeft(grace) {
+  const lease = grace.lease?.();
+  return Math.min(ROTATION_GRACE_MS - grace.spent, lease ? lease.expiresAt - LEASE_MARGIN_MS - Date.now() : Infinity);
+}
+function renewed(lease, answer) {
+  const at = typeof answer === "object" && answer !== null ? answer.expiresAt : undefined;
+  if (typeof at === "number" && Number.isFinite(at))
+    lease.expiresAt = at;
+}
 var ADMITTED_LIMIT = 100;
+var LOOKUPS = 1024;
 var ROTATION_POLL_MS = 500;
 var ROTATION_GRACE_MS = 1e4;
+var LEASE_MARGIN_MS = 2000;
+var RENEW_MS = 1e4;
+var SWAP_CLOSE_MS = 1000;
+var SWAP_CAPACITY_RETRIES = 5;
+var RECOVERY_FIRST_MS = 1000;
+var RECOVERY_MAX_MS = 30000;
+var RECOVERY_BUDGET_MS = 60 * 60000;
+var outageText = (error) => error instanceof ServerBusy ? "Server at capacity" : "Server unreachable";
+var refreshingAtRecover = (harness) => `Token refresh in progress in another ${harness} process while recovering; retrying, approval retained`;
 function sleep5(ms, signal) {
   return new Promise((resolve) => {
     if (signal.aborted)
@@ -36062,6 +36820,15 @@ function causeOf(error, type) {
       return e;
   return;
 }
+function transient(error) {
+  if (unreachable(error) || causeOf(error, RefreshInProgress))
+    return true;
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e.name === "TimeoutError" || e instanceof SubscriberError && e.code === "unbound")
+      return true;
+  }
+  return false;
+}
 function fingerprint(e) {
   const c = e.configuration;
   return createHash6("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.held ?? []])).digest("hex");
@@ -36071,12 +36838,29 @@ var display = (address) => shortOf(address.slice(0, address.lastIndexOf("/")), a
 class Controller {
   port;
   routes = new SessionRoutes;
+  lookups = new Map;
+  registered = new Map;
   Transport;
   roots = new Map;
   watches = new Map;
   stopped = false;
   ending = new Set;
   closing = new AbortController;
+  ends = new Map;
+  endOf(sessionID) {
+    let end = this.ends.get(sessionID);
+    if (!end)
+      this.ends.set(sessionID, end = new AbortController);
+    return end;
+  }
+  startStop(sessionID) {
+    return AbortSignal.any([this.closing.signal, this.endOf(sessionID).signal]);
+  }
+  stoppedBy(sessionID, error) {
+    if (!this.stopped && !this.ending.has(sessionID))
+      return false;
+    return abortOf(error, this.closing.signal) || abortOf(error, this.endOf(sessionID).signal) || error instanceof Refusal && error.code === "paused" || this.stopped && accessExpiry(error)?.reason === "expired";
+  }
   drifted = false;
   controls = Promise.resolve();
   state;
@@ -36084,11 +36868,16 @@ class Controller {
   place;
   wait;
   configured;
+  context;
+  skipped = new Set;
+  retries = new Set;
   constructor(port, options = {}) {
     this.port = port;
     this.Transport = options.Transport ?? Wire;
     this.wait = options.wait ?? sleep5;
     this.configured = options.configured;
+    if (options.context === false)
+      this.context = false;
     this.place = port.place();
     const idle = port.approval ? "Approve an active root; approval does not bind a name" : "No active root";
     this.state = { state: "unenrolled", message: idle, roots: [] };
@@ -36122,6 +36911,7 @@ class Controller {
     this.drifted = true;
     for (const r of this.roots.values()) {
       r.paused = true;
+      r.awaiting = undefined;
       r.epoch++;
       r.abort?.abort();
       this.set(r, "paused", message);
@@ -36131,13 +36921,99 @@ class Controller {
   credentialChanged() {
     this.drift(`${DRIFTED}; ${this.hint}`);
   }
+  signInChanged(error, live) {
+    if (!live || causeOf(error, Refusal)?.code !== "binding")
+      return false;
+    if (!this.drifted)
+      this.credentialChanged();
+    return true;
+  }
   async path(sessionID) {
-    const path = await this.port.ancestry(sessionID);
+    return this.route(await this.port.ancestry(sessionID));
+  }
+  route(path) {
     this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
     for (const [index, id] of path.via.entries())
       this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
     this.routes.remember(path);
     return path;
+  }
+  async childRoot(sessionID) {
+    let path = this.routes.get(sessionID) ?? this.lookups.get(sessionID);
+    if (!path) {
+      if (this.routes.isEnded(sessionID))
+        return;
+      try {
+        path = await this.port.ancestry(sessionID);
+      } catch {
+        return;
+      }
+      if (this.routes.isEnded(sessionID) || this.routes.isEnded(path.root))
+        return;
+      this.lookups.set(sessionID, path);
+      if (this.lookups.size > LOOKUPS)
+        this.lookups.delete(this.lookups.keys().next().value);
+    }
+    const r = this.roots.get(path.root);
+    return path.root !== sessionID && r && !r.paused ? path : undefined;
+  }
+  async enlist(path, fetch2 = false) {
+    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0, epoch = r?.epoch;
+    const e = r?.e ?? await this.port.credential.capture(path.root);
+    const call = (sessionID, c, ending) => this.temporary(e, c, sessionID, undefined, ending);
+    const shared = () => {
+      const known = r && this.registered.get(path.sessionID);
+      return known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
+    };
+    const start = () => {
+      const started = register2(call, { root: path.root, via: path.via, child: path.sessionID });
+      if (r) {
+        const entry = { r, epoch: r.epoch, ...r.lease ? { ownership: r.lease.ownership } : {}, settled: false, done: started };
+        this.registered.set(path.sessionID, entry);
+        if (this.registered.size > LOOKUPS)
+          this.registered.delete(this.registered.keys().next().value);
+        started.then(() => {
+          entry.settled = true;
+        }, () => {});
+      }
+      started.catch(() => {
+        if (this.registered.get(path.sessionID)?.done === started)
+          this.registered.delete(path.sessionID);
+      });
+      return started;
+    };
+    const unmoved = () => !this.stopped && !this.routes.isEnded(path.sessionID) && !this.routes.isEnded(path.root) && this.roots.get(path.root) === r && !!r && !r.paused && r.epoch === epoch;
+    let done = shared(), joined = !!done;
+    for (;; ) {
+      done ??= start();
+      const error = await done.then(() => {
+        return;
+      }, (error) => ({ error }));
+      if (!error)
+        break;
+      if (joined && transient(error.error) && unmoved()) {
+        joined = false;
+        done = shared();
+        continue;
+      }
+      if (!fetch2)
+        this.failure("child_register", error.error, r);
+      throw error.error;
+    }
+    if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
+      await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
+      throw new AncestryError("Grayboard session ended during registration");
+    }
+    if (fetch2 && live && (this.roots.get(path.root) !== r || (r.released ?? 0) !== releases)) {
+      if (this.registered.get(path.sessionID)?.done === done)
+        this.registered.delete(path.sessionID);
+      if (this.roots.get(path.root) === r && r.paused) {
+        await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
+        await end(call, { child: path.root }).catch((error) => this.failure("session_end", error, r));
+      }
+      throw new AncestryError("Grayboard root paused during registration");
+    }
+    this.routes.remember(path);
   }
   async activeRoot(sessionID) {
     const path = await this.path(sessionID);
@@ -36160,8 +37036,20 @@ class Controller {
     if (!this.port.approval)
       return;
     await this.activeRoot(r.e.sessionID);
-    await this.port.approval.save(r.e, r.approval, enabled, [...new Set([...this.roots.keys(), r.e.sessionID])]);
+    await this.port.approval.save(r.e, r.approval, enabled);
     await this.port.storage.set(`paused:${r.e.sessionID}`, !enabled);
+    this.skipped.delete(r.e.sessionID);
+    await this.prune();
+  }
+  async prune() {
+    for (const id of this.skipped) {
+      this.skipped.delete(id);
+      try {
+        await this.activeRoot(id);
+        continue;
+      } catch {}
+      await this.port.approval.drop(id).catch((error) => this.failure("restore", error));
+    }
   }
   async guard(r, epoch, signal) {
     const e = r.e, key = this.key(e);
@@ -36172,8 +37060,7 @@ class Controller {
     };
     check();
     await this.port.credential.check(e).catch((error) => {
-      if (error instanceof Refusal && error.code === "binding" && current())
-        this.credentialChanged();
+      this.signInChanged(error, current());
       throw error;
     });
     await this.activeRoot(e.sessionID);
@@ -36184,24 +37071,28 @@ class Controller {
     check();
   }
   wireOptions(e) {
-    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {} };
+    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {}, ...this.port.facts ? { facts: (id) => this.port.facts(id) } : {}, ...this.port.suggested ? { suggested: (id) => this.port.suggested(id) } : {} };
   }
-  async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
+  async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry, ending = false) {
     let current;
-    const wire = new this.Transport(this.wireOptions(e), {
+    const wire = new this.Transport({ ...this.wireOptions(e), ...ending ? { ending: true } : {} }, {
       token: async () => current = await this.port.credential.token(e),
       onUnauthorized: async () => this.port.credential.unauthorized(e, current ?? "")
     }, signal, sessionID, beforeRetry);
     await wire.connect();
     return wire;
   }
-  async temporary(e, call, sessionID = e.sessionID) {
-    const wire = await this.wire(e, sessionID);
+  async temporary(e, call, sessionID = e.sessionID, stop, ending = false) {
+    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(1e4), stop]), undefined, ending);
     try {
       return await call(wire);
     } finally {
       await wire.close().catch((error) => this.failure("wire_close", error));
     }
+  }
+  signedOut(error) {
+    const e = this.expired(error);
+    return e instanceof AccessExpired && e.reason !== "expired";
   }
   expired(error) {
     return accessExpiry(error) ?? (causeOf(error, InsufficientScope) ? new AccessExpired(this.port.harness, this.port.loginAction, "login_required") : causeOf(error, RefreshInProgress) ?? error);
@@ -36243,6 +37134,7 @@ class Controller {
       await this.save(r, true);
       await this.watch(e);
       this.set(r, "approved", "Root approved; bind a name to receive deliveries");
+      let bound = false;
       try {
         if (names.length) {
           const epoch = r.epoch, signal = new AbortController().signal;
@@ -36251,13 +37143,19 @@ class Controller {
             for (const name of names)
               await w.call("bind", { name, create, where: this.port.place() });
             await this.guard(r, epoch, signal);
-          });
+          }, sessionID, this.startStop(sessionID));
+          bound = true;
         }
-        await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
+        await this.rotated({ spent: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
+        const stopped = this.stoppedBy(sessionID, error);
+        if (!stopped)
+          this.signInChanged(error, this.roots.get(sessionID) === r);
+        if (!stopped && this.signedOut(error))
+          r.paused = true;
         if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
+          this.set(r, r.paused ? "paused" : "approved", `${what}; ${stopped ? "stopped before delivery opened" : failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", stopped ? undefined : failureCode(this.expired(error)));
       }
       await this.diagnostics.flush();
       return { ...r.status, roots: this.status().roots };
@@ -36280,10 +37178,18 @@ class Controller {
       await this.watch(r.e);
       this.set(r, "approved", held?.length ? `Resuming ${this.names(r.e)}` : "Root approved; bind a name to receive deliveries");
       try {
-        await this.rotated({ ms: 0 }, () => this.prepare(r, true));
-      } catch (error) {
-        if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error)));
+        await this.rotated({ spent: 0 }, () => this.prepare(r, true));
+      } catch (caught) {
+        const error = this.expired(caught);
+        if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
+          this.retrying(r, error);
+          this.retryRestore(r);
+        } else if (!this.stoppedBy(sessionID, error) && this.signInChanged(error, this.roots.get(sessionID) === r)) {} else if (!this.drifted) {
+          const stopped = this.stoppedBy(sessionID, error);
+          if (!stopped && this.signedOut(error))
+            r.paused = true;
+          this.set(r, r.paused ? "paused" : "approved", stopped ? "Stopped before delivery opened" : failureMessage(error, this.hint), "enroll", stopped ? undefined : failureCode(error));
+        }
       }
       await this.diagnostics.flush();
       return { ...r.status, roots: this.status().roots };
@@ -36299,11 +37205,22 @@ class Controller {
     return saved.approval;
   }
   async carried(sessionID) {
+    const back = await this.takeBack(sessionID);
+    return back === "unreadable" ? undefined : back;
+  }
+  async takeBack(sessionID) {
+    let approval;
     try {
-      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
-      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined);
+      approval = await this.approvalFor(sessionID);
     } catch {
       return;
+    }
+    const live = this.roots.get(sessionID);
+    const held = live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined;
+    try {
+      return await this.remembered(sessionID, approval) ?? held;
+    } catch {
+      return held ?? "unreadable";
     }
   }
   names(e) {
@@ -36329,7 +37246,7 @@ class Controller {
       try {
         await wire.call("bind", { name: address, create: false, where: this.port.place() });
       } catch (error) {
-        if (!(tolerant && error instanceof SubscriberError && ["alias_held", "identity_unknown", "forbidden"].includes(error.code)))
+        if (!(tolerant && error instanceof SubscriberError && ["alias_held", "identity_unknown", "forbidden", "not_found"].includes(error.code)))
           throw error;
         refused.push(error);
       }
@@ -36372,7 +37289,7 @@ class Controller {
         if (waitForStart)
           await started;
       }
-    });
+    }, r.e.sessionID, this.startStop(r.e.sessionID));
   }
   start(r) {
     if (r.task || r.paused || this.stopped || this.ending.has(r.e.sessionID))
@@ -36384,26 +37301,33 @@ class Controller {
     });
     r.task = this.run(r, e, epoch, abort.signal, ready).catch((caught) => {
       const error = this.expired(caught);
-      if (!abort.signal.aborted) {
-        r.paused = true;
+      if (abort.signal.aborted)
+        return;
+      if (this.signInChanged(error, this.roots.get(r.e.sessionID) === r && r.epoch === epoch))
+        return;
+      r.paused = true;
+      if (error instanceof AccessExpired && error.reason === "expired")
+        this.awaitRefresh(r, "subscriber");
+      else
         this.set(r, "paused", failureMessage(error, this.hint), "subscriber", failureCode(error));
-      }
     }).finally(ready);
     return started;
   }
   async run(r, e, epoch, signal, ready) {
-    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, rotation = 0, outage = false, inItem = false, reidentified = false;
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false, reidentified = false;
+    let grace = { spent: 0, lease: () => r.lease };
     let pendingItem;
     const attempts = new Map;
     while (!signal.aborted && failures < 8) {
       let wire;
+      const began = performance.now(), attempt = grace;
       try {
         await this.guard(r, epoch, signal);
         wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
         await this.guard(r, epoch, signal);
         const current = bindingOf(await wire.call("whoami"));
         outage = false;
-        rotation = 0;
+        grace = { spent: 0, lease: () => r.lease };
         await this.guard(r, epoch, signal);
         if (await this.dropLost(r, current)) {
           e = { ...e, held: r.e.held };
@@ -36422,7 +37346,7 @@ class Controller {
           throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
         let lease;
         try {
-          lease = leaseOf(await wire.call("delivery_open"), e);
+          lease = leaseOf(await wire.call("delivery_open", this.context === false && await wire.takes("delivery_open", "context") ? { context: false } : {}), e);
         } catch (error) {
           if (!(error instanceof Refusal) || reidentified)
             throw error;
@@ -36433,24 +37357,58 @@ class Controller {
         await this.guard(r, epoch, signal);
         r.lease = lease;
         wire.capability = lease.capability;
+        r.recovery = undefined;
         this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
-        let dirty = true, wake, closed = false;
+        let dirty = true, wake, closed = false, tokenChanged = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => {
           dirty = true;
           wake?.();
         });
-        const subscription = await wire.listen();
-        subscription.closed.then(() => {
-          closed = true;
-          wake?.();
-        }, () => {
-          closed = true;
+        let subscription;
+        const listen = async () => {
+          const opened = subscription = await wire.listen();
+          const ended = () => {
+            if (subscription === opened) {
+              closed = true;
+              wake?.();
+            }
+          };
+          opened.closed.then(ended, ended);
+        };
+        const rotation = this.port.credential.rotated?.(e, () => {
+          tokenChanged = true;
           wake?.();
         });
-        let renewal = Date.now() + 1e4;
+        let renewal = Date.now() + RENEW_MS;
         try {
+          await listen();
           while (!signal.aborted) {
+            if (tokenChanged) {
+              tokenChanged = false;
+              const old = subscription;
+              subscription = undefined;
+              closed = false;
+              if (old) {
+                const bound = new AbortController;
+                const closing = old.close().catch((error) => this.failure("subscription_close", error, r));
+                await Promise.race([closing, this.wait(SWAP_CLOSE_MS, AbortSignal.any([signal, bound.signal]))]);
+                bound.abort();
+              }
+              await this.guard(r, epoch, signal);
+              for (let retry = 0;; retry++) {
+                try {
+                  await listen();
+                  break;
+                } catch (error) {
+                  if (signal.aborted || retry >= SWAP_CAPACITY_RETRIES || !listenCapacity(error))
+                    throw error;
+                }
+                await this.wait(Math.min(4000, 250 * 2 ** retry), signal);
+                await this.guard(r, epoch, signal);
+              }
+              dirty = true;
+            }
             if (dirty) {
               dirty = false;
               const items = itemsOf(await wire.read("grayboard://inbox"));
@@ -36465,23 +37423,19 @@ class Controller {
                   throw new Refusal("identity", "Issued batch does not match the immutable lease");
                 await this.guard(r, epoch, signal);
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
-                await wire.call("delivery_renew");
+                renewed(lease, await wire.call("delivery_renew"));
                 await this.guard(r, epoch, signal);
-                if (r.admitted.has(key)) {
-                  inItem = false;
+                if (r.admitted.has(key))
                   return;
-                }
                 await this.port.admit(e, item, stableID(e, item, lease.identity), lease.identity, signal);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT)
                   r.admitted.delete(r.admitted.values().next().value);
                 await this.guard(r, epoch, signal);
-                await wire.call("delivery_renew");
-                await this.guard(r, epoch, signal);
-                inItem = false;
               }, async (ids) => {
                 await this.guard(r, epoch, signal);
                 await wire.call("delivery_receipt", { ids });
+                inItem = false;
                 for (const id of ids) {
                   attempts.delete(id);
                   r.admitted.delete(`${lease.ownership}:${lease.bind_gen}:${id}`);
@@ -36491,6 +37445,11 @@ class Controller {
                 recoveries = 0;
                 unreachable = 0;
                 pendingItem = undefined;
+                try {
+                  this.port.receipted?.(e, ids);
+                } catch (error) {
+                  this.failure("receipt_hook", error, r);
+                }
               });
               if (items.length === 100)
                 dirty = true;
@@ -36499,13 +37458,13 @@ class Controller {
               throw new SubscriptionClosed;
             if (Date.now() >= renewal) {
               await this.guard(r, epoch, signal);
-              await wire.call("delivery_renew");
-              renewal = Date.now() + 1e4;
+              renewed(lease, await wire.call("delivery_renew"));
+              renewal = Date.now() + RENEW_MS;
               dirty = true;
               recoveries = 0;
               unreachable = 0;
             }
-            if (dirty)
+            if (dirty || tokenChanged)
               continue;
             const timer = new AbortController;
             await Promise.race([sleep5(1000, AbortSignal.any([signal, timer.signal])), new Promise((resolve) => {
@@ -36515,7 +37474,8 @@ class Controller {
             timer.abort();
           }
         } finally {
-          await subscription.close().catch((error) => this.failure("subscription_close", error, r));
+          rotation?.dispose();
+          await subscription?.close().catch((error) => this.failure("subscription_close", error, r));
         }
       } catch (caught) {
         if (signal.aborted)
@@ -36524,13 +37484,15 @@ class Controller {
         if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || error instanceof RefreshInProgress || error instanceof AccessExpired && error.reason === "expired" && outage) {
           if (error instanceof ServerUnreachable)
             outage = true;
-          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained" : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
+          this.set(r, "retrying", error instanceof ServerUnreachable ? `${outageText(error)}; retrying, approval retained` : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
           ready();
-          await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
+          if (error instanceof AccessExpired && this.port.credential.refresh)
+            await this.port.credential.refresh(e).catch((failure) => this.failure("reopen", failure));
+          await this.wait(Math.min(8000, Math.max(250 * 2 ** ++unreachable, error instanceof ServerBusy ? error.retryAfterMs : 0)), signal);
           continue;
         }
-        if (error instanceof AccessExpired && error.reason === "expired" && rotation < ROTATION_GRACE_MS) {
-          rotation += ROTATION_POLL_MS;
+        if (error instanceof AccessExpired && error.reason === "expired" && graceLeft(grace) > 0) {
+          grace.spent += (grace === attempt ? performance.now() - began : 0) + ROTATION_POLL_MS;
           this.set(r, "retrying", `Access expired; waiting for ${this.port.harness} to refresh it, approval retained`, "reopen", failureCode(error));
           ready();
           await this.wait(ROTATION_POLL_MS, signal);
@@ -36581,18 +37543,20 @@ class Controller {
   async release(r) {
     const lease = r.lease;
     r.lease = undefined;
+    r.released = (r.released ?? 0) + 1;
     await this.temporary(r.e, async (wire) => {
       if (lease) {
         wire.capability = lease.capability;
         await wire.call("delivery_release").catch((error) => this.failure("delivery_release", error, r));
       }
       await wire.call("session_end");
-    });
+    }, r.e.sessionID, undefined, true);
   }
   async pause(message = `Ownership ended; ${this.hint}`) {
     return this.serial(async () => {
       for (const r of this.roots.values()) {
         r.paused = true;
+        r.awaiting = undefined;
         await this.stop(r);
         await this.release(r).catch((error) => this.failure("session_end", error, r));
         await this.save(r, false).catch((error) => this.failure("pause_save", error, r));
@@ -36603,11 +37567,13 @@ class Controller {
   }
   shutdown(sessionID, mode, o = {}) {
     this.ending.add(sessionID);
+    this.endOf(sessionID).abort();
     this.roots.get(sessionID)?.abort?.abort();
     return this.serial(async () => {
       const r = this.roots.get(sessionID);
       if (r) {
         r.paused = true;
+        r.awaiting = undefined;
         await this.stop(r);
       }
       const carried = o.carry ? await this.carried(sessionID) : undefined;
@@ -36628,19 +37594,20 @@ class Controller {
   async endUnowned(sessionID) {
     try {
       const e = await this.port.credential.capture(sessionID);
-      await this.temporary(e, (wire) => wire.call("session_end"));
+      await this.temporary(e, (wire) => wire.call("session_end"), e.sessionID, undefined, true);
     } catch (error) {
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
   }
-  async rotated(spent, call) {
+  async rotated(grace, call) {
     for (;; ) {
+      const began = performance.now();
       try {
         return await call();
       } catch (error) {
-        if (this.stopped || accessExpiry(error)?.reason !== "expired" || spent.ms >= ROTATION_GRACE_MS)
+        if (this.stopped || accessExpiry(error)?.reason !== "expired" || graceLeft(grace) <= 0)
           throw error;
-        spent.ms += ROTATION_POLL_MS;
+        grace.spent += performance.now() - began + ROTATION_POLL_MS;
         await this.wait(ROTATION_POLL_MS, this.closing.signal);
         if (this.stopped)
           throw error;
@@ -36654,7 +37621,7 @@ class Controller {
     });
     if (!this.port.approval)
       return;
-    const spent = { ms: 0 };
+    const grace = { spent: 0 };
     for (const saved of await this.port.approval.saved()) {
       const id = saved.sessionID;
       if (this.stopped)
@@ -36663,6 +37630,7 @@ class Controller {
         try {
           await this.activeRoot(id);
         } catch {
+          this.skipped.add(id);
           continue;
         }
         if (!saved.approval)
@@ -36681,46 +37649,186 @@ class Controller {
         if (expired)
           this.set(r, "retrying", `Access expired before the restart; waiting for ${this.port.harness} to refresh it, approval retained`, "restore", "native_access_expired");
         try {
-          await this.rotated(spent, () => this.port.credential.check(e));
+          await this.rotated(grace, () => this.port.credential.check(e));
         } catch (error) {
           if (!expired)
             throw error;
           if (this.roots.get(id) !== r || r.paused || r.task)
             continue;
           const cause = this.expired(error);
+          if (!(cause instanceof Refusal))
+            throw error;
           r.paused = true;
-          this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
+          if (cause instanceof AccessExpired && cause.reason === "expired")
+            this.awaitRefresh(r, "restore");
+          else
+            this.set(r, "paused", failureMessage(cause, this.hint), "restore", failureCode(cause));
           continue;
         }
         if (this.roots.get(id) !== r)
           continue;
         await this.watch(e);
-        await this.rotated(spent, () => this.prepare(r, true, true));
-      } catch {
-        const r = this.roots.get(id);
-        if (r) {
+        await this.rotated(grace, () => this.prepare(r, true, true));
+      } catch (caught) {
+        const r = this.roots.get(id), error = this.expired(caught);
+        if (r && this.watches.has(id) && (this.drifted && r.paused || this.signInChanged(error, this.restorable(r, r.epoch))))
+          continue;
+        if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
+          this.retrying(r, error);
+          this.retryRestore(r);
+        } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
+          r.paused = true;
+          this.awaitRefresh(r, "restore");
+        } else if (r) {
           r.paused = true;
           await this.stop(r);
-          this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+          this.set(r, "degraded", `Saved root unavailable (${failureCode(error)}); approval retained, ${this.hint}`, "restore", failureCode(error));
         } else
           this.diagnostics.record({ state: "paused", sessionID: id, message: `Saved enrollment invalid; ${this.hint}`, operation: "restore" });
       }
     }
   }
+  retrying(r, error) {
+    const text = error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying` : `${outageText(error)} at ${this.port.approval ? "restore" : "resume"}; retrying`;
+    this.set(r, "retrying", this.port.approval ? `${text}, approval retained` : text, "restore", failureCode(error));
+  }
+  restorable(r, epoch) {
+    return !this.stopped && !this.drifted && !this.ending.has(r.e.sessionID) && !r.paused && !r.task && r.epoch === epoch && this.roots.get(r.e.sessionID) === r;
+  }
+  retryRestore(r) {
+    const epoch = r.epoch;
+    const retry = (async () => {
+      let expired = false;
+      for (let attempt = 1;; attempt++) {
+        if (expired && this.restorable(r, epoch) && this.port.credential.refresh)
+          await this.port.credential.refresh(r.e).catch((error) => this.failure("restore", error));
+        expired = false;
+        await this.wait(Math.min(8000, 250 * 2 ** attempt), this.closing.signal);
+        const done = await this.serial(async () => {
+          if (!this.restorable(r, epoch))
+            return true;
+          try {
+            if (!this.watches.has(r.e.sessionID))
+              await this.watch(r.e);
+            await this.prepare(r, true, true);
+            return true;
+          } catch (caught) {
+            const error = this.expired(caught);
+            if (!this.restorable(r, epoch) || this.signInChanged(error, true))
+              return true;
+            if (error instanceof ServerUnreachable || error instanceof RefreshInProgress) {
+              this.retrying(r, error);
+              return false;
+            }
+            if (error instanceof AccessExpired && error.reason === "expired") {
+              this.set(r, "retrying", `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "restore", failureCode(error));
+              expired = true;
+              return false;
+            }
+            if (!this.port.approval) {
+              if (this.signedOut(error))
+                r.paused = true;
+              this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+            } else {
+              r.paused = true;
+              await this.stop(r);
+              this.set(r, "degraded", `Saved root unavailable (${failureCode(error)}); approval retained, ${this.hint}`, "restore", failureCode(error));
+            }
+            return true;
+          }
+        });
+        if (done)
+          return;
+      }
+    })().catch((error) => this.failure("restore", error, r)).finally(() => this.retries.delete(retry));
+    this.retries.add(retry);
+  }
+  awaitingSet(r, operation) {
+    this.set(r, "paused", `Access expired; delivery resumes once ${this.port.harness} refreshes it, approval retained (or ${this.port.loginAction})`, operation, "native_access_expired");
+  }
+  awaitRefresh(r, operation) {
+    const mark = r.awaiting = {}, id = r.e.sessionID;
+    const awaiting = () => this.awaitingSet(r, operation);
+    awaiting();
+    const live = () => r.awaiting === mark && !this.stopped && !this.drifted && !this.ending.has(id) && this.roots.get(id) === r;
+    const recovery = (async () => {
+      const progress = r.recovery ??= { attempt: 0, spent: 0 };
+      while (live()) {
+        if (progress.spent >= RECOVERY_BUDGET_MS) {
+          r.awaiting = undefined;
+          this.set(r, "paused", `Access still expired after an hour; ${this.hint}`, "recover", "native_access_expired");
+          return;
+        }
+        if (this.port.credential.refresh)
+          await this.port.credential.refresh(r.e).catch((error) => this.failure("recover", error));
+        const ms = Math.min(RECOVERY_MAX_MS, RECOVERY_FIRST_MS * 2 ** progress.attempt++);
+        await this.wait(ms, this.closing.signal);
+        progress.spent += ms;
+        const done = await this.serial(async () => {
+          if (!live())
+            return true;
+          if (r.binding)
+            return false;
+          try {
+            await this.port.credential.check(r.e);
+            await this.port.credential.token(r.e);
+          } catch (caught) {
+            const error = this.expired(caught);
+            if (!live())
+              return true;
+            if (error instanceof AccessExpired && error.reason === "expired" || error instanceof RefreshInProgress)
+              return false;
+            if (this.signInChanged(error, true))
+              return true;
+            r.awaiting = undefined;
+            this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
+            return true;
+          }
+          r.awaiting = undefined;
+          await this.stop(r);
+          r.lease = undefined;
+          r.paused = false;
+          this.set(r, "retrying", "Access refreshed; recovering ownership, approval retained", "recover");
+          try {
+            if (!this.watches.has(id))
+              await this.watch(r.e);
+            await this.prepare(r, true);
+          } catch (caught) {
+            const error = this.expired(caught);
+            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r || this.signInChanged(error, true))
+              return true;
+            if (error instanceof AccessExpired && error.reason === "expired") {
+              r.paused = true;
+              r.awaiting = mark;
+              awaiting();
+              return false;
+            }
+            if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
+              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : `${outageText(error)} while recovering; retrying, approval retained`, "recover", failureCode(error));
+              this.retryRestore(r);
+              return true;
+            }
+            if (this.signedOut(error))
+              r.paused = true;
+            this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));
+          }
+          return true;
+        });
+        if (done)
+          return;
+      }
+    })().catch((error) => this.failure("recover", error, r)).finally(() => this.retries.delete(recovery));
+    this.retries.add(recovery);
+  }
   async beforeCall(event) {
-    const path = await this.path(event.sessionID), r = this.roots.get(path.root);
-    if (path.root !== event.sessionID) {
-      const e = r?.e ?? await this.port.credential.capture(path.root);
-      await register2((sessionID, call) => this.temporary(e, call, sessionID), { root: path.root, via: path.via, child: event.sessionID }).catch((error) => {
-        this.failure("child_register", error, r);
-        throw error;
-      });
-      this.routes.remember(path);
-    }
+    const path = await this.path(event.sessionID);
+    if (path.root !== event.sessionID)
+      await this.enlist(path);
     if ((event.tool === "bind" || event.tool === "unbind") && path.root === event.sessionID)
       await this.serial(async () => {
         const current = this.roots.get(path.root);
         if (current) {
+          current.binding = (current.binding ?? 0) + 1;
           this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind");
           await this.stop(current);
         } else
@@ -36728,17 +37836,36 @@ class Controller {
       });
   }
   async afterCall(event) {
+    if (!this.roots.has(event.sessionID) && event.result.status === "completed" && event.result.output?.unbound === true)
+      this.registered.delete(event.sessionID);
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
-      if (!r || r.paused || this.drifted || this.stopped)
+      const own = event.tool === "bind" || event.tool === "unbind";
+      if (r && own && r.binding)
+        r.binding--;
+      if (!r || this.drifted || this.stopped)
+        return;
+      let resumed = false;
+      if (r.paused && r.awaiting && (event.tool === "bind" || event.tool === "unbind")) {
+        if (event.result.status !== "completed") {
+          this.awaitingSet(r, "after");
+          return;
+        }
+        r.awaiting = undefined;
+        r.paused = false;
+        resumed = true;
+      }
+      if (r.paused)
         return;
       try {
+        if (resumed && !this.watches.has(r.e.sessionID))
+          await this.watch(r.e);
         if (event.tool !== "bind" && event.tool !== "unbind") {
           const output = event.result.status === "completed" ? event.result.output : undefined;
           if (output?.unbound === true && r.e.held?.length) {
             await this.stop(r);
             r.lease = undefined;
-            await this.rotated({ ms: 0 }, () => this.prepare(r, true));
+            await this.rotated({ spent: 0 }, () => this.prepare(r, true));
           }
           return;
         }
@@ -36753,17 +37880,21 @@ class Controller {
             await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: [] });
           }
         }
-        await this.rotated({ ms: 0 }, () => this.prepare(r, false));
+        await this.rotated({ spent: 0 }, () => this.prepare(r, false));
       } catch (error) {
-        if (!this.drifted)
-          this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
+        if (this.drifted)
+          return;
+        if (this.signedOut(error))
+          r.paused = true;
+        this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
       }
     });
   }
   async configuredBind(sessionID) {
     if (this.stopped || !this.configured)
       return;
-    const path = await this.path(sessionID);
+    const known = this.lookups.get(sessionID);
+    const path = known ? this.route(known) : await this.path(sessionID);
     if (path.root !== sessionID)
       return;
     try {
@@ -36777,12 +37908,15 @@ class Controller {
   async ended(sessionID) {
     if (this.stopped)
       return;
+    this.lookups.delete(sessionID);
+    this.registered.delete(sessionID);
     const path = this.routes.end(sessionID);
     if (!path)
       return;
     const r = this.roots.get(path.root);
     if (sessionID === path.root && r) {
       r.paused = true;
+      r.awaiting = undefined;
       r.epoch++;
       r.abort?.abort();
       await this.serial(async () => {
@@ -36793,7 +37927,7 @@ class Controller {
       });
     } else {
       const e = r?.e ?? await this.port.credential.capture(path.root);
-      await end((id, call) => this.temporary(e, call, id), { child: sessionID }).catch((error) => this.failure("child_end", error, r));
+      await end((id, call, ending) => this.temporary(e, call, id, undefined, ending), { child: sessionID }).catch((error) => this.failure("child_end", error, r));
     }
   }
   backgroundFailure(operation) {
@@ -36805,6 +37939,8 @@ class Controller {
     for (const r of this.roots.values())
       r.abort?.abort();
     await this.controls;
+    while (this.retries.size)
+      await Promise.all(this.retries);
     for (const r of this.roots.values())
       await this.stop(r);
     for (const watch of this.watches.values())
@@ -36821,6 +37957,7 @@ class NotStarted extends Error {
   }
 }
 var SLOTS = ["held", "start", "sink", "first", "last"];
+var REFUSED = new Set(["alias_held", "refused", "bad_request", "forbidden", "not_found"]);
 
 class RootDelivery {
   client;
@@ -36839,6 +37976,7 @@ class RootDelivery {
   signedOut;
   begun;
   carrying;
+  configuring;
   starting;
   restarting;
   used = false;
@@ -36846,17 +37984,20 @@ class RootDelivery {
   lastBinding;
   lastRecord;
   storeUnreadable = false;
+  hooked;
+  children = new Set;
   constructor(client, o) {
     this.client = client;
     this.o = o;
     this.carrying = o.carried;
+    this.configuring = o.configured;
   }
   log(text, level) {
     if (!this.done)
       this.client.options.log(text, level);
   }
   path() {
-    return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.options.clientId, this.o.sessionID);
+    return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.login.stateKey, this.o.sessionID);
   }
   async epoch() {
     try {
@@ -36875,10 +38016,11 @@ class RootDelivery {
     this.watcher = this.client.watch();
     this.subscription = this.client.onChange((signedIn) => {
       if (signedIn)
-        this.restartIfChanged();
+        this.o.push ? this.restartIfChanged() : this.bindConfigured();
     });
     if (!this.o.push) {
       this.toolsOnly();
+      this.bindConfigured();
       return;
     }
     await this.take();
@@ -36936,6 +38078,51 @@ class RootDelivery {
     if (!this.closed)
       this.o.onTools(tools);
   }
+  bindingConfigured;
+  bindConfigured() {
+    if (!this.configuring || !this.proxy || this.closed)
+      return Promise.resolve();
+    return this.bindingConfigured ??= this.tryConfigured(this.configuring, this.proxy).finally(() => {
+      this.bindingConfigured = undefined;
+    });
+  }
+  async tryConfigured(name, proxy) {
+    try {
+      try {
+        await this.client.login.token();
+      } catch (error) {
+        if (accessExpiry(error))
+          return;
+        throw error;
+      }
+      if (this.closed)
+        return;
+      this.used = true;
+      const result = await this.client.call(proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
+      if (this.closed)
+        return;
+      if (!result.isError) {
+        this.configuring = undefined;
+        return;
+      }
+      const { code, why } = refusalOf2(result);
+      if (code && REFUSED.has(code))
+        this.configuring = undefined;
+      this.configuredMissed(name, code ? `${code}: ${why}` : why, !this.configuring);
+    } catch (error) {
+      if (!this.closed)
+        this.configuredMissed(name, message(error), false);
+    }
+  }
+  configuredSaid;
+  configuredMissed(name, why, final) {
+    const text = `BUS_IDENTITY asked for "${name}", but this session couldn't bind it (${why}); it ${final ? "started unbound" : "is unbound until a later try binds it"}`;
+    if (text === this.configuredSaid)
+      return;
+    this.configuredSaid = text;
+    this.notices.set("start", text);
+    this.log(text, "warning");
+  }
   async own(taken) {
     if (this.closed) {
       taken.release();
@@ -36948,13 +38135,13 @@ class RootDelivery {
       this.begun = await this.epoch();
       if (this.closed)
         return;
-      const controller = this.controller = new Controller(this.port(), { sink: this.sink });
+      const controller = this.controller = new Controller(this.port(), { sink: this.sink, ...this.o.context === false ? { context: false } : {} });
       await controller.restore();
       if (this.closed)
         return;
       const proxy = this.client.proxy("push", { hooks: controller, onTools: (tools) => this.listed(tools), onAfterFailure: () => controller.backgroundFailure("after") });
       const old = this.proxy;
-      this.proxy = proxy;
+      this.proxy = this.hooked = proxy;
       if (old)
         this.client.retire(old);
       await this.client.connect(proxy);
@@ -36974,12 +38161,17 @@ class RootDelivery {
       sessionKey: wire.sessionKey,
       client: wire.client,
       delivery: wire.delivery,
-      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
+      ...wire.launcher ? { launcher: true } : {},
+      ...wire.facts ? { facts: wire.facts } : {},
+      ...wire.suggested ? { suggested: wire.suggested } : {},
+      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, this.client.login.stateKey, id)),
       place: this.o.place,
       ancestry: async (sessionID) => {
-        if (sessionID !== id)
-          throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
-        return { sessionID, root: id, via: [] };
+        if (sessionID === id)
+          return { sessionID, root: id, via: [] };
+        if (this.children.has(sessionID))
+          return { sessionID, root: id, via: [] };
+        throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
       },
       credential: this.client.login.credential(),
       approval: null,
@@ -36987,7 +38179,8 @@ class RootDelivery {
         if (signal.aborted)
           throw new Refusal("paused", `the ${c.harness} session closed`);
         await this.o.admit(item, stableID, identity, signal);
-      }
+      },
+      ...this.o.receipted ? { receipted: (_e, ids) => this.o.receipted(ids) } : {}
     };
   }
   restart() {
@@ -37002,20 +38195,33 @@ class RootDelivery {
     const id = this.o.sessionID, carried = this.carrying;
     try {
       this.begun = await this.epoch();
-      const expected = carried ?? await controller.carried(id);
-      const status = carried ? await controller.enroll(id, carried, false) : await controller.resume(id);
+      const back = carried ? undefined : await controller.takeBack(id);
+      const remembered = back === "unreadable" ? undefined : back;
+      if (carried || remembered)
+        this.configuring = undefined;
+      const configured = back === "unreadable" ? undefined : this.configuring;
+      const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
+      const status = carried ? await controller.enroll(id, carried, false) : configured ? await controller.enroll(id, [configured], true) : await controller.resume(id);
       if (this.closed)
         return;
       this.signedOut = undefined;
       this.proxy?.forget(id);
       const root = status.roots.find((r) => r.sessionID === id);
       const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
+      const landed = (carried || configured) && root?.operation === "prepare" && root.code !== undefined ? expected : undefined;
       if (carried && bound?.length && this.carrying === carried)
         this.carrying = undefined;
-      const missing = (expected ?? []).filter((address) => !bound?.includes(address));
-      if (missing.length && root?.state !== "paused") {
+      const holds = (address) => !![...bound ?? [], ...landed ?? []].some((b) => b === address || b.endsWith(`/${address}`));
+      if (configured && (holds(configured) || REFUSED.has(root?.code ?? "")))
+        this.configuring = undefined;
+      const missing = (expected ?? []).filter((address) => !holds(address));
+      if (landed && root?.state !== "paused") {
+        const text = `this session is bound as ${landed.join(", ")}, but delivery couldn't start (${root?.message ?? status.message})`;
+        this.notices.set("start", text);
+        this.log(text, "warning");
+      } else if (missing.length && root?.state !== "paused") {
         const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
-        const text = carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
+        const text = configured ? `BUS_IDENTITY asked for "${configured}", but this session couldn't bind it (${root?.message ?? status.message}); ${now}` : carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
         this.notices.set("start", text);
         this.log(text, "warning");
       }
@@ -37089,9 +38295,13 @@ ${record.message}`;
     this.notices.set("sink", text);
     this.log(text, "warning");
   };
-  async call(tool, args, before) {
+  async call(tool, args, before, o = {}) {
+    if (o.signal?.aborted)
+      throw new CallAborted;
     if (!this.proxy)
       return failure2(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
+    if (o.child !== undefined)
+      return this.childCall(o.child, tool, args, before, o.passed, o.signal);
     const refused = () => this.held && (tool === "bind" || tool === "unbind") ? failure2(`${this.held}; bind and unbind work from the process that holds delivery`) : undefined;
     const early = refused();
     if (early)
@@ -37100,11 +38310,40 @@ ${record.message}`;
     const late = refused();
     if (late)
       return late;
+    if (!this.o.push)
+      await this.bindConfigured();
     this.used = true;
-    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
+    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID, o.signal);
     const shown = [...SLOTS.map((slot) => this.notices.get(slot)), after].filter((n) => !!n);
     this.notices.clear();
     return shown.length ? { ...result, content: [...shown.map((n) => ({ type: "text", text: `grayboard: ${n}` })), ...result.content] } : result;
+  }
+  async childCall(child, tool, args, before, passed, signal) {
+    if (this.closed)
+      return failure2(`this ${this.client.options.harness} session is closing`);
+    const after = before ? await before() : undefined;
+    const proxy = this.proxy;
+    this.children.add(child);
+    passed?.();
+    this.used = true;
+    if (proxy !== this.hooked) {
+      try {
+        await register2(this.client.temporary, { root: this.o.sessionID, via: [], child });
+      } catch (error) {
+        return failure2(`couldn't register this subagent's grayboard session ${child} under its root, so the call didn't run: ${message(error)}; ${this.client.options.retryHint}`);
+      }
+    }
+    const result = await this.client.call(proxy, tool, args, child, signal);
+    return after ? { ...result, content: [{ type: "text", text: `grayboard: ${after}` }, ...result.content] } : result;
+  }
+  async endChild(child, called = false) {
+    if (!this.children.delete(child) && !called)
+      return;
+    try {
+      await end(this.client.temporary, { child });
+    } catch (error) {
+      this.log(`couldn't end subagent session ${child} on the server: ${message(error)}`, "warning");
+    }
   }
   tools() {
     return this.proxy?.tools() ?? hostTools(snapshotTools());
@@ -37162,42 +38401,635 @@ ${record.message}`;
   }
 }
 
+// adapters/hosted-core/src/static.ts
+import { createHash as createHash7 } from "crypto";
+import { readdirSync as readdirSync2, readFileSync as readFileSync4 } from "fs";
+import { join as join5 } from "path";
+var STATIC_AUTH = "GRAYBOARD_AUTH";
+var STATIC_ISSUER = "GRAYBOARD_ISSUER";
+var RUN_TOKEN = "GRAYBOARD_RUN_TOKEN";
+var STATIC_PRINCIPAL = "GRAYBOARD_PRINCIPAL";
+var NAMES = [STATIC_AUTH, STATIC_ISSUER, RUN_TOKEN, STATIC_PRINCIPAL];
+var NEW_RUN = "the launcher must start a new run with a fresh run token";
+var SERVICE_CLIENT = "service-credential";
+var TOKEN = /^[\x21-\x7e]{16,512}$/;
+var PRINCIPAL = /^[^\s/]{1,128}$/;
+function launchEnv() {
+  let raw;
+  try {
+    raw = readFileSync4("/proc/self/environ", "utf8");
+  } catch {
+    return;
+  }
+  const env = {};
+  for (const entry of raw.split("\x00")) {
+    const at = entry.indexOf("=");
+    if (at > 0)
+      env[entry.slice(0, at)] = entry.slice(at + 1);
+  }
+  return env;
+}
+function* keys(value) {
+  if (Array.isArray(value)) {
+    for (const v of value)
+      yield* keys(v);
+    return;
+  }
+  if (value === null || typeof value !== "object")
+    return;
+  for (const [k, v] of Object.entries(value)) {
+    yield k;
+    yield* keys(v);
+  }
+}
+function repositorySets(env, cwd, settingsDirs, launch) {
+  if (launch) {
+    const changed = NAMES.find((name) => (env[name] ?? undefined) !== launch[name]);
+    if (changed)
+      return `${changed} was set after the harness started (a dotenv file?); the launcher sets it`;
+  }
+  const dotenv = new RegExp(`^\\s*(export\\s+)?(${NAMES.join("|")})\\s*[=:]`, "m");
+  let files = [];
+  try {
+    files = readdirSync2(cwd).filter((name) => /^\.env(\..+)?$/.test(name));
+  } catch {}
+  for (const file of files) {
+    let text;
+    try {
+      text = readFileSync4(join5(cwd, file), "utf8");
+    } catch {
+      return `${file} in the working directory is unreadable`;
+    }
+    if (dotenv.test(text))
+      return `${file} in the working directory sets its variables; the launcher sets them`;
+  }
+  for (const dir of new Set(settingsDirs))
+    for (const file of ["settings.json", "settings.local.json"]) {
+      let text;
+      try {
+        text = readFileSync4(join5(dir, ".claude", file), "utf8");
+      } catch (error) {
+        if (error.code === "ENOENT")
+          continue;
+        return `the project's .claude/${file} is unreadable`;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return `the project's .claude/${file} isn't JSON grayboard can check`;
+      }
+      for (const k of keys(parsed))
+        if (NAMES.includes(k))
+          return `the project's .claude/${file} sets its variables; the launcher sets them`;
+    }
+  return;
+}
+function staticMode(env, cwd, settingsDirs = [], launch = env === process.env ? launchEnv() : undefined) {
+  const auth = env[STATIC_AUTH];
+  if ((auth === undefined || auth === "") && !env[RUN_TOKEN])
+    return;
+  const repository = repositorySets(env, cwd, settingsDirs, launch);
+  if (repository)
+    return { refused: `Static mode refused: ${repository}` };
+  if (auth === undefined || auth === "")
+    return { refused: `${RUN_TOKEN} is set without ${STATIC_AUTH}=static` };
+  if (auth !== "static")
+    return { refused: `${STATIC_AUTH} must be "static" or unset` };
+  const issuer = env[STATIC_ISSUER];
+  if (!issuer)
+    return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
+  if (!issuerEndpoint(issuer))
+    return { refused: `${STATIC_ISSUER} must be an HTTPS URL (or HTTP loopback) without credentials, query or fragment, written as the server lists its issuer` };
+  const token = env[RUN_TOKEN];
+  if (!token)
+    return { refused: `Static mode needs the launcher's run token (${RUN_TOKEN})` };
+  if (!TOKEN.test(token))
+    return { refused: `${RUN_TOKEN} isn't a run token` };
+  const principal = env[STATIC_PRINCIPAL];
+  if (principal === undefined || principal === "")
+    return { issuer, token };
+  if (!PRINCIPAL.test(principal))
+    return { refused: `${STATIC_PRINCIPAL} must be a service name` };
+  return { issuer, token, principal };
+}
+var ended = new Set;
+
+class StaticLogin {
+  resource;
+  stateKey;
+  static;
+  #config;
+  #token;
+  #fingerprint;
+  #verified;
+  #refusal;
+  constructor({ mode, ...config }) {
+    this.#config = config;
+    const resource = canonicalEndpoint(config.resource);
+    if (!resource)
+      throw new Error("Grayboard resource must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
+    this.resource = resource.href;
+    this.stateKey = `${SERVICE_CLIENT}:${config.clientId}`;
+    if ("refused" in mode) {
+      this.static = { refused: mode.refused };
+      this.#refusal = new Refusal("identity", mode.refused);
+    } else {
+      this.static = { issuer: mode.issuer, ...mode.principal ? { principal: mode.principal } : {} };
+      this.#token = mode.token;
+      this.#fingerprint = createHash7("sha256").update(mode.token).digest("hex");
+    }
+  }
+  expired() {
+    return new AccessExpired(this.#config.harness, NEW_RUN, "login_required");
+  }
+  get ended() {
+    return this.#fingerprint !== undefined && ended.has(this.#fingerprint);
+  }
+  async token() {
+    if (this.#refusal)
+      throw this.#refusal;
+    if (this.ended)
+      throw this.expired();
+    this.#verified ??= this.verify().catch((error) => {
+      if (error instanceof Refusal && !(error instanceof AccessExpired))
+        this.#refusal = error;
+      this.#verified = undefined;
+      throw error;
+    });
+    await this.#verified;
+    if (this.ended)
+      throw this.expired();
+    return this.#token;
+  }
+  async unauthorized(_token) {
+    if (this.#fingerprint)
+      ended.add(this.#fingerprint);
+    throw this.#refusal ?? this.expired();
+  }
+  async verify() {
+    const { issuer, principal } = this.static;
+    const pin = issuerEndpoint(issuer);
+    if (pin.origin !== new URL(this.resource).origin)
+      throw new Refusal("identity", `Static mode refused: the pinned issuer ${issuer} isn't on ${new URL(this.resource).origin}, where this harness's server is set up`);
+    let servers;
+    try {
+      servers = (await resourceMetadata(this.resource, 1e4)).authorization_servers;
+    } catch (error) {
+      if (error instanceof ServerUnreachable)
+        throw error;
+      throw new Refusal("identity", `Static mode refused: ${this.resource}'s protected-resource metadata couldn't be checked against the pinned issuer (${error.message?.slice(0, 200) ?? "invalid"})`);
+    }
+    if (!servers.includes(issuer))
+      throw new Refusal("identity", `Static mode refused: ${this.resource} doesn't name the pinned issuer ${issuer}`);
+    const who = await this.whoami();
+    if (who.kind !== "service")
+      throw new Refusal("identity", "Static mode refused: the run token isn't a service's; static mode runs only as a service");
+    if (principal !== undefined && who.principal !== principal)
+      throw new Refusal("identity", `Static mode refused: the run token is service ${who.principal ?? "unknown"}'s, not ${principal}'s (${STATIC_PRINCIPAL})`);
+  }
+  async whoami() {
+    const token = this.#token;
+    const wire = new NativeWire({ url: this.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.#config.clientId, version: this.#config.version } }, {
+      token: async () => token,
+      onUnauthorized: async () => this.unauthorized(token)
+    }, AbortSignal.timeout(1e4));
+    try {
+      await wire.connect();
+      const result = await wire.client.callTool({ name: "whoami", arguments: {} }, wire.options());
+      const content = result.content;
+      const value = result.structuredContent ?? (!result.isError && content?.length === 1 && content[0]?.type === "text" ? JSON.parse(content[0].text ?? "null") : undefined);
+      if (result.isError) {
+        const refused = subscriberError(value, false);
+        if (refused.code === "rate_limited" || refused.code === "internal_error")
+          throw new ServerUnreachable(refused);
+        throw new Refusal("identity", `Static mode refused: the server's whoami answered ${refused.code}`);
+      }
+      const fields = value;
+      const text = (v) => typeof v === "string" ? v : undefined;
+      return { kind: text(fields?.principal_kind), principal: text(fields?.principal) };
+    } catch (error) {
+      if (signOutCause(error)) {
+        if (this.#fingerprint)
+          ended.add(this.#fingerprint);
+        throw this.expired();
+      }
+      throw error;
+    } finally {
+      await wire.close().catch(() => {});
+    }
+  }
+  async read() {
+    return { epoch: "static" };
+  }
+  watch() {
+    return { dispose: () => {} };
+  }
+  async login() {
+    throw new Refusal("auth", "static mode: the launcher supplies the run token");
+  }
+  async logout() {
+    throw new Refusal("auth", "static mode: the launcher supplies the run token and revokes it");
+  }
+  configuration() {
+    const { issuer, principal } = this.static;
+    return { type: "remote", url: this.resource, issuer: issuer ?? "", clientID: SERVICE_CLIENT, scope: SCOPES, configHash: sha256(JSON.stringify(["static", this.resource, issuer ?? null, principal ?? null])) };
+  }
+  credential() {
+    return {
+      capture: async (sessionID) => {
+        await this.token();
+        return { version: 2, sessionID, configuration: this.configuration() };
+      },
+      check: async (e) => {
+        if (e.configuration.configHash !== this.configuration().configHash)
+          throw new Refusal("binding", `Grayboard sign-in changed in ${this.#config.harness}`);
+      },
+      watch: async () => ({ dispose: async () => {} }),
+      token: async () => this.token(),
+      unauthorized: async (_e, token) => this.unauthorized(token)
+    };
+  }
+}
+
+// src/shared/claude_agents.ts
+import { closeSync, constants as constants3, fstatSync, lstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync3, readFileSync as readFileSync5, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { createHash as createHash8 } from "crypto";
+import { join as join6, resolve as resolve3 } from "path";
+
+// src/shared/protocol.ts
+var SESSION_FACT_MAX = 64;
+
+// src/shared/testpause.ts
+import { existsSync } from "fs";
+import { dirname as dirname3 } from "path";
+var parent = process.ppid;
+var abandoned = (file) => !existsSync(dirname3(file)) || process.ppid !== parent;
+async function testPauseAsync(point, env = process.env) {
+  const file = env.BUS_TEST_PAUSE_FILE;
+  if (env.BUS_TEST_PAUSE !== point || !file)
+    return;
+  console.error(`[grayboard] test pause hit: ${point}`);
+  while (!existsSync(file)) {
+    if (abandoned(file))
+      throw new Error(`test pause abandoned: ${point}`);
+    await Bun.sleep(10);
+  }
+  console.error(`[grayboard] test pause released: ${point}`);
+}
+
+// src/shared/claude_agents.ts
+var SIGN_IN = "signin";
+var ROOT = "-";
+var LEFTOVER_TTL_MS = 10 * 60000;
+var TOOL_USE_META = "claudecode/toolUseId";
+var TOOL_USE_ID = /^toolu_[A-Za-z0-9_]{1,128}$/;
+var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
+var agentsRoot = (base) => join6(base, "claude-agents");
+var sessionDir = (base, claudePid) => join6(agentsRoot(base), String(claudePid));
+var FACTS = ["model", "effort"];
+var HOOK_ERROR = "hook-error";
+var HOOK_ERROR_MAX = 1024;
+var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
+var validFact = (v) => typeof v === "string" && FACT.test(v);
+function put(path, text) {
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, text, { mode: 384 });
+  renameSync(tmp, path);
+}
+function putSignIn(base, claudePid, url, now = Date.now()) {
+  const dir = sessionDir(base, claudePid);
+  mkdirSync2(dir, { recursive: true, mode: 448 });
+  put(join6(dir, SIGN_IN), JSON.stringify({ url, at: now }));
+}
+var SIGN_IN_MAX = 16384;
+function dropSignIn(base, claudePid, url) {
+  const path = join6(sessionDir(base, claudePid), SIGN_IN);
+  if (url !== undefined) {
+    let text;
+    try {
+      text = readSmall(path, SIGN_IN_MAX);
+    } catch (error) {
+      const code = error.code;
+      if (code === "ENOENT" || code === "ELOOP" || code === undefined)
+        return;
+      throw error;
+    }
+    let held;
+    try {
+      held = JSON.parse(text).url;
+    } catch {
+      return;
+    }
+    if (held !== url)
+      return;
+  }
+  rmSync(path, { force: true });
+}
+var CONTROLS = /[\x00-\x1f\x7f-\x9f]+/g;
+var MISSING_TEXT = {
+  bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
+  no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
+  recycled_pid: "the record directory belongs to an earlier process with the same pid",
+  absent: "the grayboard PreToolUse hook wrote no record for this call",
+  bad_record: "the call's record isn't an agent id"
+};
+function takeRecord(base, claudePid, harnessStart, toolUseId) {
+  if (!validToolUseId(toolUseId))
+    return { missing: "bad_tool_use_id" };
+  const dir = sessionDir(base, claudePid);
+  let start;
+  try {
+    start = readFileSync5(join6(dir, "start"), "utf8");
+  } catch {
+    return { missing: "no_session" };
+  }
+  if (harnessStart !== null && start !== "" && start !== harnessStart)
+    return { missing: "recycled_pid" };
+  const taken = join6(dir, `${toolUseId}.taken.${process.pid}`);
+  try {
+    renameSync(join6(dir, toolUseId), taken);
+  } catch {
+    return { missing: "absent" };
+  }
+  try {
+    const content = JSON.parse(readFileSync5(taken, "utf8"));
+    if (content.agent !== null && (!validSourceId(content.agent) || content.agent === ROOT))
+      return { missing: "bad_record" };
+    if (content.session !== undefined && !validSourceId(content.session))
+      return { missing: "bad_record" };
+    return { agent: content.agent, ...content.session === undefined ? {} : { session: content.session } };
+  } catch {
+    return { missing: "bad_record" };
+  } finally {
+    try {
+      unlinkSync(taken);
+    } catch {}
+  }
+}
+function readSmall(path, max) {
+  const fd = openSync(path, constants3.O_RDONLY | constants3.O_NOFOLLOW | constants3.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile())
+      throw new Error("not a regular file");
+    if (stat.size > max)
+      throw new Error(`record exceeds ${max} bytes`);
+    const buf = Buffer.alloc(max + 1);
+    const count = readSync(fd, buf, 0, buf.length, 0);
+    if (count > max)
+      throw new Error(`record exceeds ${max} bytes`);
+    return buf.toString("utf8", 0, count);
+  } finally {
+    closeSync(fd);
+  }
+}
+function readFacts(base, claudePid, harnessStart, bad) {
+  const dir = sessionDir(base, claudePid);
+  let start;
+  try {
+    start = readFileSync5(join6(dir, "start"), "utf8");
+  } catch {
+    return;
+  }
+  if (harnessStart !== null && start !== "" && start !== harnessStart)
+    return;
+  const out = {};
+  for (const fact of FACTS) {
+    let value;
+    try {
+      value = readSmall(join6(dir, fact), SESSION_FACT_MAX + 1);
+    } catch (e) {
+      if (e.code !== "ENOENT")
+        bad(fact, `couldn't read ${join6(dir, fact)}: ${e.message}`);
+      continue;
+    }
+    if (value === "")
+      out[fact] = null;
+    else if (validFact(value))
+      out[fact] = value;
+    else
+      bad(fact, `${join6(dir, fact)} isn't a Claude Code ${fact}`);
+  }
+  let failure;
+  try {
+    failure = readSmall(join6(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4).replace(CONTROLS, " ");
+  } catch {}
+  if (failure !== undefined)
+    bad("hook", failure);
+  return out;
+}
+function factReader(read, say) {
+  const said = new Set;
+  return () => {
+    const seen = new Set;
+    const out = read((what, error) => {
+      const text = what === "hook" ? `a grayboard hook failed, so the server may show a stale model or effort: ${error}` : `the server gets no ${what} for this session: ${error}`;
+      seen.add(text);
+      if (!said.has(text)) {
+        said.add(text);
+        say(text);
+      }
+    });
+    if (out !== undefined) {
+      for (const text of said)
+        if (!seen.has(text))
+          said.delete(text);
+    }
+    return out;
+  };
+}
+var calledPath = (base, claudePid, agent) => join6(sessionDir(base, claudePid), "called", createHash8("sha256").update(agent).digest("hex"));
+function markCalled(base, claudePid, agent) {
+  const path = calledPath(base, claudePid, agent);
+  mkdirSync2(join6(path, ".."), { recursive: true, mode: 448 });
+  writeFileSync(path, "", { mode: 384 });
+}
+function ownDir(base, claudePid, harnessStart) {
+  let start;
+  try {
+    start = readFileSync5(join6(sessionDir(base, claudePid), "start"), "utf8");
+  } catch {
+    return false;
+  }
+  return harnessStart === null || start === "" || start === harnessStart;
+}
+function dropCalled(base, claudePid) {
+  rmSync(join6(sessionDir(base, claudePid), "called"), { recursive: true, force: true });
+}
+function hasCalled(base, claudePid) {
+  try {
+    return readdirSync3(join6(sessionDir(base, claudePid), "called")).length > 0;
+  } catch {
+    return false;
+  }
+}
+function takeCalled(base, claudePid, agent) {
+  try {
+    unlinkSync(calledPath(base, claudePid, agent));
+    return true;
+  } catch {
+    return false;
+  }
+}
+function takeEnded(base, claudePid) {
+  const dir = join6(sessionDir(base, claudePid), "ended");
+  let names;
+  try {
+    names = readdirSync3(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    if (name.includes(".tmp.") || name.includes(".taken."))
+      continue;
+    const taken = join6(dir, `${name}.taken.${process.pid}`);
+    try {
+      renameSync(join6(dir, name), taken);
+    } catch {
+      continue;
+    }
+    try {
+      const agent = readFileSync5(taken, "utf8");
+      if (validSourceId(agent) && agent !== ROOT)
+        out.push(agent);
+    } catch {} finally {
+      try {
+        unlinkSync(taken);
+      } catch {}
+    }
+  }
+  return out;
+}
+
 // src/shared/identity.ts
-import { existsSync, readFileSync as readFileSync3, statSync as statSync2 } from "fs";
-import { basename as basename2, dirname as dirname3, join as join5, resolve as resolve3 } from "path";
+import { existsSync as existsSync3, readFileSync as readFileSync7, statSync as statSync4 } from "fs";
+import { basename as basename3, dirname as dirname5, join as join8, resolve as resolve5 } from "path";
+
+// src/core/session_id.ts
+var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
+var SESSION_ID_PATTERN = `id:[${CROCKFORD}]{13}`;
+var SESSION_ID = new RegExp(`^${SESSION_ID_PATTERN}$`);
+
+// src/core/addresses.ts
+function addressParts(input) {
+  const s = input.toLowerCase();
+  if (SESSION_ID.test(s))
+    return { kind: "id", address: s };
+  if (s.startsWith("team:")) {
+    const name = s.slice(5);
+    return isValidIdentityName(name) ? { kind: "team", address: s, name } : null;
+  }
+  const slash = s.indexOf("/");
+  if (slash === -1)
+    return isValidIdentityName(s) ? { kind: "bare", address: s, name: s } : null;
+  const scope = s.slice(0, slash);
+  const name = s.slice(slash + 1);
+  if (!scope || !isValidIdentityName(name))
+    return null;
+  if (isValidEmail(scope))
+    return { kind: "alias", address: s, scope, scopeKind: "person", name };
+  return scope.includes("@") ? null : { kind: "alias", address: s, scope, scopeKind: "principal", name };
+}
+function normalizeAliasName(raw) {
+  const p = addressParts(raw);
+  if (p?.kind === "bare" || p?.kind === "alias")
+    return { ok: true, name: p.address };
+  return { ok: false, error: `invalid identity name "${shownName(raw)}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
+}
+
+// src/shared/naming.ts
+import { existsSync as existsSync2, readFileSync as readFileSync6, statSync as statSync3 } from "fs";
+import { basename as basename2, dirname as dirname4, join as join7, resolve as resolve4 } from "path";
+var MAX_LEN = 32;
 function gitLocation(cwd) {
-  for (let dir = cwd;; dir = dirname3(dir)) {
-    const dotGit = join5(dir, ".git");
-    if (existsSync(dotGit)) {
-      if (statSync2(dotGit).isDirectory())
+  for (let dir = cwd;; dir = dirname4(dir)) {
+    const dotGit = join7(dir, ".git");
+    if (existsSync2(dotGit)) {
+      if (statSync3(dotGit).isDirectory())
         return { repo: dir, worktree: null };
-      const m = /^gitdir:\s*(.+)$/m.exec(readFileSync3(dotGit, "utf8"));
-      const gitdir = m ? resolve3(dir, m[1].trim()) : "";
+      const m = /^gitdir:\s*(.+)$/m.exec(readFileSync6(dotGit, "utf8"));
+      const gitdir = m ? resolve4(dir, m[1].trim()) : "";
       if (!/[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitdir))
         return { repo: dir, worktree: null };
-      const common = dirname3(dirname3(gitdir));
-      const repo = basename2(common) === ".git" ? dirname3(common) : common.replace(/\.git$/, "");
+      const common = dirname4(dirname4(gitdir));
+      const repo = basename2(common) === ".git" ? dirname4(common) : common.replace(/\.git$/, "");
       return { repo, worktree: basename2(dir) };
     }
-    if (dirname3(dir) === dir)
+    if (dirname4(dir) === dir)
       return null;
   }
 }
+function linkedWorktreeName(cwd) {
+  return gitLocation(cwd)?.worktree ?? null;
+}
+function sanitizeIdentity(name) {
+  return name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, MAX_LEN).replace(/-+$/, "");
+}
+function defaultIdentity(cwd = process.cwd()) {
+  const name = sanitizeIdentity(basename2(gitLocation(cwd)?.repo ?? cwd));
+  if (!name)
+    throw new Error(`can't derive an identity from ${cwd}; set BUS_IDENTITY`);
+  return name;
+}
+function resolveIdentity(base, cwd = process.cwd()) {
+  const wt = linkedWorktreeName(cwd);
+  if (!wt)
+    return base;
+  const b = base.toLowerCase();
+  const name = sanitizeIdentity(wt);
+  if (!name || name === b)
+    return base;
+  return sanitizeIdentity(name.startsWith(`${b}-`) ? name : `${b}-${name}`);
+}
+var PIN_FILES = [".mcp.json", ".omp/mcp.json"];
+function readPin(cwd, file) {
+  try {
+    const pin = JSON.parse(readFileSync6(join7(gitLocation(cwd)?.repo ?? cwd, file), "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+    return typeof pin === "string" && pin ? pin : undefined;
+  } catch {
+    return;
+  }
+}
+function pinnedIdentities(cwd = process.cwd()) {
+  return PIN_FILES.flatMap((file) => readPin(cwd, file) ?? []);
+}
+function pinnedIdentity(cwd = process.cwd(), env = process.env) {
+  for (const file of env.BUS_HARNESS === "omp" ? PIN_FILES : PIN_FILES.slice(0, 1)) {
+    const name = readPin(cwd, file);
+    if (name)
+      return { name, file };
+  }
+  return;
+}
+function isExplicitIdentity(env = process.env, cwd = process.cwd()) {
+  if (!env.BUS_IDENTITY)
+    return false;
+  return !pinnedIdentities(cwd).includes(env.BUS_IDENTITY);
+}
+function sessionIdentity(env = process.env, cwd = process.cwd()) {
+  if (isExplicitIdentity(env, cwd))
+    return env.BUS_IDENTITY;
+  return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd, env)?.name || defaultIdentity(cwd), cwd);
+}
+
+// src/shared/identity.ts
 function gitBranch(cwd) {
-  for (let dir = cwd;; dir = dirname3(dir)) {
-    const dotGit = join5(dir, ".git");
-    if (existsSync(dotGit)) {
+  for (let dir = cwd;; dir = dirname5(dir)) {
+    const dotGit = join8(dir, ".git");
+    if (existsSync3(dotGit)) {
       let gitdir = dotGit;
-      if (!statSync2(dotGit).isDirectory()) {
-        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync3(dotGit, "utf8"));
+      if (!statSync4(dotGit).isDirectory()) {
+        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync7(dotGit, "utf8"));
         if (!m)
           return null;
-        gitdir = resolve3(dir, m[1].trim());
+        gitdir = resolve5(dir, m[1].trim());
       }
-      const head = readFileSync3(join5(gitdir, "HEAD"), "utf8").trim();
+      const head = readFileSync7(join8(gitdir, "HEAD"), "utf8").trim();
       return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
     }
-    if (dirname3(dir) === dir)
+    if (dirname5(dir) === dir)
       return null;
   }
 }
@@ -37205,11 +39037,21 @@ function describeLocation(cwd) {
   try {
     const loc = gitLocation(cwd);
     if (!loc)
-      return basename2(cwd);
+      return basename3(cwd);
     const branch = gitBranch(cwd);
-    return `${basename2(loc.repo)}${loc.worktree ? ` worktree ${loc.worktree}` : ""}${branch ? ` on ${branch}` : ""}`;
+    return `${basename3(loc.repo)}${loc.worktree ? ` worktree ${loc.worktree}` : ""}${branch ? ` on ${branch}` : ""}`;
   } catch {
     return null;
+  }
+}
+function configuredIdentity(env = process.env, cwd = process.cwd()) {
+  try {
+    if (!isExplicitIdentity(env, cwd))
+      return;
+    const n = normalizeAliasName(sessionIdentity(env, cwd));
+    return n.ok ? { name: n.name } : { error: n.error };
+  } catch (e) {
+    return { error: e.message };
   }
 }
 
@@ -37219,10 +39061,12 @@ var CLIENT_ID = "grayboard-claude-code";
 var SOURCE = "plugin:grayboard:grayboard";
 var ENTRY = `plugin:${CLAUDE_PLUGIN}`;
 var RESUME_HINT = "call any grayboard tool to retry";
-var LOGIN_INTERACTIVE = "approve the grayboard sign-in Claude Code shows (any grayboard tool call offers it again)";
+var LOGIN_INTERACTIVE = "open the sign-in link Claude Code shows under a grayboard tool call, or approve the sign-in prompt Claude Code shows";
 var LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 var INSTRUCTIONS_MS = 5000;
-var FLOW_MS2 = 10 * 60000;
+var UNSHOWN_MS = 1000;
+var RESEND_MS = 500;
+var RESENDS = 3;
 function pluginConfig(env) {
   const { CLAUDE_CODE_SESSION_ID: id, CLAUDE_PLUGIN_DATA: dataDir } = env, url = env.GRAYBOARD_SERVER_URL?.trim();
   if (!id)
@@ -37236,56 +39080,112 @@ function pluginConfig(env) {
     return { error: `the grayboard plugin's server_url isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; ${reconfigure}` };
   return { id, dataDir, url };
 }
+var pluginStaticMode = (env, cwd) => staticMode(env, cwd, [...env.CLAUDE_PROJECT_DIR ? [env.CLAUDE_PROJECT_DIR] : [], cwd]);
+var STATIC_LOGOUT = "This run uses a launcher-set grayboard run token: nothing to sign out here; the launcher revokes it.";
 function createPlugin(o) {
   const config = pluginConfig(o.env);
   const interactive = interactiveClaude(o.env, o.parentCmd);
-  const loginAction = interactive ? LOGIN_INTERACTIVE : LOGIN_ELSEWHERE;
+  const mode = "error" in config ? undefined : pluginStaticMode(o.env, o.cwd);
+  const loginAction = mode ? NEW_RUN : interactive ? LOGIN_INTERACTIVE : LOGIN_ELSEWHERE;
   const verdict = claudeChannels({ env: o.env, parentCmd: o.parentCmd, entry: ENTRY, files: o.files });
   const push = verdict.state === "on";
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
   const place = describeLocation(o.cwd) ?? HARNESS;
+  const configured = configuredIdentity(o.env, o.cwd);
+  const suggestion = (() => {
+    try {
+      return sessionIdentity(o.env, o.cwd);
+    } catch {
+      return;
+    }
+  })();
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...project ? attachRoots({}, project) : []])];
   const say = (message) => o.log(`[grayboard] ${message}`);
   let closed = false;
   let initialized = false;
   const { promise: ready, resolve: markInitialized } = Promise.withResolvers();
-  let signingIn;
+  const signins = {};
+  const prompts = new WeakMap;
   let server;
   const listChanged = () => {
     if (initialized && !closed)
       server?.sendToolListChanged().catch(() => {});
   };
-  const login = "error" in config ? undefined : new Login({
+  const login = "error" in config ? undefined : mode ? new StaticLogin({ resource: config.url, clientId: CLIENT_ID, version: o.version, harness: HARNESS, mode }) : new Login({
     resource: config.url,
     clientId: CLIENT_ID,
     stateDir: config.dataDir,
     harness: HARNESS,
     loginAction,
-    present: async (url) => {
-      const abort = signingIn?.abort.signal;
-      if (!server.getClientCapabilities()?.elicitation?.url) {
-        const text = `open ${url} to sign in to grayboard`;
-        root?.noticeOnce(text, "last");
-        say(text);
-        return;
+    present: async (url, answered) => {
+      const flow = signins.flow;
+      await testPauseAsync("claude-sign-in-present", o.env);
+      try {
+        putSignIn(config.dataDir, o.claude.pid, url);
+      } catch (error) {
+        say(`couldn't save the sign-in link for the hook to show: ${message(error)}; approve the sign-in prompt, or open the link in this log`);
       }
-      const elicitationId = randomUUID2();
-      const result = await server.elicitInput({ mode: "url", elicitationId, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: FLOW_MS2, ...abort ? { signal: abort } : {} });
-      if (result.action !== "accept")
-        throw new LoginFailed(result.action === "decline" ? "sign-in declined" : "sign-in cancelled");
-      complete = () => server.createElicitationCompletionNotifier(elicitationId)().catch(() => {});
+      present(signins, url);
+      say(`open ${url} to sign in to grayboard`);
+      if (!server.getClientCapabilities()?.elicitation?.url)
+        return;
+      if (!flow)
+        return;
+      for (let sent = 0;; sent++) {
+        const prompt = { id: randomUUID2(), withdraw: new AbortController };
+        prompts.get(flow)?.withdraw.abort();
+        prompts.set(flow, prompt);
+        say(`sign-in prompt sent (elicitation ${prompt.id})`);
+        const start = Date.now();
+        let result;
+        try {
+          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: SIGN_IN_FLOW_MS, signal: AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) });
+        } catch (error) {
+          if (prompt.withdraw.signal.aborted)
+            return;
+          say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
+          throw error;
+        }
+        const ms = Date.now() - start;
+        say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action} after ${ms} ms`);
+        if (result.action === "decline")
+          throw new LoginFailed("sign-in declined");
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS)
+          return;
+        if (sent >= RESENDS) {
+          say(`sign-in prompt cancelled unshown ${sent + 1} times; the link Claude Code shows under each grayboard call remains`);
+          return;
+        }
+        say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
+        await after(RESEND_MS);
+        await testPauseAsync("claude-sign-in-resend", o.env);
+        if (signins.flow !== flow || flow.abort.signal.aborted) {
+          say("sign-in ended before the prompt was sent again");
+          return;
+        }
+        if (answered?.aborted) {
+          say("the browser answered before the prompt was sent again");
+          return;
+        }
+        if (prompts.get(flow) !== prompt)
+          return;
+      }
     },
-    notify: (message) => say(message),
+    notify: (message) => {
+      say(message);
+      notify(signins, message);
+    },
     diagnostic: (record) => {
       if (record.state !== "degraded" && record.state !== "paused")
         return;
-      root?.noticeOnce(record.message, "last");
+      if (record.operation !== "login_link")
+        root?.noticeOnce(record.message, "last");
       say(record.message);
     }
   });
-  let complete;
-  const client = login && new HostedClient({
+  const facts = "error" in config ? undefined : factReader((bad) => readFacts(config.dataDir, o.claude.pid, o.claude.start, bad), say);
+  const client = "error" in config || !login ? undefined : new HostedClient({
     harness: HARNESS,
     clientId: CLIENT_ID,
     version: o.version,
@@ -37296,7 +39196,10 @@ function createPlugin(o) {
     retryHint: RESUME_HINT,
     roots,
     env: o.env,
-    log: (message) => say(message)
+    launcher: o.env.BUS_LAUNCHER === "1",
+    log: (message) => say(message),
+    facts: (sessionID) => sessionID === config.id ? facts?.() : undefined,
+    ...suggestion ? { suggested: (sessionID) => sessionID === config.id ? suggestion : undefined } : {}
   });
   const initializedOr = (signal) => {
     signal.throwIfAborted();
@@ -37310,6 +39213,8 @@ function createPlugin(o) {
     stateDir: config.dataDir,
     place: () => place,
     push,
+    context: false,
+    ...configured && "name" in configured ? { configured: configured.name } : {},
     admit: async (item, _stableID, identity, signal) => {
       if (!initialized)
         await initializedOr(signal);
@@ -37317,29 +39222,52 @@ function createPlugin(o) {
     },
     onTools: () => listChanged()
   }) : undefined;
-  if (offNotice)
-    root?.noticeOnce(offNotice, "first");
-  const changes = client?.onChange((signedIn) => {
-    if (signedIn)
-      signingIn?.abort.abort();
-  });
-  const signIn = () => {
-    if (!login || !root || !interactive || closed || signingIn || !initialized)
+  const badIdentity = configured && "error" in configured ? `BUS_IDENTITY is ignored: ${configured.error}` : undefined;
+  if (badIdentity)
+    say(badIdentity);
+  const firstNotice = [offNotice, badIdentity].filter(Boolean).join(" ");
+  if (firstNotice)
+    root?.noticeOnce(firstNotice, "first");
+  const begin = (origin) => {
+    if (signins.flow)
+      return signins.flow;
+    if (!(login instanceof Login) || !root || !interactive || closed || !initialized)
       return;
-    const abort = new AbortController;
-    const done = login.login(abort.signal, true).then(async () => {
-      await complete?.();
-      say("signed in");
-      await root.credentialChanged();
-    }, (error) => {
-      if (!abort.signal.aborted)
-        say(`sign-in failed: ${message(error)}`);
-    }).finally(() => {
-      complete = undefined;
-      if (signingIn?.done === done)
-        signingIn = undefined;
+    const flow = start(signins, login, {
+      origin,
+      browser: false,
+      ifSignedOut: true,
+      ended: async (flow, outcome) => {
+        const prompt = prompts.get(flow);
+        try {
+          if (outcome === "signed in") {
+            if (prompt)
+              await server.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
+            say(`signed in (${origin})`);
+            await root.credentialChanged();
+          } else if (outcome !== "cancelled")
+            say(`sign-in failed (${[origin, ...prompt ? [`elicitation ${prompt.id}`] : []].join(", ")}): ${flow.failed}`);
+        } finally {
+          prompt?.withdraw.abort();
+          if (flow.url && !("error" in config)) {
+            try {
+              dropSignIn(config.dataDir, o.claude.pid, flow.url);
+            } catch (error) {
+              say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+            }
+          }
+        }
+      },
+      current: async () => {
+        say(`sign-in not needed (${origin}): already signed in`);
+        await root.credentialChanged();
+      }
     });
-    signingIn = { abort, done };
+    return flow;
+  };
+  const notes = {
+    started: "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again",
+    starting: "sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again"
   };
   const unpause = async () => {
     if (!root || "error" in config)
@@ -37364,34 +39292,84 @@ function createPlugin(o) {
     await root.resume();
     return `delivery was paused (${paused.message}); restarted: ${state()}`;
   };
-  const before = async () => {
-    try {
-      await login.token();
-    } catch (error) {
-      if (accessExpiry(error)) {
-        signIn();
-        return;
-      }
+  const before = async () => (mode ? undefined : await offer(signins, login, { interactive, begin: () => begin("offer"), notes })) ?? await unpause();
+  const childOf = (agent) => `${config.id}/agent/${agent}`;
+  let endWatch;
+  const drainEnded = () => {
+    if ("error" in config || closed)
+      return;
+    const ours = ownDir(config.dataDir, o.claude.pid, o.claude.start);
+    for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
+      const called = takeCalled(config.dataDir, o.claude.pid, agent) && ours;
+      if (validSourceId(childOf(agent)))
+        root?.endChild(childOf(agent), called);
     }
-    return unpause();
   };
-  const call = async (name, args) => {
+  const watchEnded = () => {
+    if (endWatch || "error" in config || closed)
+      return;
+    const dir = join9(sessionDir(config.dataDir, o.claude.pid), "ended");
+    try {
+      mkdirSync3(dir, { recursive: true, mode: 448 });
+      const watcher = watch(dir, () => drainEnded());
+      watcher.on("error", (error) => {
+        say(`stopped watching subagent ends: ${message(error)}; they end at the next subagent call, which watches again`);
+        watcher.close();
+        if (endWatch === watcher)
+          endWatch = undefined;
+      });
+      endWatch = watcher;
+    } catch (error) {
+      say(`couldn't watch subagent ends: ${message(error)}; they end at the next subagent call, or with this session`);
+    }
+    drainEnded();
+  };
+  if (!("error" in config) && ownDir(config.dataDir, o.claude.pid, o.claude.start) && hasCalled(config.dataDir, o.claude.pid))
+    watchEnded();
+  const call = async (name, args, meta) => {
     if ("error" in config)
       return failure2(config.error);
-    return root.call(name, args, before);
+    const toolUse = meta?.[TOOL_USE_META];
+    if (toolUse === undefined)
+      return root.call(name, args, before);
+    const taken = takeRecord(config.dataDir, o.claude.pid, o.claude.start, toolUse);
+    if ("missing" in taken) {
+      const cause = MISSING_TEXT[taken.missing];
+      say(`refused ${name} (tool_use_id ${String(toolUse).slice(0, 160)}): no agent record: ${cause}`);
+      return failure2(`grayboard couldn't tell which Claude Code agent made this call (${cause}), so it didn't run. Restart Claude Code so the grayboard plugin's hooks run; hooks turned off (disableAllHooks, or managed settings that allow only managed hooks) stop every grayboard call.`);
+    }
+    if (taken.agent === null)
+      return root.call(name, args, before);
+    const child = childOf(taken.agent), length = child.length;
+    if (!validSourceId(child)) {
+      say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
+      return failure2(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
+    }
+    const agent = taken.agent;
+    const passed = () => {
+      try {
+        markCalled(config.dataDir, o.claude.pid, agent);
+      } catch (error) {
+        say(`couldn't note subagent ${agent.slice(0, 160)}'s call: ${message(error)}; if this plugin restarts first, its session lasts until this one ends`);
+      }
+    };
+    watchEnded();
+    drainEnded();
+    return root.call(name, args, before, { child, passed });
   };
   const tools = () => root?.tools() ?? hostTools(snapshotTools());
   const serve = (instructions) => {
     const s = new Server({ name: "grayboard", version: o.version }, { capabilities: { experimental: { "claude/channel": {} }, tools: { listChanged: true } }, instructions });
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() }));
-    s.setRequestHandler(CallToolRequestSchema, async (req) => await call(req.params.name, req.params.arguments ?? {}));
+    s.setRequestHandler(CallToolRequestSchema, async (req) => await call(req.params.name, req.params.arguments ?? {}, req.params._meta));
     s.oninitialized = () => {
+      s.ping().catch(() => {});
       initialized = true;
       markInitialized();
-      if (login && interactive)
+      if (login && interactive && !mode)
         login.token().catch((error) => {
           if (accessExpiry(error))
-            signIn();
+            begin("startup");
         });
     };
     return s;
@@ -37404,6 +39382,8 @@ function createPlugin(o) {
   const instructions = async () => {
     if ("error" in config)
       return `Warning: grayboard is unavailable: ${config.error}. Tell the user.`;
+    if (mode && "refused" in mode)
+      return `Warning: grayboard is unavailable: ${mode.refused}. Tell the user.`;
     let body;
     try {
       const text = await Promise.race([root.instructions(), after(INSTRUCTIONS_MS).then(() => {
@@ -37421,6 +39401,13 @@ function createPlugin(o) {
 `);
   };
   const connectTransport = async (transport) => {
+    if (!("error" in config)) {
+      try {
+        dropSignIn(config.dataDir, o.claude.pid);
+      } catch (error) {
+        say(`couldn't remove a sign-in link a previous server left: ${message(error)}`);
+      }
+    }
     await Promise.race([root?.start(), after(INSTRUCTIONS_MS)]);
     server = serve(await instructions());
     if (offNotice)
@@ -37431,9 +39418,17 @@ function createPlugin(o) {
     if (closed)
       return;
     closed = true;
-    changes?.dispose();
-    signingIn?.abort.abort();
+    endWatch?.close();
+    signins.flow?.abort.abort();
+    const held = root?.status().held;
     await root?.shutdown("release");
+    if (root && !held && !("error" in config)) {
+      try {
+        dropCalled(config.dataDir, o.claude.pid);
+      } catch (error) {
+        say(`couldn't clear subagent notes: ${message(error)}`);
+      }
+    }
     await server?.close().catch(() => {});
   };
   return { connect: connectTransport, shutdown };
@@ -37451,9 +39446,18 @@ async function logout(args) {
     log("grayboard logout: --data <plugin data dir> is required");
     return 2;
   }
+  const mode = pluginStaticMode(process.env, process.cwd());
+  if (mode && !("refused" in mode)) {
+    console.log(STATIC_LOGOUT);
+    return 0;
+  }
+  if (mode) {
+    log(`grayboard logout: ${mode.refused}; no grant was signed out. Remove the static-mode variables from the environment (or the project's files) and run it again.`);
+    return 1;
+  }
   let names;
   try {
-    names = readdirSync2(join6(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
+    names = readdirSync4(join10(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
   } catch (error) {
     if (error.code !== "ENOENT")
       throw error;
@@ -37464,7 +39468,7 @@ async function logout(args) {
   for (const name of names) {
     let store;
     try {
-      store = await readJson(join6(dataDir, "grants", name));
+      store = await readJson(join10(dataDir, "grants", name));
     } catch (error) {
       unreadable.push(`${name}: ${error.message}`);
       continue;
@@ -37508,7 +39512,8 @@ async function logout(args) {
   return failed ? 1 : 0;
 }
 async function serve() {
-  const plugin = createPlugin({ env: process.env, parentCmd: parentCommandLine(), files: hostFiles(), version: package_default.version, cwd: process.cwd(), log });
+  const claude = { pid: process.ppid, start: procStart(process.ppid) ?? null };
+  const plugin = createPlugin({ env: process.env, parentCmd: parentCommandLine(), files: hostFiles(), version: package_default.version, cwd: process.cwd(), claude, log });
   let exiting = false;
   const exit = async () => {
     if (exiting)

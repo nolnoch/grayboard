@@ -1,3 +1,4 @@
+import type { Read } from "./store/tx.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,8 +11,11 @@ import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
+import { sessionEndPort } from "./session_end.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
+import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { transactionProcess } from "../../tests/support/transaction-process.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 let dir: string, now: number;
 let database: ReturnType<typeof openDatabase>;
@@ -20,33 +24,33 @@ let hosted: ReturnType<typeof createHostedSessions>;
 let delivery: ReturnType<typeof createDelivery>;
 const resource = "https://grayboard.example/mcp";
 const context = (p: OAuthPrincipal, raw = "root") => sessionContext(p, { [OPENCODE_SESSION_META]: raw });
-function open() {
-  database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
-  application = createApplication(database.repo, database.db);
-  const isAuthorized = (p: OAuthPrincipal) => database.repo.oauth.isGrantActive(p.grantId, now);
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized });
+async function open() {
+  database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") , sessionEnd: sessionEndPort("team") });
+  application = createApplication(database.repo);
+  const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.oauth.isGrantActive(r, p.grantId, now);
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized });
 }
-function close() { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); }
-function issue(email = "you@example.com") {
-  const issued = issueOAuth(database.repo, resource, email, ["grayboard:tools", "grayboard:delivery"], now, OPENCODE_CLIENT);
+async function close() { delivery.close(); await hosted.close(); await application.stopExpiry(); database.db.close(); }
+async function issue(email = "you@example.com") {
+  const issued = await issueOAuth(database.repo, resource, email, ["grayboard:tools", "grayboard:delivery"], now, OPENCODE_CLIENT);
   const principal: OAuthPrincipal = { authed: issued.authed, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: issued.grantId, accessHash: hashToken(issued.token), accessExpiry: issued.tokens.accessExpiresAt, scopes: ["tools", "delivery"] };
   return { ...issued, principal };
 }
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "gb-hosted-durable-")); now = Date.now(); open(); });
-afterEach(() => { close(); rmSync(dir, { recursive: true, force: true }); });
+beforeEach(async () => { dir = mkdtempSync(join(tmpdir(), "gb-hosted-durable-")); now = Date.now(); await open(); });
+afterEach(async () => { await close(); rmSync(dir, { recursive: true, force: true }); });
 const releases = () => database.db.query<{ detail: string }, []>("SELECT detail FROM binding_events WHERE event='released'").all();
 
 async function overlap(first: Record<string, unknown>, second: Record<string, unknown>, pause: string) {
-  delivery.close(); hosted.close(); application.stopExpiry();
+  delivery.close(); await hosted.close(); await application.stopExpiry();
   const release = join(dir, "release-transaction");
   const start = (operation: Record<string, unknown>, point: string) => transactionProcess("tests/support/hosted-operation.ts", [join(dir, "bus.db"), join(dir, "blobs"), JSON.stringify({ now, ...operation })], point, release);
   const workers = [start(first, pause), start(second, "")];
   try {
     await Promise.all(workers.map(w => w.wait("READY")));
-    workers[0]!.proc.stdin.end();
+    void workers[0]!.proc.stdin.end();
     await workers[0]!.wait(`test pause hit: ${pause}`);
-    workers[1]!.proc.stdin.end();
+    void workers[1]!.proc.stdin.end();
     await workers[1]!.wait("OPERATING");
     await Bun.write(release, "release");
     await Promise.all(workers.map(async w => { expect(await w.proc.exited).toBe(0); await w.done; }));
@@ -58,7 +62,7 @@ async function overlap(first: Record<string, unknown>, second: Record<string, un
 }
 
 for (const revokeFirst of [false, true]) test(`forced attachment/revoke transaction overlap, revoke first=${revokeFirst}`, async () => {
-  const first = issue(), second = issue();
+  const first = await issue(), second = await issue();
   await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
   await hosted.register(first.principal, context(first.principal), "child");
   const attach = { operation: "bind", principal: second.principal };
@@ -66,34 +70,57 @@ for (const revokeFirst of [false, true]) test(`forced attachment/revoke transact
   const results = await overlap(revokeFirst ? revoke : attach, revokeFirst ? attach : revoke, revokeFirst ? "hosted:revoke:in-txn" : "hosted:attach:in-txn");
   if (revokeFirst) {
     expect(results[1]).toMatchObject({ ok: false, code: "unauthenticated" });
-    expect(database.repo.hosted.all().every(row => row.grant_id === first.grantId)).toBe(true);
+    expect((await database.repo.hosted.all(database.repo.read)).every(row => row.grant_id === first.grantId)).toBe(true);
     expect(releases()).toEqual([]);
   } else {
-    expect(results.every(result => result.ok)).toBe(true);
-    expect(database.repo.hosted.all()).toEqual([]);
+    expect(results).toMatchObject([{ ok: true }, { ok: true }]);   // on a failure, prints both workers' results (#1134)
+    expect(hostedRowCount(database.db)).toBe(0);
     expect(releases()).toEqual([{ detail: "revoked" }]);
   }
 }, 15_000);
 
+test("forced bind/bind overlap on one name gives it one holder (#387 item 23)", async () => {
+  const { principal } = await issue();
+  const results = await overlap({ operation: "bind", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:bind:in-txn");
+  expect(results[0]).toMatchObject({ ok: true });
+  expect(results[1]).toMatchObject({ ok: false });
+  const rows = await database.repo.hosted.all(database.repo.read);
+  const holds = await Promise.all(rows.map(row => application.hostedHolds(application.repo.read, row.session_id)));
+  const holders = rows.filter((_, i) => holds[i]!.map(short).includes("fe"));
+  expect(holders).toHaveLength(1);
+  expect(holders[0]?.source_session_id).toBe("root");
+}, 15_000);
+
+test("forced release/bind overlap hands the name to the contender only after the release commits (#387 item 23)", async () => {
+  const { principal } = await issue();
+  await hosted.bind(principal, context(principal), { name: "fe", create: true });
+  const results = await overlap({ operation: "end", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:release:in-txn");
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
+  const rows = await database.repo.hosted.all(database.repo.read);
+  expect(rows.map(row => row.source_session_id)).toEqual(["other"]);
+  expect((await application.hostedHolds(application.repo.read, rows[0]!.session_id)).map(short)).toEqual(["fe"]);
+  expect(releases()).toHaveLength(1);
+}, 15_000);
+
 test("forced root registration/end overlap cannot leave an orphan child", async () => {
-  const { principal } = issue();
+  const { principal } = await issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const results = await overlap({ operation: "register", principal, child: "child" }, { operation: "end", principal }, "hosted:register:in-txn");
-  expect(results.every(result => result.ok)).toBe(true);
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toHaveLength(1);
 }, 15_000);
 
 test("forced expiry/rebind overlap releases only the expired ownership", async () => {
-  const { principal } = issue();
+  const { principal } = await issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const lease = await delivery.open(principal, context(principal));
   const results = await overlap({ operation: "sweep", principal, sweepAt: now + 30_001 }, { operation: "bind", principal }, "hosted:lease-expire:in-txn");
-  expect(results.every(result => result.ok)).toBe(true);
-  const rows = database.repo.hosted.all();
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
+  const rows = await database.repo.hosted.all(database.repo.read);
   expect(rows).toHaveLength(1);
   expect(rows[0]?.ownership_id).not.toBe(lease.ownership);
-  expect(application.hostedHolds(rows[0]!.session_id).map(short)).toEqual(["fe"]);
+  expect((await application.hostedHolds(application.repo.read, rows[0]!.session_id)).map(short)).toEqual(["fe"]);
   expect(releases()).toEqual([{ detail: "expired" }]);
 }, 15_000);
 
@@ -107,11 +134,11 @@ function external(operation: Record<string, unknown>) {
 
 for (const owning of ["bind", "open", "register"] as const) {
   for (const change of ["convert", "recreate"] as const) test(`owning ${owning} refuses external ${change} before its transaction`, async () => {
-    const first = issue(), second = issue(), p = second.principal;
+    const first = await issue(), second = await issue(), p = second.principal;
     await hosted.whoami(first.principal, context(first.principal));
     if (owning === "open") await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
     const id = (context(p) as { id: string }).id;
-    const old = database.repo.hosted.get(id)!;
+    const old = (await database.repo.hosted.get(database.repo.read, id))!;
     const operation = () => owning === "bind" ? hosted.bind(p, context(p), { name: "new", create: true })
       : owning === "open" ? delivery.open(p, context(p)) : hosted.register(p, context(p), "new-child");
     const point = owning === "register" ? "hosted:register:before-txn" : "hosted:owning:before-txn";
@@ -124,89 +151,107 @@ for (const owning of ["bind", "open", "register"] as const) {
         expect(external({ operation: "bind", name: "be", principal: first.principal }).ok).toBe(true);
       }
     })).rejects.toBeDefined();
-    const fresh = database.repo.hosted.get(id)!;
+    const fresh = (await database.repo.hosted.get(database.repo.read, id))!;
     expect(fresh.ownership_id).not.toBe(old.ownership_id);
     expect(fresh.grant_id).toBe(first.grantId);
-    expect(application.hostedHolds(fresh.session_id).map(short)).toEqual(change === "convert" ? [] : ["be"]);
-    expect(database.repo.aliases.find(`${p.authed.user_email}/new`)).toBeUndefined();
-    expect(database.repo.hosted.all().some(row => row.source_session_id === "new-child")).toBe(false);
+    expect((await application.hostedHolds(application.repo.read, fresh.session_id)).map(short)).toEqual(change === "convert" ? [] : ["be"]);
+    expect(await database.repo.aliases.find(database.repo.read, `${p.authed.user_email}/new`)).toBeUndefined();
+    expect((await database.repo.hosted.all(database.repo.read)).some(row => row.source_session_id === "new-child")).toBe(false);
     expect(delivery.activeLeaseCount).toBe(0);
   });
 }
 
 test("registration before bind/open preserves the graph and never extends a sticky deadline", async () => {
-  const { principal: p } = issue();
+  const { principal: p } = await issue();
   await hosted.register(p, context(p), "first");
   const id = (context(p) as { id: string }).id;
-  const ownership = database.repo.hosted.get(id)!.ownership_id;
+  const ownership = (await database.repo.hosted.get(database.repo.read, id))!.ownership_id;
   await hosted.bind(p, context(p), { name: "fe", create: true });
   const lease = await delivery.open(p, context(p));
   now += 20_000;
   await hosted.register(p, context(p), "second");
   await hosted.register(p, context(p), "first");
-  expect(database.repo.hosted.get(id)).toMatchObject({ ownership_id: ownership, lease_deadline: lease.expiresAt, last_seen_at: now });
-  expect(database.repo.hosted.all()).toHaveLength(3);
+  expect(await database.repo.hosted.get(database.repo.read, id)).toMatchObject({ ownership_id: ownership, lease_deadline: lease.expiresAt, last_seen_at: now });
+  expect(await database.repo.hosted.all(database.repo.read)).toHaveLength(3);
   now = lease.expiresAt + 1;
-  hosted.sweep();
-  expect(database.repo.hosted.all()).toHaveLength(0);
+  await hosted.sweep();
+  expect(hostedRowCount(database.db)).toBe(0);
+});
+
+test("a registration that arrives while its root rebinds waits for the bind and lands under the same ownership", async () => {
+  const { principal: p } = await issue();
+  await hosted.bind(p, context(p), { name: "fe", create: true });
+  const id = (context(p) as { id: string }).id;
+  const before = (await database.repo.hosted.get(database.repo.read, id))!;
+  let registering!: Promise<unknown>;
+  // The bind holds the root's gate; the registration starts (and reads the root) while it waits for it.
+  await hostedPause("hosted:owning:before-txn", () => hosted.bind(p, context(p), { name: "be", create: true }), async () => {
+    registering = hosted.register(p, context(p), "child");
+  });
+  await expect(registering).resolves.toMatchObject({ message: "registered" });
+  const root = (await database.repo.hosted.get(database.repo.read, id))!;
+  expect(root).toMatchObject({ ownership_id: before.ownership_id, bind_gen: before.bind_gen + 1 });
+  expect((await database.repo.hosted.all(database.repo.read)).find(row => row.source_session_id === "child")?.root_session_id).toBe(id);
 });
 
 test("successful new and idempotent registration refresh activity but refusals do not", async () => {
-  const first = issue(), second = issue(), p = first.principal;
+  const first = await issue(), second = await issue(), p = first.principal;
   await hosted.register(p, context(p), "first");
   const id = (context(p) as { id: string }).id;
   now += 899_000;
   await hosted.register(p, context(p), "second");
-  expect(database.repo.hosted.get(id)?.last_seen_at).toBe(now);
+  expect((await database.repo.hosted.get(database.repo.read, id))?.last_seen_at).toBe(now);
   now += 899_000;
   await hosted.register(p, context(p), "second");
-  expect(database.repo.hosted.get(id)?.last_seen_at).toBe(now);
+  expect((await database.repo.hosted.get(database.repo.read, id))?.last_seen_at).toBe(now);
   const active = now;
   now += 1_001;
-  hosted.sweep();
-  expect(database.repo.hosted.all()).toHaveLength(3);
+  await hosted.sweep();
+  // The root and "second" stay active; "first", idle since its registration, is parked (#566).
+  expect(await database.repo.hosted.all(database.repo.read)).toHaveLength(2);
+  expect(await database.repo.hosted.children(database.repo.read, id)).toHaveLength(2);
   await hosted.bind(p, context(p, "blocked"), { name: "blocked", create: true });
   await expect(hosted.register(second.principal, context(second.principal), "blocked")).rejects.toMatchObject({ code: "child_bound" });
-  expect(database.repo.hosted.get(id)?.last_seen_at).toBe(active);
-  expect(database.repo.hosted.get(id)?.grant_id).toBe(first.grantId);
+  expect((await database.repo.hosted.get(database.repo.read, id))?.last_seen_at).toBe(active);
+  expect((await database.repo.hosted.get(database.repo.read, id))?.grant_id).toBe(first.grantId);
   await hosted.end(p, context(p, "blocked"));
   now = active + 900_001;
-  hosted.sweep();
-  expect(database.repo.hosted.all()).toHaveLength(0);
+  await hosted.sweep();
+  expect(hostedRowCount(database.db)).toBe(0);
 });
 
 for (const operation of ["revoke", "bind"] as const) {
   test(`external ${operation} before receipt lock cannot consume an issued batch`, async () => {
-    const issued = issue(), { principal } = issued;
+    const issued = await issue(), { principal } = issued;
     await hosted.bind(principal, context(principal), { name: "fe", create: true });
     const lease = await delivery.open(principal, context(principal));
-    database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "must remain", null, false);
+    await seed(database.repo, tx => database.repo.messages.insert(tx, "sender@example.com/be", "user", "you@example.com/fe", "must remain", null, false));
     const batch = await delivery.pending(principal, context(principal), lease.capability);
     const receipt = hostedPause("hosted:receipt:before-txn", () => delivery.receipt(principal, context(principal), lease.capability, batch.map(item => item.id)), async () => {
       expect(external({ operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }).ok).toBe(true);
     });
     await expect(receipt).rejects.toHaveProperty("code", "not_found");
-    expect(database.repo.cursors.directFor("you@example.com/fe")).toBe(0);
+    expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(0);
   });
 
   test(`receipt lock precedes external ${operation}, consumes only the authorized batch`, async () => {
-    const issued = issue(), { principal } = issued;
+    const issued = await issue(), { principal } = issued;
     await hosted.bind(principal, context(principal), { name: "fe", create: true });
-    const message = database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false);
+    const message = await seed(database.repo, tx => database.repo.messages.insert(tx, "sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false));
     const results = await overlap({ operation: "receipt", principal }, { operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }, "hosted:receipt:in-txn");
-    expect(results.every(result => result.ok)).toBe(true);
-    expect(database.repo.cursors.directFor("you@example.com/fe")).toBe(message.id);
+    expect(results).toMatchObject([{ ok: true }, { ok: true }]);
+    expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(message.id);
   }, 15_000);
 }
 
 for (const child of [false, true]) test(`external rebind during native dispatch await fences old snapshot, child=${child}`, async () => {
-  const { principal } = issue();
+  const { principal } = await issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   if (child) await hosted.register(principal, context(principal), "child");
   let dispatched = false;
-  const call = hostedPause("hosted:tool:in-gate", () => hosted.run(principal, context(principal, child ? "child" : "root"), "peer_status", session => {
+  const call = hostedPause("hosted:tool:in-gate", () => hosted.run(principal, context(principal, child ? "child" : "root"), "peer_status", (session, tx) => {
     dispatched = true;
-    return application.call(session, "peer_status", { text: "stale write" });
+    return application.call(tx, session, "peer_status", { text: "stale write" });
   }), async () => { expect(external({ operation: "bind", principal, name: "be" }).ok).toBe(true); });
   await expect(call).rejects.toHaveProperty("code", "unbound");
   expect(dispatched).toBe(false);
@@ -214,47 +259,56 @@ for (const child of [false, true]) test(`external rebind during native dispatch 
 });
 
 test("two restarts retain ownership and deadline; downtime is credited; expiry releases exactly once", async () => {
-  const { principal } = issue();
+  const { principal } = await issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   await hosted.register(principal, context(principal), "child");
   const before = await hosted.whoami(principal, context(principal));
   const lease = await delivery.open(principal, context(principal));
-  close(); now += 5_000; open();
+  await close(); now += 5_000; await open();
   expect(await hosted.whoami(principal, context(principal))).toMatchObject(before);
   expect(database.db.query("SELECT address, id FROM alias_holds").all()).toEqual([{ address: "you@example.com/fe", id: (context(principal) as { id: string }).id }]);
   const reopened = await delivery.open(principal, context(principal));
   expect(reopened.ownership).toBe(lease.ownership);
   expect(reopened.capability).not.toBe(lease.capability);
-  close(); now += 5_000; open();
+  await close(); now += 5_000; await open();
   expect(releases()).toEqual([]);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='bound'").get()?.count).toBe(1);
   // Downtime longer than the TTL doesn't count against the lease (#423)...
-  close(); now += 31_000; open();
+  await close(); now += 31_000; await open();
   expect(releases()).toEqual([]);
-  expect(database.repo.hosted.all()).toHaveLength(2);
+  expect(await database.repo.hosted.all(database.repo.read)).toHaveLength(2);
   // ...but time while the server is up does.
-  now += 31_000; hosted.sweep();
-  expect(database.repo.hosted.all()).toEqual([]);
+  now += 31_000; await hosted.sweep();
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "expired" }]);
-  close(); open();
+  await close(); await open();
   expect(releases()).toEqual([{ detail: "expired" }]);
 });
 
 test("G2 ordinary writes do not attach, G1 revoke releases atomically including children", async () => {
-  const first = issue(), second = issue();
+  const first = await issue(), second = await issue();
   await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
   await hosted.register(first.principal, context(first.principal), "child");
   await hosted.run(second.principal, context(second.principal), "peer_status", () => true);
-  database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now);
-  expect(database.repo.hosted.all()).toEqual([]);
+  await seed(database.repo, tx => database.repo.oauth.revokeToken(tx, hashToken(first.refreshToken), OPENCODE_CLIENT, now));
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "revoked" }]);
-  expect(application.hostedHolder("you@example.com/fe")).toBeUndefined();
+  expect(await application.aliasHolderId(application.repo.read, "you@example.com/fe")).toBeNull();
   await hosted.bind(second.principal, context(second.principal), { name: "fe" });
   expect(await hosted.whoami(second.principal, context(second.principal, "child"))).toHaveProperty("unbound", true);
 });
 
+test("a reattach with no open lease audits no lease_closed (#387 item 15)", async () => {
+  const first = await issue(), second = await issue();
+  await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
+  await hosted.register(first.principal, context(first.principal), "child");
+  await hosted.register(second.principal, context(second.principal), "child");
+  expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.grant_attached'").get()?.count).toBe(1);
+  expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.lease_closed'").get()?.count).toBe(0);
+});
+
 test("successful G2 root registration reattaches once; G1 revoke cannot end it, disable does", async () => {
-  const first = issue(), second = issue();
+  const first = await issue(), second = await issue();
   await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
   await hosted.register(first.principal, context(first.principal), "child");
   const lease = await delivery.open(first.principal, context(first.principal));
@@ -263,41 +317,44 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   await expect(delivery.renew(first.principal, context(first.principal), lease.capability)).rejects.toHaveProperty("code", "not_found");
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.child_registered'").get()?.count).toBe(1);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.grant_attached'").get()?.count).toBe(1);
-  database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now);
+  expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.lease_closed'").get()?.count).toBe(1);
+  await seed(database.repo, tx => database.repo.oauth.revokeToken(tx, hashToken(first.refreshToken), OPENCODE_CLIENT, now));
   expect(await hosted.whoami(second.principal, context(second.principal))).toHaveProperty("primary", "you@example.com/fe");
   expect(releases()).toEqual([]);
-  database.repo.users.setDisabled(second.authed.user_id, true);
-  expect(database.repo.hosted.all()).toEqual([]);
+  await seed(database.repo, tx => database.repo.users.setDisabled(tx, second.authed.user_id, true));
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "disabled" }]);
-  expect(application.hostedHolder("you@example.com/fe")).toBeUndefined();
+  expect(await application.aliasHolderId(application.repo.read, "you@example.com/fe")).toBeNull();
 });
 
 test("opening a pre-hosted SQLite schema adds tables without changing users, messages or OAuth", async () => {
-  const first = issue();
-  database.repo.aliases.create({ scope_kind: "person", scope_ref: first.authed.user_email, name: "fe" }, first.authed.user_email);
-  const message = database.repo.messages.insert("you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
+  const first = await issue();
+  const message = await seed(database.repo, async tx => {
+    await database.repo.aliases.create(tx, { scope_kind: "person", scope_ref: first.authed.user_email, name: "fe" }, first.authed.user_email);
+    return await database.repo.messages.insert(tx, "you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
+  });
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
-  close(); open();
-  expect(database.repo.aliases.listForScope("person", first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
-  expect(database.repo.oauth.isGrantActive(first.grantId, now)).toBe(true);
+  await close(); await open();
+  expect((await database.repo.aliases.listForScope(database.repo.read, "person", first.authed.user_email)).map(row => row.name)).toEqual(["fe"]);
+  expect(await database.repo.oauth.isGrantActive(database.repo.read, first.grantId, now)).toBe(true);
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   await hosted.bind(first.principal, context(first.principal), { name: "fe" });
   expect(await hosted.whoami(first.principal, context(first.principal))).toHaveProperty("primary", "you@example.com/fe");
 });
 
 test("a database a v2.x release wrote, with a hosted root bound under its single name, opens and keeps that hold (#451)", async () => {
-  const first = issue();
+  const first = await issue();
   await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
   const id = (context(first.principal) as { id: string }).id;
   // The v2.x shape: the name on the row under its partial unique index, no writes_as, and the hold row its bind also wrote.
-  database.db.exec(`ALTER TABLE hosted_sessions DROP COLUMN writes_as; UPDATE hosted_sessions SET name = 'fe'; CREATE UNIQUE INDEX idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;`);
-  close(); open();
+  await seed(database.repo, () => { database.db.exec(`ALTER TABLE hosted_sessions DROP COLUMN writes_as; UPDATE hosted_sessions SET name = 'fe'; CREATE UNIQUE INDEX idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;`); });
+  await close(); await open();
   expect(database.db.query("SELECT name FROM hosted_sessions").get()).toEqual({ name: null });
   expect(database.db.query("SELECT 1 AS x FROM sqlite_master WHERE name = 'idx_hosted_name'").get()).toBeNull();
-  expect(application.hostedHolds(id)).toEqual(["you@example.com/fe"]);
+  expect((await application.hostedHolds(application.repo.read, id))).toEqual(["you@example.com/fe"]);
   expect(await hosted.whoami(first.principal, context(first.principal))).toMatchObject({ held: ["you@example.com/fe"], primary: "you@example.com/fe" });
   // A second open changes nothing.
-  close(); open();
-  expect(application.hostedHolds(id)).toEqual(["you@example.com/fe"]);
+  await close(); await open();
+  expect((await application.hostedHolds(application.repo.read, id))).toEqual(["you@example.com/fe"]);
 });

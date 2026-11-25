@@ -1,0 +1,142 @@
+// #807 P3 C1: the Postgres store stands alone. db.ts (the SQLite store) and bun:sqlite go when the SQLite server store is deleted (#808), so no module
+// under store/pg/ may reach either, directly or through the relative modules it imports (store/tx.ts, for
+// example, reaches bun:sqlite through core/sqlite.ts). Type-only imports are erased at build and don't count.
+import { expect, test } from "bun:test";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+
+const SRC = resolve(import.meta.dir, "../../..");
+const SQLITE_STORE = join(SRC, "server/db.ts");
+
+// The runtime import specifiers of a module: static imports and re-exports (less `import type`/`export type`),
+// side-effect imports and dynamic import().
+function runtimeImports(text: string): string[] {
+  const specs: string[] = [];
+  for (const m of text.matchAll(/^\s*(?:import|export)\s+(type\s+)?[^;'"]*?\bfrom\s*["']([^"']+)["']/gm)) {
+    if (!m[1]) specs.push(m[2]!);
+  }
+  for (const m of text.matchAll(/^\s*import\s*["']([^"']+)["']/gm)) specs.push(m[1]!);
+  for (const m of text.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) specs.push(m[1]!);
+  return specs;
+}
+
+// Every path from `roots` that reaches bun:sqlite or a `forbidden` module (by default the SQLite store), as
+// "a -> b -> spec" chains.
+function forbiddenReach(roots: string[], forbidden: ReadonlySet<string> = new Set([SQLITE_STORE])): string[] {
+  const offenders: string[] = [];
+  const seen = new Set<string>();
+  const visit = (file: string, chain: string[]) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    const here = [...chain, relative(SRC, file)];
+    for (const spec of runtimeImports(readFileSync(file, "utf8"))) {
+      if (spec === "bun:sqlite") { offenders.push([...here, spec].join(" -> ")); continue; }
+      if (!spec.startsWith(".")) continue;
+      const target = resolve(dirname(file), spec);
+      const path = existsSync(target) ? target : `${target}.ts`;
+      if (forbidden.has(path)) { offenders.push([...here, relative(SRC, path)].join(" -> ")); continue; }
+      if (!existsSync(path)) throw new Error(`${relative(SRC, file)}: unresolved import ${spec}`);
+      visit(path, here);
+    }
+  };
+  for (const r of roots) visit(r, []);
+  return offenders;
+}
+
+function pgModules(): string[] {
+  const out: string[] = [];
+  const walk = (d: string) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.ts$/.test(e.name) && !/\.(test|d)\.ts$/.test(e.name)) out.push(p);
+    }
+  };
+  walk(import.meta.dir);
+  return out.sort();
+}
+
+test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQLite store, even transitively", () => {
+  const roots = pgModules();
+  // The scan sees this directory's modules (a scan that read nothing would pass vacuously).
+  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "attachments.ts", "audit.ts", "audit_row.ts", "bindings.ts", "boards.ts", "claims.ts", "cursors.ts", "delegation.ts", "errors.ts", "hosted.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "session_end.ts", "slack.ts", "sql.ts", "tx.ts", "write_receipts.ts"]));
+  expect(forbiddenReach(roots)).toEqual([]);
+});
+
+test("the walk follows relative imports and skips type-only ones", () => {
+  // store/tx.ts reaches bun:sqlite through core/sqlite.ts: a pg module importing it at runtime must fail.
+  expect(forbiddenReach([join(SRC, "server/store/tx.ts")])).toEqual(["server/store/tx.ts -> core/sqlite.ts -> bun:sqlite"]);
+  // The neutral handle base a pg module may import (#807 P3 C2a): nothing at runtime.
+  expect(forbiddenReach([join(SRC, "server/store/tx_base.ts")])).toEqual([]);
+  // The hosted change notices both Repos compose (#807 P3 C11a): neutral, so the Postgres Repo carries no SQLite in.
+  expect(forbiddenReach([join(SRC, "server/store/notices.ts")])).toEqual([]);
+  // The identity groups' types and their Postgres implementation (#807 P3 C3): db.ts re-exports the types, never the
+  // other way round, and pg/identity.ts reaches core/addresses.ts and request_context.ts, neither of which reaches
+  // bun:sqlite.
+  expect(forbiddenReach([join(SRC, "server/store/identity.ts")])).toEqual([]);
+  expect(forbiddenReach([join(import.meta.dir, "identity.ts")])).toEqual([]);
+  // The OAuth input rules both stores run (#807 P3 C4a): pg/oauth.ts imports them, so they reach neither.
+  expect(forbiddenReach([join(SRC, "server/oauth-rules.ts")])).toEqual([]);
+  // The Postgres OAuth store (#807 P3 C4b) and what it reaches beyond the rules: oauth-config.ts (the scopes) and the
+  // audit row's request_context.ts.
+  expect(forbiddenReach([join(SRC, "server/oauth-config.ts")])).toEqual([]);
+  expect(forbiddenReach([join(import.meta.dir, "oauth.ts")])).toEqual([]);
+  // The aliases and messages groups' types, and the cap refusal both stores' callers run over the aliases group
+  // (#807 P3 C5a): the Postgres store and its contract runner import them.
+  expect(forbiddenReach([join(SRC, "server/store/aliases.ts")])).toEqual([]);
+  expect(forbiddenReach([join(SRC, "server/store/messages.ts")])).toEqual([]);
+  expect(forbiddenReach([join(SRC, "server/alias_cap.ts")])).toEqual([]);
+  // The cursors, write receipts, audit and Slack groups' types, and the NUL and surrogate replacement both stores' audit
+  // and progress writes run (#807 P3 C67a): the Postgres stores and their contract runners import them.
+  for (const m of ["cursors.ts", "write_receipts.ts", "audit.ts", "slack.ts", "json_safe.ts"]) expect(forbiddenReach([join(SRC, "server/store", m)])).toEqual([]);
+  // The bindings group's type (#807 P3 C10a-a), which the Postgres store (C10a-b) implements; and the IdCollision it
+  // throws, in core/errors.ts so a pg module can import it without reaching core/boards.ts.
+  expect(forbiddenReach([join(SRC, "server/store/bindings.ts")])).toEqual([]);
+  expect(forbiddenReach([join(SRC, "core/errors.ts")])).toEqual([]);
+  // The boards group's type (#807 P3 C10e-a), which the Postgres store (C10e1/C10e2) implements, and the MissingPost
+  // its insertPost throws (store/errors.ts, over core/errors.ts's text).
+  expect(forbiddenReach([join(SRC, "server/store/boards.ts")])).toEqual([]);
+  expect(forbiddenReach([join(SRC, "server/store/errors.ts")])).toEqual([]);
+  // The Postgres aliases and messages stores and the attachment rows they share with C10c (#807 P3 C5b), which restate
+  // core/boards.ts's and core/attachments.ts's SQL (those take a bun:sqlite Database and go with local mode).
+  for (const m of ["aliases.ts", "messages.ts", "attachment_rows.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
+  // The Postgres cursors, write receipts, audit and Slack stores (#807 P3 C67b), and the audit row they share with the
+  // other groups, which now reaches json_safe.ts.
+  for (const m of ["cursors.ts", "write_receipts.ts", "audit.ts", "slack.ts", "audit_row.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
+  // The hosted group's interface (#807 P3 C8a) and its Postgres store and ports (C8b1), which restate core's session-end
+  // and bindings SQL (or call the injected session end) and reach testpause.ts, which imports only node modules.
+  expect(forbiddenReach([join(SRC, "server/store/hosted.ts")])).toEqual([]);
+  // The auth cache (#807 P3 C9a), which the Postgres Repo composes over its own generation source (C11).
+  expect(forbiddenReach([join(SRC, "server/store/auth_cache.ts")])).toEqual([]);
+  // The attachments group's interface and its Postgres store (#807 P3 C10c), which restates core/attachments.ts's SQL.
+  for (const m of [join(SRC, "server/store/attachments.ts"), join(import.meta.dir, "attachments.ts")]) expect(forbiddenReach([m])).toEqual([]);
+  for (const m of ["hosted.ts", "hosted_port.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
+  // The session end and delegation groups' interfaces, the deliverability rule both stores run, and their Postgres stores
+  // (#807 P3 C10d1), which restate core/session_end.ts's, core/delegation.ts's and core/boards.ts's SQL.
+  for (const m of ["server/store/session_end.ts", "server/store/delegation.ts", "core/undeliverable.ts"]) expect(forbiddenReach([join(SRC, m)])).toEqual([]);
+  for (const m of ["session_end.ts", "delegation.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
+  // The claims group's interface, the holder rule both stores run, and the Postgres claims store (#807 P3 C10b), which
+  // restates core/claims.ts's SQL.
+  expect(forbiddenReach([join(SRC, "server/store/claims.ts")])).toEqual([]);
+  expect(forbiddenReach([join(SRC, "core/claim_holder.ts")])).toEqual([]);
+  expect(forbiddenReach([join(import.meta.dir, "claims.ts")])).toEqual([]);
+  // The Postgres bindings store (#807 P3 C10a-b), which restates core/bindings.ts's and core/boards.ts's SQL, and the
+  // text cleaners it shares with them, moved to core/text.ts so it can.
+  expect(forbiddenReach([join(SRC, "core/text.ts")])).toEqual([]);
+  expect(forbiddenReach([join(import.meta.dir, "bindings.ts")])).toEqual([]);
+  // The Postgres boards store (#807 P3 C10e1), which restates core/boards.ts's SQL and its board-name rule.
+  expect(forbiddenReach([join(import.meta.dir, "boards.ts")])).toEqual([]);
+  expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
+  expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
+    .toEqual(["../tx.ts", "./d.ts", "./e.ts", "../db.ts"]);
+});
+
+// #807 P3 C5 decision 11: the Postgres stores restate core's board and attachment SQL, the hosted store (C8b1) its
+// session-end and bindings SQL, and the claims store (C10b) its claim SQL. core/boards.ts, core/attachments.ts,
+// core/session_end.ts, core/bindings.ts and core/claims.ts run
+// statements on a bun:sqlite Database (type-only, so the walk above passes them); a pg module importing one at runtime,
+// directly or through a module that re-exports it, would be calling SQLite code with a Postgres handle.
+test("no non-test module under src/server/store/pg/ reaches core's boards, attachments, session-end, bindings or claims modules at runtime, even transitively", () => {
+  const core = new Set(["core/boards.ts", "core/attachments.ts", "core/session_end.ts", "core/bindings.ts", "core/claims.ts"].map(p => join(SRC, p)));
+  expect(forbiddenReach(pgModules(), core)).toEqual([]);
+});

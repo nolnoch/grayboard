@@ -1,18 +1,23 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
+import type { Principal } from "../core/resolver.ts";
 import type { Repo } from "./db.ts";
+import type { User } from "./store/identity.ts";
+import type { SignedIn } from "./policy.ts";
+import type { IdpRecheck } from "./idp_recheck.ts";
+import { atSite } from "./store/queue.ts";
 
-const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
-const GOOGLE_ISSUERS  = ["accounts.google.com", "https://accounts.google.com"];
-
-// jose handles JWKS caching internally (respects Cache-Control)
-const googleJwks = createRemoteJWKSet(new URL(GOOGLE_JWKS_URL));
-
+// The signed-in principal: its users row's id and name (an email, or a service's name), and its kind, read with the
+// row (#270 D1). Every check that keys on "a user is a person" reads `kind`.
 export type AuthedUser = {
   user_id: number;
   user_email: string;
+  kind: "user" | "service";
   session_id: number;
 };
+
+// The signed-in principal, as a scope rule (actIn) and a user-keyed verb (admin, team.*) take it: kind from the row.
+export const principalOfAuthed = (a: AuthedUser): Principal => ({ kind: a.kind, name: a.user_email });
+export const signedIn = (a: AuthedUser): SignedIn => ({ id: a.user_id, email: a.user_email, kind: a.kind });
 
 export function hashToken(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
@@ -27,6 +32,9 @@ export function mintToken(): string {
 // crash (the CI failure this fixes), so stop() cancels what is pending. The
 // queue is per-server: one startServer's stop() must not cancel a different
 // live server's touches in the same process (two TestServers in one test run).
+// cancelAll also closes the queue: a request still in flight when stop() runs
+// (one awaiting the OAuth handler, say) can verify a token after the cancel,
+// and its touch must not run against the closed database either (#385).
 export type TouchQueue = {
   schedule(run: () => void): void;
   cancelAll(): void;
@@ -34,8 +42,10 @@ export type TouchQueue = {
 
 export function createTouchQueue(): TouchQueue {
   const pending = new Set<NodeJS.Immediate>();
+  let closed = false;
   return {
     schedule(run: () => void): void {
+      if (closed) return;
       const t = setImmediate(() => {
         pending.delete(t);
         run();
@@ -43,77 +53,49 @@ export function createTouchQueue(): TouchQueue {
       pending.add(t);
     },
     cancelAll(): void {
+      closed = true;
       for (const t of pending) clearImmediate(t);
       pending.clear();
     },
   };
 }
 
-export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue): AuthedUser | null {
+// reauthDue (#930): the IdP last vouched for the user more than `days` ago, so their grants and CLI tokens stop
+// working until they sign in again. A service principal never signs in, so it's exempt. A null clock is due with an
+// issuer (a row a release without the column linked); with neither, no token can exist (the upgrade stamps every row,
+// sign-in and dev login stamp, unlink-idp keeps or zeroes the clock), so only a test fixture's row reads that way.
+export function reauthDue(user: Pick<User, "kind" | "idp_issuer" | "idp_checked_at">, now: number, days: number): boolean {
+  if (user.kind !== "user" || days <= 0) return false;
+  return user.idp_checked_at !== null ? user.idp_checked_at < now - days * 86_400_000 : user.idp_issuer !== null;
+}
+
+// Thrown by verifySessionToken when the IdP re-check couldn't get an answer past its stale bound (#930): the caller
+// answers 503 temporarily_unavailable, not 401, since the token isn't revoked and its user isn't disabled.
+export class IdpUnavailable extends Error {
+  constructor() { super("identity provider unreachable"); this.name = "IdpUnavailable"; }
+}
+
+// idleDays: a token unused that long is refused (security audit F-14); 0 never
+// expires one. Use, not age, so an agent that keeps working never loses its token.
+// reauth: the server's IdP re-check (#930 A2: the fallback clock, or a background directory check), or a bare
+// GRAYBOARD_IDP_REAUTH_DAYS (see reauthDue) where no provider has a directory check. Throws IdpUnavailable when the
+// re-check answers "unavailable".
+export async function verifySessionToken(
+  raw: string, repo: Repo, touches: TouchQueue, idleDays: number, reauth: number | Pick<IdpRecheck, "cliVerdict">,
+): Promise<AuthedUser | null> {
   const hash = hashToken(raw);
-  const session = repo.sessions.findByTokenHash(hash);
+  const session = await repo.sessions.findByTokenHash(repo.read, hash);
   if (!session) return null;
-  const user = repo.users.findById(session.user_id);
+  const user = await repo.users.findById(repo.read, session.user_id);
   if (session.revoked_at !== null || !user || user.disabled_at !== null) return null;
-  // Off the request path: last-used is a stamp, not a result the caller waits on.
-  touches.schedule(() => repo.sessions.touch(session.id, Date.now()));
-  return { user_id: session.user_id, user_email: user!.email, session_id: session.id };
-}
-
-export async function verifyGoogleIdToken(
-  idToken: string,
-  clientId: string,
-  allowedDomain: string,
-  options: { expectedNonce?: string; keyResolver?: JWTVerifyGetKey } = {},
-): Promise<{ email: string; displayName: string | null }> {
-  const { payload } = await jwtVerify(idToken, options.keyResolver ?? googleJwks, {
-    issuer: GOOGLE_ISSUERS,
-    audience: clientId,
-  });
-  if (typeof payload.exp !== "number" || typeof payload.iat !== "number" || typeof payload.sub !== "string" || !payload.sub ||
-      (payload.azp !== undefined && payload.azp !== clientId) ||
-      (Array.isArray(payload.aud) && payload.aud.length > 1 && payload.azp !== clientId)) throw new Error("invalid Google ID token claims");
-  if (payload["hd"] !== allowedDomain) {
-    throw new Error(`account must be from @${allowedDomain}`);
-  }
-  if (options.expectedNonce !== undefined && payload["nonce"] !== options.expectedNonce) throw new Error("invalid Google nonce");
-  if (typeof payload["email"] !== "string" || !payload["email"].trim()) throw new Error("invalid Google email");
-  if (payload["email_verified"] !== true) {
-    throw new Error("email is not verified");
-  }
-  const email = (payload["email"] as string).toLowerCase();
-  const displayName = typeof payload["name"] === "string" ? payload["name"] : null;
-  return { email, displayName };
-}
-
-export async function exchangeGoogleCode(
-  code: string,
-  codeVerifier: string,
-  redirectUri: string,
-  clientId: string,
-  clientSecret: string,
-  allowedDomain: string,
-  expectedNonce?: string,
-): Promise<{ email: string; displayName: string | null }> {
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    signal: AbortSignal.timeout(10_000),
-    body: new URLSearchParams({
-      client_id:     clientId,
-      client_secret: clientSecret,
-      code,
-      code_verifier: codeVerifier,
-      redirect_uri:  redirectUri,
-      grant_type:    "authorization_code",
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Google token exchange failed (${res.status}): ${body}`);
-  }
-  const { id_token } = (await res.json()) as { id_token: string };
-  return verifyGoogleIdToken(id_token, clientId, allowedDomain, { expectedNonce });
+  if (idleDays > 0 && repo.now() - session.last_used_at > idleDays * 86_400_000) return null;
+  const verdict = typeof reauth === "number" ? (reauthDue(user, repo.now(), reauth) ? "refuse" : "ok") : await reauth.cliVerdict(user);
+  if (verdict === "refuse") return null;
+  if (verdict === "unavailable") throw new IdpUnavailable();
+  // Off the request path: last-used is a stamp, not a result the caller waits on. Posted, so a touch that fires
+  // while another body holds the write queue waits behind it (#807).
+  touches.schedule(() => { atSite("session", () => repo.post(tx => repo.sessions.touch(tx, session.id, repo.now()), undefined, "session touch")); });
+  return { user_id: session.user_id, user_email: user!.email, kind: user!.kind, session_id: session.id };
 }
 
 export function extractBearer(req: Request): string | null {

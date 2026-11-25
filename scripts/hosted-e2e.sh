@@ -4,7 +4,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 package="$root/adapters/opencode-v2"
 : "${GRAYBOARD_E2E_RUN_DIR:?Run through scripts/e2e.sh}"
 : "${GRAYBOARD_EVIDENCE_PRIVATE:?Internal runner; use scripts/e2e.sh}"
-[[ "$(bun --version)" == 1.4.4 ]] || { echo "Bun 1.4.4 required" >&2; exit 1; }
+bun_version="$(tr -d '[:space:]' < "$root/.bun-version")"
+[[ -n "$bun_version" && "$(bun --version)" == "$bun_version" ]] || { echo "Bun $bun_version (.bun-version) required" >&2; exit 1; }
 # Retain logs/provenance, never upload the isolated HOME, auth store or databases.
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/grayboard-hosted.XXXXXX")"
 # A verification hook's Git environment must not redirect disposable package fixtures.
@@ -51,7 +52,7 @@ case "${1:-}" in
     printf '{"phase":"prepare","state":"started"}\n' > "$GRAYBOARD_MATRIX_OBSERVATIONS"
     PATH="$scratch/matrix-bin:$PATH" bun run test:host-races
     ;;
-  native) bun run test:native-host ;;
+  native) bun run test:native-host && bun run test:native-refresh ;;
   durable) bun run test:durable-host ;;
   config|public)
     public_revision=""

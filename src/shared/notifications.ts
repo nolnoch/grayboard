@@ -8,6 +8,9 @@ export type Post = {
   id: number;
   board: string;
   author: string;
+  // The child session (a harness subagent, #523) that wrote it under the
+  // author's address; absent for a root's own post.
+  via?: string;
   body: string;
   parent_id: number | null;
   created_at: number;
@@ -15,13 +18,43 @@ export type Post = {
   expires_at?: number | null;
   // Present on reads and pushes when the post carries files.
   attachments?: AttachmentInfo[];
+  // On a server's delivery to a session of another signed-in user than the
+  // writer's (security audit F-10), on a pushed post and on every read of one
+  // (#825); absent otherwise.
+  other_user?: true;
+  // On such a delivery when no grant lets the writer wake this session
+  // (security audit F-03, #806): shown, never a wake.
+  ungranted?: true;
 };
 
 export type Pending =
-  | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true }
+  // `claim`: the queue claim key (`queue:<board>:<post id>`) when the receiving address holds the post's queue claim
+  // (#1640): the key a decline releases, so the lane needn't look it up.
+  | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true; claim?: string }
   | { kind: "digest"; board: string; unread: number; latest: Post };
 
-export type DirectNotice = { id: number; sender: string; recipient?: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
+export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[]; other_user?: true; ungranted?: true; delegated?: true };
+
+/**
+ * A body made safe as `<channel>` content (#433, security audit F-07): the `<` of any
+ * `<channel` or `</channel`, any case and spacing, becomes `&lt;`, so a peer
+ * can't close its element or open a forged one with its own attributes
+ * (`human="true"`). Every other character stays as sent, and a second pass
+ * changes nothing. The pinned Claude Code escapes only a closing tag, so every
+ * path that hands Claude Code channel content applies this itself.
+ */
+export function fenceChannel(content: string): string {
+  return content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;");
+}
+
+/**
+ * How text for a person names a child writer (#523): the harness asserted
+ * which subagent wrote it, and nothing on the bus checks that, so the label
+ * says so. Channel meta carries the bare ID as `via`.
+ */
+export function viaLabel(via: string): string {
+  return `subagent ${via}, harness-asserted`;
+}
 
 // A message's or post's files, in its channel meta. attachment_get isn't
 // alwaysLoad, so the notification that carries files names it; one without
@@ -37,9 +70,13 @@ function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefin
 // `primary` (#284 S4): a one-address session pays nothing for it.
 export function dmNotification(msg: DirectNotice, primary?: string): { content: string; meta: Record<string, string> } {
   const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (msg.via) meta.via = msg.via;
   if (primary !== undefined && msg.recipient !== undefined && msg.recipient !== primary) meta.to = msg.recipient;
   if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
   if (msg.kind) meta.kind = msg.kind;
+  if (msg.other_user) meta.other_user = "true";
+  if (msg.ungranted) meta.ungranted = "true";
+  if (msg.delegated) meta.delegated = "true";
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }
@@ -55,14 +92,20 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
       reason: item.reason,
       created_at: String(p.created_at),
     };
+    if (p.via) meta.via = p.via;
     if (p.parent_id !== null) meta.parent_id = String(p.parent_id);
+    if (p.other_user) meta.other_user = "true";
+    if (p.ungranted) meta.ungranted = "true";
     addFiles(meta, p.attachments);
     if (item.deferred) meta.deferred = "true";
+    if (item.claim) meta.claim = item.claim;
     return { content: p.body, meta };
   }
   const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);
+  const from = item.latest.via ? `${item.latest.author} (${viaLabel(item.latest.via)})` : item.latest.author;
   return {
-    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${item.latest.author}: "${snippet}${item.latest.body.length > 160 ? "…" : ""}" Call board_read if it's relevant.`,
-    meta: { board: item.board, kind: "digest", unread: String(item.unread) },
+    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${from}: "${snippet}${item.latest.body.length > 160 ? "…" : ""}" Call board_read if it's relevant.`,
+    // The quoted latest post is marked like a pushed one.
+    meta: { board: item.board, kind: "digest", unread: String(item.unread), ...(item.latest.other_user ? { other_user: "true" } : {}) },
   };
 }

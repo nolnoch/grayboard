@@ -8,6 +8,10 @@ export type Configuration = { type: "remote"; url: string; issuer: string; clien
 // `held`: the root's holds as full addresses, oldest first; the first is the one it sends as (#451).
 export type Enrollment = { version: 2; sessionID: string; configuration: Configuration; held?: string[] };
 export type Delivery = { mode: "push" | "poll"; source: string };
+// A fact's three states (#558): a string is the value, `null` is "the host has none" (sent as an empty string, which
+// clears the server's), and absent is "unknown" (sent as nothing, which keeps it).
+export type SessionFacts = { model?: string | null; effort?: string | null };
+
 export interface KeyValueStorage { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void> }
 
 export interface HostPort<E extends Enrollment = Enrollment> {
@@ -17,6 +21,11 @@ export interface HostPort<E extends Enrollment = Enrollment> {
   readonly sessionKey: string;   // "ai.opencode/sessionID" | "io.github.nolnoch.grayboard/sessionID"
   readonly client: { name: string; version: string };
   readonly delivery?: Delivery;  // adapters only; OpenCode omits it
+  readonly launcher?: true;      // the harness can spawn subagents: every wire declares it, and the server turns the ownership's flag on (#473, #520)
+  // Optional: the session's current model and effort, read per request (#364). Omitted where the harness exposes none (Claude Code).
+  facts?(sessionID: string): SessionFacts | undefined;
+  // Optional: the name the harness suggests for the session (#443, #522), the repo's as local mode's is. Every wire sends it.
+  suggested?(sessionID: string): string | undefined;
   readonly storage: KeyValueStorage;
   place(): string;               // bind `where`; captured at construction, guard refuses once it differs
   ancestry(sessionID: string): Promise<SessionPath>; // {sessionID, root, via}; throws AncestryError
@@ -27,6 +36,10 @@ export interface HostPort<E extends Enrollment = Enrollment> {
   // `signal` is the run loop's: a host whose admit waits (Claude Code's
   // `initialized`) races it, so a stop releases the wait without a pause.
   admit(e: E, item: Item, stableID: string, identity: Identity, signal: AbortSignal): Promise<void>;
+  // Optional: the server committed the receipt for these item ids (an
+  // admission's `item.id`). A throw is reported to the diagnostic sink and
+  // never fails the run loop. OpenCode V2 and the Claude Code plugin omit it.
+  receipted?(e: E, ids: readonly string[]): void;
 }
 export interface CredentialPort<E extends Enrollment> {
   capture(sessionID: string): Promise<E>;            // a fresh enrollment for this root
@@ -34,14 +47,27 @@ export interface CredentialPort<E extends Enrollment> {
   watch(e: E, drift: () => void): Promise<{ dispose(): Promise<void> }>;
   token(e: E): Promise<string>;                       // current access token; throws AccessExpired only when a new login is needed
   unauthorized(e: E, token: string): Promise<void>;   // called on 401 for `token`; returns when the next token() may succeed, else throws
+  // Optional, for a host that rotates its own token (OpenCode): asks it to refresh e's expired access token now.
+  // The Controller calls it on each recovery attempt past the rotation grace (#661), and from the outage retries
+  // (run loop and restore) once the server answers with the expiry (#916); acting at most once per
+  // expiry, and only when that can't disturb the host, is the port's. Resolves true when it acted.
+  refresh?(e: E): Promise<boolean>;
+  // Optional, for a provider that refreshes its own token (pi, omp, Claude Code's Login; #1379): calls `changed`
+  // each time the access token it serves changes, its own refresh or another process's. The run loop then
+  // replaces its listen under the same lease, before the old token's expiry closes it. Omitted by a static run
+  // token, which never changes, and by a host that rotates its own token (OpenCode), which keeps the rotation grace.
+  rotated?(e: E, changed: () => void): { dispose(): void };
 }
 export interface ApprovalPort<E extends Enrollment> {
   key(e: E): string;                                   // OpenCode: enrollmentHash
-  // `roots`: every live root's sessionID, `e`'s included. The saved root list
-  // becomes exactly these, so a root restore dropped (ended, or edited) is pruned.
-  save(e: E, approval: E, enabled: boolean, roots: readonly string[]): Promise<void>;
+  // Writes `e`'s own saved record only. No call rewrites another root's record,
+  // so a concurrent save (another OpenCode location on the same plugin
+  // storage) can never drop it (#660).
+  save(e: E, approval: E, enabled: boolean): Promise<void>;
   approved(e: E, approval: E): Promise<boolean>;
   // Restore input, one entry per saved root; `approval: null` is a saved
   // record that no longer verifies (edited), which restore reports and skips.
   saved(): Promise<Array<{ sessionID: string; approval: E | null; enabled: boolean }>>;
+  // Deletes the saved record of a root whose session has ended.
+  drop(sessionID: string): Promise<void>;
 }

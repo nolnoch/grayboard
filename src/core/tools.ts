@@ -4,8 +4,11 @@
 import type { Database } from "bun:sqlite";
 
 import {
+  archiveBoard,
   canSeeBoard,
   createBoard,
+  createdNote,
+  createRepeats,
   getBoard,
   listBoards,
   muteThread,
@@ -16,6 +19,8 @@ import {
   setStatus,
   subscribe,
   viewers,
+  mentionTokens,
+  seenHandles,
   parseMatch,
   who,
   type BoardPredicate,
@@ -24,12 +29,12 @@ import {
 } from "./boards.ts";
 import { addressParts } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
-import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
+import { alreadyReleasedText, claim, listClaims, release, releasedText, watch, type Claim, type TakeOpts } from "./claims.ts";
 import { attachmentIds, type FileSend } from "./attachments.ts";
-import { ATTACHMENTS_PARAM, type AttachmentInfo } from "../shared/attachments.ts";
+import { ATTACHMENTS_PARAM, ATTACHMENT_IDS_PARAM, type AttachmentInfo } from "../shared/attachments.ts";
 import type { Post } from "../shared/notifications.ts";
 import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
-import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
+import { DM_INBOX_INSTRUCTION, PENDING_PARAM } from "../shared/inbox.ts";
 
 export type ToolDef = {
   name: string;
@@ -48,7 +53,75 @@ export const RESEND_PARAM = { type: "boolean", description: `true sends again ev
 // On the writes a session can make as another of its addresses (#284 S3).
 export const AS_PARAM = { type: "string", description: "Optional. Act as another of your addresses: an alias you hold, or your session ID." };
 
-export function boardTools(opts: { teams: boolean }): ToolDef[] {
+// How a write names its files: local paths it reads (local mode), or the IDs
+// of files already uploaded over the attachment HTTP API (a server's hosted MCP).
+export type AttachmentForm = "paths" | "ids";
+const attachmentParam = (form: AttachmentForm) =>
+  form === "ids" ? { attachment_ids: ATTACHMENT_IDS_PARAM } : { attachments: ATTACHMENTS_PARAM };
+
+// A message ID: hosted MCP validates arguments against the schema, so 0, -1
+// or 1.5 is refused before it reaches a handler.
+const messageId = (description: string) => ({ type: "integer", exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER, description });
+
+// dm_send, dm_history and dm_thread, served by both modes (#385); dm_inbox,
+// dm_ack and dm_retract are in src/shared/inbox.ts. Each surface implements them.
+export function dmTools(opts: { attachments: AttachmentForm }): ToolDef[] {
+  const files = opts.attachments === "ids" ? "attachment_ids" : "attachments";
+  return [
+    {
+      name: "dm_send",
+      // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
+      // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
+      _meta: { "anthropic/alwaysLoad": true },
+      description: `dm_send(to, body, parent_id?, pending?, ${files}?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          to: {
+            type: "string",
+            description: opts.attachments === "ids"
+              ? "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
+              : "The peer's exact handle, as peer_list shows it.",
+          },
+          body: { type: "string", description: "Message body. Plain text or markdown." },
+          parent_id: messageId("Optional. message_id this is replying to; sets the thread parent."),
+          pending: PENDING_PARAM,
+          ...attachmentParam(opts.attachments),
+          resend: RESEND_PARAM,
+          as: AS_PARAM,
+        },
+        required: ["to", "body"],
+      },
+    },
+    {
+      name: "dm_history",
+      description:
+        "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session; delivered_at: when it was handed to the recipient's harness.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          peer: { type: "string", description: "Optional. Only return messages between you and this peer identity." },
+          limit: { type: "number", description: "Max messages to return (default 20, max 200)." },
+          before_id: messageId("Return messages with id strictly less than this; use for pagination."),
+        },
+      },
+    },
+    {
+      name: "dm_thread",
+      _meta: { "anthropic/alwaysLoad": true },
+      description:
+        "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
+      inputSchema: {
+        type: "object",
+        properties: { thread: messageId("Any message_id in the thread.") },
+        required: ["thread"],
+      },
+    },
+  ];
+}
+
+export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }): ToolDef[] {
+  const files = opts.attachments === "ids" ? "attachment_ids" : "attachments";
   return [
     {
       name: "board_list",
@@ -83,17 +156,30 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       },
     },
     {
+      name: "board_archive",
+      description:
+        "board_archive(board, archived?): retire a board you created once its work is done: it leaves board_list and takes no new top-level posts, while replies, reads by name and subscriptions go on. archived false reopens it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          board: BOARD,
+          archived: { type: "boolean", description: "Default true; false reopens the board." },
+        },
+        required: ["board"],
+      },
+    },
+    {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?, attachments?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+        `board_post(board, body, parent_id?, ${files}?, resend?, as?): ` + "post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
           board: BOARD,
           body: { type: "string", description: "Plain text or markdown." },
           parent_id: { type: "number", description: "Optional. post_id to reply to." },
-          attachments: ATTACHMENTS_PARAM,
+          ...attachmentParam(opts.attachments),
           resend: RESEND_PARAM,
           as: AS_PARAM,
         },
@@ -219,7 +305,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
   ];
 }
 
-const NAMES = new Set(boardTools({ teams: true }).map((t) => t.name));
+const NAMES = new Set(boardTools({ teams: true, attachments: "paths" }).map((t) => t.name));
 
 export function isBoardTool(name: string): boolean {
   return NAMES.has(name);
@@ -312,25 +398,30 @@ export function channelInstructions(source: string): string[] {
 }
 
 // Tool args arrive as untrusted JSON (from an MCP client, or over the wire).
-function str(a: Record<string, unknown>, k: string): string {
+export function str(a: Record<string, unknown>, k: string): string {
   const v = a[k];
   if (typeof v !== "string") throw new CoreError(`${k} must be a string`);
   return v;
 }
-function optStr(a: Record<string, unknown>, k: string): string | undefined {
+export function optStr(a: Record<string, unknown>, k: string): string | undefined {
   return a[k] === undefined || a[k] === null ? undefined : str(a, k);
 }
-function optBool(a: Record<string, unknown>, k: string): boolean | undefined {
+export function optBool(a: Record<string, unknown>, k: string): boolean | undefined {
   const v = a[k];
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "boolean") throw new CoreError(`${k} must be a boolean`);
   return v;
 }
-function optNum(a: Record<string, unknown>, k: string): number | undefined {
+export function optNum(a: Record<string, unknown>, k: string): number | undefined {
   const v = a[k];
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "number" || !Number.isFinite(v)) throw new CoreError(`${k} must be a number`);
   return v;
+}
+
+/** claim_take's arguments, read in the order both modes check them. */
+export function claimTakeArgs(a: Record<string, unknown>): TakeOpts & { key: string } {
+  return { key: str(a, "key"), ttl_minutes: optNum(a, "ttl_minutes"), until: optStr(a, "until"), note: optStr(a, "note"), board: optStr(a, "board") };
 }
 
 export type ToolOutcome = { result: unknown; wake: string[]; boards?: string[] };
@@ -352,6 +443,9 @@ export type BoardPostResult = {
 // `human`: the caller is the Slack bridge's human, exempt from #254's
 // answers from state.
 // `session`: the calling session's ID, recorded on its posts (#284).
+// `via`: set when that session is a child (#523), a harness subagent acting
+// under its root's addresses: recorded on its posts beside `session`. Its
+// board_read peeks: the root's cursors and pending pushes are left as they were.
 // `addresses`: the caller's address set, `handle` the one it acts as (#284 S5);
 // claims held by any of them are the caller's. Default [handle].
 export type ToolContext = {
@@ -360,12 +454,48 @@ export type ToolContext = {
   unbound?: UnboundPeer[];
   human?: boolean;
   session?: string;
+  via?: string;
+  // The caller's signed-in user, on a server: recorded on its posts (author_user).
+  user?: string;
   addresses?: string[];
-  // A reader with no address (an unbound hosted session): board_list,
-  // board_read, claim_list and peer_list judge board visibility by it
-  // instead of `handle`, and touch no cursor.
+  // A reader with no address: board_list, board_read, claim_list and
+  // peer_list judge board visibility by it instead of `handle`, and touch no
+  // cursor. Neither mode sets it now: the server judges an unbound hosted
+  // session by its principal in its own port (src/server/boards.ts, #807 P3
+  // B5b1b), and the port's parity test sets it as core's reference answer.
   reader?: BoardPredicate;
 };
+
+/** peer_status's arguments, checked in its order: the queue flag, then the text (read, not yet cleaned). */
+export function peerStatusArgs(a: Record<string, unknown>, handle: string): { text: string; queue?: "on" | "off" } {
+  const queue = optStr(a, "queue");
+  if (queue !== undefined && queue !== "on" && queue !== "off") {
+    throw new CoreError(`queue must be "on" or "off"`);
+  }
+  // The opt-out is a name's flag (#284 S13); an ID leaves a rotation by leaving push (#340 2).
+  if (queue !== undefined && addressParts(handle)?.kind === "id") {
+    throw new CoreError(`queue opt-out is a name's; bind(name) first, or board_subscribe(board, "quiet") to leave that board's rotation`);
+  }
+  return { text: str(a, "text"), ...(queue !== undefined ? { queue } : {}) };
+}
+
+/**
+ * board_subscribe's arguments: with `thread`, mode must be off (mute) or push (unmute); the board is read as given.
+ * The mode itself is checked by the write (setSubscription), after the board's visibility.
+ */
+export function subscribeArgs(a: Record<string, unknown>): { board: string; mode: SubMode | "off"; thread?: number } {
+  const mode = str(a, "mode") as SubMode | "off";
+  const thread = optNum(a, "thread");
+  if (thread !== undefined && mode !== "off" && mode !== "push") {
+    throw new CoreError('with thread, mode is "off" (mute its replies) or "push" (unmute)');
+  }
+  return { board: str(a, "board"), mode, ...(thread !== undefined ? { thread } : {}) };
+}
+
+export const muteText = (board: string, root: number, muted: boolean): string =>
+  `ok: #${normalizeBoard(board)} thread ${root} ${muted ? "muted (@mentions still reach you)" : "unmuted"}`;
+
+export const subscribedText = (board: string, mode: SubMode | "off"): string => `ok: #${board.replace(/^#/, "").toLowerCase()} → ${mode}`;
 
 export function callBoardTool(
   db: Database,
@@ -392,14 +522,16 @@ export function callBoardTool(
       // treats success as a fresh create.
       const name = normalizeBoard(str(a, "name"));
       const mine = ctx.human ? undefined : getBoard(db, name);
-      if (
-        mine && mine.created_by === handle && mine.scope === scope && (mine.kind ?? "broadcast") === (kind ?? "broadcast") &&
-        mine.purpose === str(a, "purpose").trim() && canSeeBoard(db, handle, name)
-      ) {
-        return { result: { ...mine, note: `you created #${name} at ${new Date(mine.created_at).toISOString()}` }, wake: [] };
+      if (createRepeats(mine, handle, scope, kind, () => str(a, "purpose")) && canSeeBoard(db, handle, name)) {
+        return { result: createdNote(mine!), wake: [] };
       }
       const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), scope, { kind });
       return { result: b, wake: [], boards: [b.name] };
+    }
+
+    case "board_archive": {
+      const { board, note } = archiveBoard(db, handle, str(a, "board"), optBool(a, "archived") ?? true, { addresses: ctx.addresses, human: ctx.human });
+      return { result: note ? { ...board, note } : board, wake: [], ...(note ? {} : { boards: [board.name] }) };
     }
 
     case "board_post": {
@@ -412,17 +544,9 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
+        { online: ctx.online, author_id: ctx.session, author_user: ctx.user, via: ctx.via, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
       );
-      const isViewer = viewers(db);
-      const result: BoardPostResult = {
-        post_id: p.id,
-        board: p.board,
-        ...(p.attachments ? { attachments: p.attachments } : {}),
-        notified: wake.filter((h) => !isViewer(h)),
-        ...(deferred.length ? { deferred } : {}),
-        ...(unresolved.length ? { unresolved } : {}),
-      };
+      const result = boardPostResult(p, { wake, deferred, unresolved }, str(a, "body"), viewers(db), (hs) => seenHandles(db, ctx.session ?? handle, hs));
       return { result, wake, boards: [p.board] };
     }
 
@@ -431,39 +555,28 @@ export function callBoardTool(
         limit: optNum(a, "limit"),
         before_id: optNum(a, "before_id"),
         thread: optNum(a, "thread"),
+        peek: ctx.via !== undefined,
       });
       // Claims announced here stay in front of anyone reading the board.
-      const held = listClaims(db).filter((c) => c.board === r.board);
+      const held = listClaims(db, undefined, ctx.reader ?? handle, ctx.session ?? handle).filter((c) => c.board === r.board);
       return { result: held.length ? { ...r, active_claims: held } : r, wake: [] };
     }
 
     case "peer_status": {
-      const queue = optStr(a, "queue");
-      if (queue !== undefined && queue !== "on" && queue !== "off") {
-        throw new CoreError(`queue must be "on" or "off"`);
-      }
-      // The opt-out is a name's flag; an ID is always in its queues' rotation.
-      if (queue !== undefined && addressParts(handle)?.kind === "id") {
-        throw new CoreError(`queue opt-out is a name's; bind(name) first, or leave queue unset`);
-      }
-      setStatus(db, handle, str(a, "text"));
+      const { text, queue } = peerStatusArgs(a, handle);
+      setStatus(db, handle, text);
       if (queue !== undefined) setQueueParticipation(db, handle, queue === "on");
       return { result: "ok", wake: [] };
     }
 
     case "board_subscribe": {
-      const mode = str(a, "mode") as SubMode | "off";
-      const thread = optNum(a, "thread");
-      if (thread !== undefined) {
-        if (mode !== "off" && mode !== "push") {
-          throw new CoreError('with thread, mode is "off" (mute its replies) or "push" (unmute)');
-        }
-        const root = muteThread(db, handle, str(a, "board"), thread, mode === "off");
-        const state = mode === "off" ? "muted (@mentions still reach you)" : "unmuted";
-        return { result: `ok: #${normalizeBoard(str(a, "board"))} thread ${root} ${state}`, wake: [] };
+      const s = subscribeArgs(a);
+      if (s.thread !== undefined) {
+        const root = muteThread(db, handle, s.board, s.thread, s.mode === "off");
+        return { result: muteText(s.board, root, s.mode === "off"), wake: [] };
       }
-      subscribe(db, handle, str(a, "board"), mode);
-      return { result: `ok: #${str(a, "board").replace(/^#/, "").toLowerCase()} → ${mode}`, wake: [] };
+      subscribe(db, handle, s.board, s.mode);
+      return { result: subscribedText(s.board, s.mode), wake: [] };
     }
 
     case "peer_list": {
@@ -479,13 +592,13 @@ export function callBoardTool(
     }
 
     case "claim_take": {
-      const r = claim(db, handle, str(a, "key"), {
-        ttl_minutes: optNum(a, "ttl_minutes"),
-        until: optStr(a, "until"),
-        note: optStr(a, "note"),
-        board: optStr(a, "board"),
+      const { key, ...take } = claimTakeArgs(a);
+      const r = claim(db, handle, key, {
+        ...take,
         addresses: ctx.addresses,
         session: ctx.session,
+        via: ctx.via,
+        user: ctx.user,
       });
       const { wake, boards, ...rest } = r;
       return { result: rest, wake, boards };
@@ -493,15 +606,41 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake, boards, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session });
-      return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake, boards };
+      const { wake, boards, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user });
+      return { result: releasedAt === undefined ? releasedText(key) : alreadyReleasedText(releasedAt), wake, boards };
     }
 
     case "claim_watch":
-      return { result: watch(db, handle, str(a, "key"), optBool(a, "off"), ctx.addresses), wake: [] };
+      return { result: watch(db, handle, str(a, "key"), optBool(a, "off"), ctx.addresses, ctx.session ?? handle), wake: [] };
 
     case "claim_list":
-      return { result: listClaims(db, optStr(a, "prefix"), ctx.reader ?? handle), wake: [] };
+      return { result: listClaims(db, optStr(a, "prefix"), ctx.reader ?? handle, ctx.session ?? handle), wake: [] };
   }
   throw new CoreError(`unknown tool: ${name}`);
+}
+
+/**
+ * board_post's answer from post's: the result names only recipients the poster may see exist (#348), through `seen`
+ * (seenHandles' filter, order kept), and no viewers among those notified.
+ */
+export function boardPostResult(
+  p: Post,
+  out: { wake: string[]; deferred: string[]; unresolved: string[] },
+  body: string,
+  isViewer: (h: string) => boolean,
+  seen: (handles: string[]) => string[],
+): BoardPostResult {
+  const shownDeferred = seen(out.deferred);
+  // A mention of a name the poster may not see exists reads as one that matched nobody, in its place (#871);
+  // delivery is unchanged: a post's result shows no per-recipient state, unlike a DM's, which is refused (#1014).
+  const missed = new Set(out.unresolved);
+  const shownUnresolved = mentionTokens(body).filter((t) => missed.has(t) || seen([t]).length === 0);
+  return {
+    post_id: p.id,
+    board: p.board,
+    ...(p.attachments ? { attachments: p.attachments } : {}),
+    notified: seen(out.wake.filter((h) => !isViewer(h))),
+    ...(shownDeferred.length ? { deferred: shownDeferred } : {}),
+    ...(shownUnresolved.length ? { unresolved: shownUnresolved } : {}),
+  };
 }

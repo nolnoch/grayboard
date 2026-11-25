@@ -1,14 +1,22 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { gateCount, GATE_METHODS, type GateMethod, refusalCount } from "./metrics.ts";
+import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
+import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
+import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { createDelivery, type DeliveryPrincipal } from "./delivery.ts";
-import { createHostedSessions, sessionContext } from "./hosted.ts";
+import { createHostedSessions, sessionContext, type SessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { openDatabase } from "./db.ts";
-import { createBoard, post, subscribe } from "../core/boards.ts";
+import { sessionEndPort } from "./session_end.ts";
+import { createBoard, post, subscribe, openAccess, setAccess } from "../core/boards.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
+import { liveGrants } from "../../tests/support/grants.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -21,23 +29,27 @@ let dir: string;
 let now: number;
 let authorized: boolean;
 const context = (p: DeliveryPrincipal, raw = "root") => sessionContext(p, { [OPENCODE_SESSION_META]: raw });
+// The caller's row for describe, as a request's authorize reads it (#807 P3 A7h2: describe reads none of its own).
+const checked = async (c: SessionContext) => ({ row: "id" in c ? await store.repo.hosted.get(store.repo.read, c.id) : undefined });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-delivery-"));
-  store = openDatabase(":memory:", { blobDir: dir });
-  application = createApplication(store.repo, store.db);
-  const principal = (email: string): DeliveryPrincipal => {
-    const user = store.repo.users.upsertByEmail(email, null);
-    return { authed: { user_id: user.id, user_email: email, session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
+  store = openDatabase(scratchDbPath(), { blobDir: dir , sessionEnd: sessionEndPort("team") });
+  setAccess(store.db, openAccess(store.db)); // core seeds on a server database opt in to local mode's open Access
+  application = createApplication(store.repo);
+  const principal = async (email: string): Promise<DeliveryPrincipal> => {
+    const user = await seed(store.repo, tx => store.repo.users.upsertByEmail(tx, email, null));
+    await liveGrants(store.repo, user.id, [`grant:${user.id}`, "G2"]);
+    return { authed: { user_id: user.id, user_email: email, kind: "user", session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
   };
-  alice = principal("alice@example.com"); bob = principal("bob@example.com");
+  alice = await principal("alice@example.com"); bob = await principal("bob@example.com");
   now = Date.now(); authorized = true;
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
-  sender = new AppSession(application, alice.authed, "be", { push: false });
+  sender = new AppSession(application, store.repo, alice.authed, "be", { push: false });
   await sender.connect();
   await hosted.bind(bob, context(bob), { name: "fe", create: true });
 });
-afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
+afterEach(async () => { delivery.close(); await hosted.close(); await application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
 const send = async (body = "hello", pending = false) => (await sender.send("bob@example.com/fe", body, { pending })).message_id;
 
 test("stale receipt audit survives rollback exactly once without committing any cursor", async () => {
@@ -45,7 +57,7 @@ test("stale receipt audit survives rollback exactly once without committing any 
   await send();
   const items = await delivery.pending(bob, context(bob), lease.capability);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id, "direct:99999"])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
   const rows = store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action = 'hosted.stale_capability'").all();
   expect(rows).toHaveLength(1);
   expect(rows[0]!.actor).toBe(bob.authed.user_email);
@@ -53,6 +65,30 @@ test("stale receipt audit survives rollback exactly once without committing any 
   expect(JSON.stringify(rows)).not.toContain(lease.capability);
   await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
   expect(store.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
+});
+
+// #1537 PR 0: each hosted call's gate body is counted under its own method (SQLite: every gate body is `skipped`), so
+// the subscriber calls' second gate (control) is told from the exchange's selection. Mutation: control's or owning's
+// method dropped (counted under `control` or `owning`); snapshot's (counted under `tool`).
+test("the gate counter labels each call's gate body by method: selection, open, renew, pending, receipt, release, whoami", async () => {
+  const at = Object.fromEntries(GATE_METHODS.map(m => [m, gateCount("gate", "skipped", m)])) as Record<GateMethod, number>;
+  const counted = () => Object.fromEntries(GATE_METHODS.map(m => [m, gateCount("gate", "skipped", m) - at[m]]).filter(([, n]) => n !== 0));
+  await hosted.snapshot(bob, context(bob));
+  const lease = await delivery.open(bob, context(bob));
+  await delivery.renew(bob, context(bob), lease.capability);
+  await send();
+  const items = await delivery.pending(bob, context(bob), lease.capability);
+  await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
+  await hosted.whoami(bob, context(bob));
+  await delivery.release(bob, context(bob), lease.capability);
+  expect(counted()).toEqual({ selection: 1, open: 1, renew: 1, pending: 1, receipt: 1, whoami: 1, release: 1 });
+});
+
+test("shutdown detaches each accepted lease with one hosted.lease_detached row naming its session (#424)", async () => {
+  const lease = await delivery.open(bob, context(bob)); delivery.accept(lease);
+  delivery.close();
+  const rows = store.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'hosted.lease_detached'").all();
+  expect(rows.map(r => [r.actor, r.target, JSON.parse(r.detail)])).toEqual([[bob.authed.user_email, (await store.repo.hosted.all(store.repo.read))[0]!.session_id, { reason: "shutdown", client_id: OPENCODE_CLIENT }]]);
 });
 
 test("a DM to the session's own ID is pushed unstamped, an alias DM carries its alias (#451: the client checks held addresses only)", async () => {
@@ -91,7 +127,7 @@ test("canceling duplicate open preserves accepted lease, children, receipts and 
   const duplicate = await delivery.open(bob, context(bob), { changed: () => { duplicateHints++; } });
   await delivery.cancel(duplicate);
   expect(delivery.activeLeaseCount).toBe(1);
-  expect(store.repo.hosted.all()).toHaveLength(2);
+  expect(await store.repo.hosted.all(store.repo.read)).toHaveLength(2);
   expect(originalHints).toBe(1);
   await send("next message");
   expect(originalHints).toBe(2); expect(duplicateHints).toBe(0);
@@ -105,7 +141,7 @@ test("successful reuse fences older creator cancellation; canceled reuse does no
   delivery.accept(reuse);
   await delivery.cancel(creator);
   expect(delivery.activeLeaseCount).toBe(1);
-  expect(delivery.describe(bob, context(bob), reuse.capability).capability).toBe(creator.capability);
+  expect(delivery.describe(bob, context(bob), reuse.capability, await checked(context(bob))).capability).toBe(creator.capability);
   await delivery.release(bob, context(bob), reuse.capability);
   await hosted.bind(bob, context(bob), { name: "fe" });
   const next = await delivery.open(bob, context(bob));
@@ -114,7 +150,7 @@ test("successful reuse fences older creator cancellation; canceled reuse does no
   expect(delivery.activeLeaseCount).toBe(1);
   await delivery.cancel(canceledReuse);
   expect(delivery.activeLeaseCount).toBe(0);
-  expect(store.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(store.db)).toBe(0);
 });
 
 test("old attempt cancellation cannot end a replacement generation or ownership", async () => {
@@ -122,12 +158,12 @@ test("old attempt cancellation cannot end a replacement generation or ownership"
   await hosted.bind(bob, context(bob), { name: "new", create: true });
   const current = await delivery.open(bob, context(bob)); delivery.accept(current);
   await delivery.cancel(old);
-  expect(delivery.describe(bob, context(bob), current.capability).bind_gen).toBeGreaterThan(old.bind_gen);
+  expect(delivery.describe(bob, context(bob), current.capability, await checked(context(bob))).bind_gen).toBeGreaterThan(old.bind_gen);
   await delivery.release(bob, context(bob), current.capability);
   await hosted.bind(bob, context(bob), { name: "new" });
   const replacement = await delivery.open(bob, context(bob)); delivery.accept(replacement);
   await delivery.cancel(current);
-  expect(delivery.describe(bob, context(bob), replacement.capability).ownership).not.toBe(current.ownership);
+  expect(delivery.describe(bob, context(bob), replacement.capability, await checked(context(bob))).ownership).not.toBe(current.ownership);
 });
 
 test("reads repeat without admission; receipt and dm_ack remain distinct", async () => {
@@ -138,23 +174,23 @@ test("reads repeat without admission; receipt and dm_ack remain distinct", async
   const pending = await delivery.pending(bob, context(bob), lease.capability);
   expect(pending.map(p => p.id)).toEqual([`direct:${first}`, `direct:${second}`]);
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual(pending);
-  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
   await delivery.receipt(bob, context(bob), lease.capability, pending.map(p => p.id));
   await delivery.receipt(bob, context(bob), lease.capability, pending.map(p => p.id));
-  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(second);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(second);
   expect((await sender.inbox()).promised).toHaveLength(1);
 });
 
 test("only an issued contiguous direct prefix advances MAX cursor, ignoring global gaps", async () => {
   const lease = await delivery.open(bob, context(bob));
   await send("first");
-  store.repo.messages.insert("alice@example.com/be", "user", "alice@example.com/be", "gap", null, false);
+  await seed(store.repo, tx => store.repo.messages.insert(tx, "alice@example.com/be", "user", "alice@example.com/be", "gap", null, false));
   await send("second");
   const items = await delivery.pending(bob, context(bob), lease.capability);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[1]!.id])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id, "direct:99999"])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
   await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
   await delivery.receipt(bob, context(bob), lease.capability, items.map(i => i.id));
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
@@ -170,7 +206,7 @@ test("foreign principal, grant, session, and unissued receipt have no authority"
   }
   items[0]!.id = "direct:99999";
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
 });
 
 test("renew is fenced and extends sticky deadline, reopening is idempotent", async () => {
@@ -178,18 +214,18 @@ test("renew is fenced and extends sticky deadline, reopening is idempotent", asy
   expect((await delivery.open(bob, context(bob))).capability).toBe(lease.capability);
   now += 10_000;
   expect((await delivery.renew(bob, context(bob), lease.capability)).expiresAt).toBe(now + 30_000);
-  now += 29_999; hosted.sweep();
+  now += 29_999; await hosted.sweep();
   expect(delivery.activeLeaseCount).toBe(1);
-  now += 1; hosted.sweep();
+  now += 1; await hosted.sweep();
   expect(delivery.activeLeaseCount).toBe(0);
-  expect(store.repo.hosted.all()).toHaveLength(0);
+  expect(hostedRowCount(store.db)).toBe(0);
 });
 
 test("shutdown leaves ownership and deadline durable; reopen retains ownership", async () => {
   const lease = await delivery.open(bob, context(bob));
-  delivery.close(); hosted.close();
+  delivery.close(); await hosted.close();
   now += 10_000;
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
   expect(await hosted.whoami(bob, context(bob))).toHaveProperty("ownership", lease.ownership);
   const reopened = await delivery.open(bob, context(bob));
@@ -202,15 +238,15 @@ test("explicit release ends ownership and closes all children", async () => {
   await hosted.register(bob, context(bob), "child");
   const lease = await delivery.open(bob, context(bob));
   await delivery.release(bob, context(bob), lease.capability);
-  expect(store.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(store.db)).toBe(0);
   await expect(delivery.renew(bob, context(bob), lease.capability)).rejects.toHaveProperty("code", "not_found");
   await hosted.bind(bob, context(bob), { name: "fe" });
   expect(await hosted.whoami(bob, context(bob))).not.toHaveProperty("ownership", lease.ownership);
 });
 
 test("cross application-level/hosted holders share one exclusion path", async () => {
-  await expect(new AppSession(application, bob.authed, "fe").connect()).rejects.toHaveProperty("code", "alias_held");
-  const holder = new AppSession(application, bob.authed, "be");
+  await expect(new AppSession(application, store.repo, bob.authed, "fe").connect()).rejects.toHaveProperty("code", "alias_held");
+  const holder = new AppSession(application, store.repo, bob.authed, "be");
   await holder.connect();
   await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "alias_held");
   // Since #282 close() leaves an application-level hold (there is no grace to sweep it) and a hosted bind never probes it; an unbind frees it.
@@ -221,17 +257,37 @@ test("cross application-level/hosted holders share one exclusion path", async ()
 
 test("disable immediately closes held ownership and invalidates capability", async () => {
   const lease = await delivery.open(bob, context(bob));
-  store.repo.users.setDisabled(bob.authed.user_id, true);
-  expect(store.repo.hosted.all()).toHaveLength(0);
+  await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.authed.user_id, true));
+  expect(hostedRowCount(store.db)).toBe(0);
+  // A user change names no row: the full pass it requests reads the lease's row and finishes it (#807 P3 A7h2).
+  await until(() => delivery.activeLeaseCount === 0);
+  const row = await checked(context(bob));
+  expect(() => delivery.describe(bob, context(bob), lease.capability, row)).toThrow();
+});
+
+test("#807 P3 A7h2: a disable's full pass finishes the lease after its read; meanwhile a pull's own row read refuses it", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  let active = -1, refused: unknown;
+  await hostedPause("hosted:reconcile:read", async () => {
+    await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.authed.user_id, true));
+    await until(() => delivery.activeLeaseCount === 0);
+  }, async () => {
+    // The user change named no row: the lease waits for the pass, held at its read.
+    active = delivery.activeLeaseCount;
+    try { delivery.describe(bob, context(bob), lease.capability, await checked(context(bob))); } catch (e) { refused = e; }
+  });
+  expect(active).toBe(1);
+  expect(refused).toHaveProperty("code");
   expect(delivery.activeLeaseCount).toBe(0);
-  expect(() => delivery.describe(bob, context(bob), lease.capability)).toThrow();
 });
 
 test("board receipt is issued and scoped, not an arbitrary high-water cursor", async () => {
-  createBoard(store.db, "alice@example.com/be", "#e2e", "test delivery");
-  subscribe(store.db, "bob@example.com/fe", "#e2e", "push");
+  await seed(store.repo, () => {
+    createBoard(store.db, "alice@example.com/be", "#e2e", "test delivery");
+    subscribe(store.db, "bob@example.com/fe", "#e2e", "push");
+  });
   const lease = await delivery.open(bob, context(bob));
-  post(store.db, "alice@example.com/be", "#e2e", "hello");
+  await seed(store.repo, () => post(store.db, "alice@example.com/be", "#e2e", "hello"));
   const items = await delivery.pending(bob, context(bob), lease.capability);
   expect(items.length).toBeGreaterThan(0);
   await expect(delivery.receipt(bob, context(bob), lease.capability, ["push:99999"])).rejects.toHaveProperty("code", "not_found");
@@ -243,7 +299,7 @@ test("failed rebind preserves lease and original grant attachment", async () => 
   const lease = await delivery.open(bob, context(bob));
   const second = { ...bob, grantId: "G2" };
   await expect(hosted.bind(second, context(bob), { name: "missing" })).rejects.toHaveProperty("code", "identity_unknown");
-  expect(delivery.describe(bob, context(bob), lease.capability).capability).toBe(lease.capability);
+  expect(delivery.describe(bob, context(bob), lease.capability, await checked(context(bob))).capability).toBe(lease.capability);
 });
 
 test("receipt storage failure rolls back direct admission and keeps the issued batch retryable", async () => {
@@ -254,8 +310,8 @@ test("receipt storage failure rolls back direct admission and keeps the issued b
   application.receiptBoards = () => { throw new Error("injected receipt rollback"); };
   try {
     await expect(delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id))).rejects.toThrow("injected receipt rollback");
-    expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
-    expect(delivery.describe(bob, context(bob), lease.capability).capability).toBe(lease.capability);
+    expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
+    expect(delivery.describe(bob, context(bob), lease.capability, await checked(context(bob))).capability).toBe(lease.capability);
   } finally { application.receiptBoards = original; }
   await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
@@ -272,8 +328,48 @@ test("per-user delivery capacity refuses without attaching another grant or drop
   await hosted.bind(bob, contender, { name: "contender", create: true });
   await expect(delivery.open({ ...bob, grantId: "G2" }, contender)).rejects.toHaveProperty("code", "bad_request");
   expect(delivery.activeLeaseCount).toBe(32);
-  expect(hosted.row("id" in contender ? contender.id : "")?.grant_id).toBe(bob.grantId);
-  expect(delivery.describe(bob, context(bob), first.capability).capability).toBe(first.capability);
+  expect((await hosted.readRow("id" in contender ? contender.id : ""))?.grant_id).toBe(bob.grantId);
+  expect(delivery.describe(bob, context(bob), first.capability, await checked(context(bob))).capability).toBe(first.capability);
+});
+
+test("the per-user lease count frees a slot on release and never double-counts a reopen (#805)", async () => {
+  const contexts = [context(bob)];
+  for (let i = 1; i < 32; i++) {
+    const c = context(bob, `root-${i}`);
+    await hosted.bind(bob, c, { name: `worker-${i}`, create: true });
+    contexts.push(c);
+  }
+  const leases = [];
+  for (const c of contexts) leases.push(await delivery.open(bob, c));
+  // Reopening a held lease reuses its slot.
+  for (const c of contexts.slice(0, 4)) await delivery.open(bob, c);
+  const contender = context(bob, "contender");
+  await hosted.bind(bob, contender, { name: "contender", create: true });
+  const counted = refusalCount("delivery_lease");
+  await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
+  expect(refusalCount("delivery_lease")).toBe(counted + 1);
+  await delivery.release(bob, contexts[5]!, leases[5]!.capability);
+  expect(delivery.activeLeaseCount).toBe(31);
+  await delivery.open(bob, contender);
+  expect(delivery.activeLeaseCount).toBe(32);
+  const another = context(bob, "another");
+  await hosted.bind(bob, another, { name: "another", create: true });
+  await expect(delivery.open(bob, another)).rejects.toThrow("delivery lease capacity reached");
+});
+
+test("a user at the lease cap can reopen every lease under a new grant, and the count stays exact (#805)", async () => {
+  const contexts = [context(bob)];
+  for (let i = 1; i < 32; i++) {
+    const c = context(bob, `root-${i}`);
+    await hosted.bind(bob, c, { name: `worker-${i}`, create: true });
+    contexts.push(c);
+  }
+  for (const c of contexts) await delivery.open(bob, c);
+  for (const c of contexts) await delivery.open({ ...bob, grantId: "G2" }, c);
+  expect(delivery.activeLeaseCount).toBe(32);
+  const contender = context(bob, "contender");
+  await hosted.bind(bob, contender, { name: "contender", create: true });
+  await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
 });
 
 test("one lease admits more than 1000 deliveries with bounded idempotent receipt history", async () => {
@@ -289,12 +385,86 @@ test("one lease admits more than 1000 deliveries with bounded idempotent receipt
     await delivery.receipt(bob, context(bob), lease.capability, latest);
     await delivery.receipt(bob, context(bob), lease.capability, latest);
   }
-  const cursor = store.repo.cursors.directFor("bob@example.com/fe");
+  const cursor = await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe");
   await expect(delivery.receipt(bob, context(bob), lease.capability, [firstId])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(cursor);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(cursor);
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
   expect((await delivery.open(bob, context(bob))).capability).toBe(lease.capability);
   expect(delivery.activeLeaseCount).toBe(1);
+});
+
+// The receipt history covers a lost receipt's retry, which re-sends one call's ids (at most 100):
+// 200 per lease covers it twice over (#805).
+test("receipt history keeps the last 200 acknowledged ids per lease", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  for (let i = 0; i < 300; i++) await send(`message ${i}`);
+  const acked: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const batch = await delivery.pending(bob, context(bob), lease.capability);
+    await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
+    acked.push(...batch.map(item => item.id));
+  }
+  await delivery.receipt(bob, context(bob), lease.capability, acked.slice(100, 200));
+  await expect(delivery.receipt(bob, context(bob), lease.capability, [acked[99]!])).rejects.toHaveProperty("code", "not_found");
+});
+
+// A lease's receipt history held a clone of every acknowledged item, bodies included: 1000 leases
+// grew the heap by hundreds of MB an hour under the load test (#805).
+test("acknowledged items' bodies aren't retained by the receipt history", async () => {
+  const { fullGC, heapStats } = await import("bun:jsc");
+  const lease = await delivery.open(bob, context(bob));
+  for (let i = 0; i < 100; i++) await send(`${i} `.padEnd(32_000, "x"));
+  fullGC();
+  const before = heapStats().heapSize;
+  const batch = await delivery.pending(bob, context(bob), lease.capability);
+  expect(batch).toHaveLength(100);
+  await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
+  batch.length = 0;
+  fullGC();
+  // 100 bodies of 32 KB are 3.2 MB (6.4 MB as UTF-16); the history may keep ids and stamps only.
+  expect(heapStats().heapSize - before).toBeLessThan(1_000_000);
+});
+
+test("a lease finished while renew's update awaits stays finished: renew refuses it (#807 P3 A6e2)", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  const deadlines = async () => (await store.repo.hosted.all(store.repo.read)).map(r => r.lease_deadline);
+  const before = await deadlines();
+  now += 1_000; // a renew now would write a later deadline
+  const update = store.repo.hosted.update.bind(store.repo.hosted);
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const spy = spyOn(store.repo.hosted, "update").mockImplementationOnce(async (tx, id, patch) => { entered(); await held; return update(tx, id, patch); });
+  try {
+    const renewed = delivery.renew(bob, context(bob), lease.capability);
+    await started;
+    delivery.close();
+    expect(delivery.activeLeaseCount).toBe(0);
+    release();
+    await expect(renewed).rejects.toHaveProperty("code", "not_found");
+    expect(delivery.activeLeaseCount).toBe(0);
+    // The refusal rolled the renew's new deadline back.
+    expect(await deadlines()).toEqual(before);
+  } finally { release(); spy.mockRestore(); }
+});
+
+test("an open whose update awaits across a close is refused and tracks no lease (#1122)", async () => {
+  const update = store.repo.hosted.update.bind(store.repo.hosted);
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const spy = spyOn(store.repo.hosted, "update").mockImplementationOnce(async (tx, id, patch) => { entered(); await held; return update(tx, id, patch); });
+  try {
+    const opening = delivery.open(bob, context(bob));
+    await started;
+    delivery.close();
+    release();
+    await expect(opening).rejects.toHaveProperty("code", "not_found");
+    expect(delivery.activeLeaseCount).toBe(0);
+    // Its opened audit is matched by a detach, as close gives each lease it finished.
+    const actions = store.db.query<{ action: string }, []>("SELECT action FROM access_log WHERE action IN ('hosted.lease_opened', 'hosted.lease_detached') ORDER BY id").all();
+    expect(actions.map(a => a.action)).toEqual(["hosted.lease_opened", "hosted.lease_detached"]);
+  } finally { release(); spy.mockRestore(); }
 });
 
 test("renew completes while a transfer holds the reader gate past the original deadline", async () => {
@@ -303,7 +473,7 @@ test("renew completes while a transfer holds the reader gate past the original d
   const started = new Promise<void>(resolve => { entered = resolve; });
   const held = new Promise<void>(resolve => { release = resolve; });
   const transfer = hosted.transfer(bob, context(bob), async (_session, guard) => {
-    entered(); await held; guard();
+    entered(); await held; await guard(store.repo.read);
   });
   await started;
   try {
@@ -311,9 +481,9 @@ test("renew completes while a transfer holds the reader gate past the original d
     const renewed = await delivery.renew(bob, context(bob), lease.capability);
     expect(renewed.expiresAt).toBe(now + 30_000);
     now += 20_000;
-    hosted.sweep();
+    await hosted.sweep();
     expect(delivery.activeLeaseCount).toBe(1);
-    expect(delivery.describe(bob, context(bob), lease.capability).ownership).toBe(lease.ownership);
+    expect(delivery.describe(bob, context(bob), lease.capability, await checked(context(bob))).ownership).toBe(lease.ownership);
   } finally { release(); }
   await transfer;
 });
@@ -325,4 +495,28 @@ test("reattachment on successful open invalidates old grant capabilities", async
   expect(replacement.ownership).toBe(lease.ownership);
   expect(delivery.activeLeaseCount).toBe(1);
   await expect(delivery.pending(bob, context(bob), lease.capability)).rejects.toHaveProperty("code", "not_found");
+});
+
+test("a configured per-user lease cap admits past the default and refuses at its size (#805 F-06)", async () => {
+  delivery.close();
+  delivery = createDelivery(hosted, { isAuthorized: () => authorized, caps: { global: 256, perUser: 40 } });
+  await delivery.open(bob, context(bob));
+  for (let i = 1; i < 40; i++) {
+    const c = context(bob, `root-${i}`);
+    await hosted.bind(bob, c, { name: `worker-${i}`, create: true });
+    await delivery.open(bob, c);
+  }
+  expect(delivery.activeLeaseCount).toBe(40);
+  const contender = context(bob, "contender");
+  await hosted.bind(bob, contender, { name: "contender", create: true });
+  await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
+});
+
+// The lease body awaits its lease_opened audit, whose actor read awaits: the row lands in the body's transaction, not
+// on a Tx closed by a commit that ran while the read was pending (#807 P3 A7u2 audit B2).
+test("open's lease_opened audit commits inside the lease body, naming the actor", async () => {
+  const lease = await hostedPause("hosted:audit:user", () => delivery.open(bob, context(bob)), async () => {});
+  expect(lease.capability).toBeString();
+  const rows = store.db.query<{ actor: string }, []>("SELECT actor FROM access_log WHERE action = 'hosted.lease_opened'").all();
+  expect(rows).toEqual([{ actor: bob.authed.user_email }]);
 });

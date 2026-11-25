@@ -3,8 +3,11 @@ import { ApplicationError } from "./application.ts";
 const MAX_BODY = 4 * 1024 * 1024;
 
 // No Request.clone(): an unread tee can prevent cancellation of the original source.
-export async function readMcpBody(request: Request, shutdown?: AbortSignal): Promise<{ parsedBody?: unknown; request: Request } | Response> {
-  if (!request.body) return { request };
+// `signal`, when given, is the returned request's (the caller's deadline joined to the client's, #1591); the read
+// itself follows the client's signal and `shutdown` only, so a slow but steady upload never meets the deadline.
+export async function readMcpBody(request: Request, shutdown?: AbortSignal, signal?: AbortSignal): Promise<{ parsedBody?: unknown; request: Request } | Response> {
+  const resignal = (r: Request) => signal ? new Request(r.url, { method: r.method, headers: r.headers, signal }) : r;
+  if (!request.body) return { request: resignal(request) };
   const reader = request.body.getReader();
   let ended = false;
   const chunks: Uint8Array[] = [];
@@ -26,10 +29,10 @@ export async function readMcpBody(request: Request, shutdown?: AbortSignal): Pro
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    try { return { request, parsedBody: JSON.parse(new TextDecoder().decode(bytes)) }; }
+    try { return { request: resignal(request), parsedBody: JSON.parse(new TextDecoder().decode(bytes)) }; }
     catch {
       // Let the SDK generate its own parse-error response from the bounded bytes.
-      return { request: new Request(request.url, { method: request.method, headers: request.headers, body: bytes, signal: request.signal }) };
+      return { request: new Request(request.url, { method: request.method, headers: request.headers, body: bytes, signal: signal ?? request.signal }) };
     }
   } finally {
     request.signal.removeEventListener("abort", cancel);
@@ -43,7 +46,8 @@ export async function readMcpBody(request: Request, shutdown?: AbortSignal): Pro
 export type OwnedStream = { stop(): Promise<void>; done: Promise<void> };
 
 // Forward SDK bytes, owning cancellation and reader release rather than a hidden pipe promise.
-export function forwardMcpStream(response: Response, signal: AbortSignal, finish: () => void): { response: Response; stream: OwnedStream } {
+// `prime` is enqueued before any SDK byte, so the response's headers flush at once.
+export function forwardMcpStream(response: Response, signal: AbortSignal, finish: () => void, prime?: Uint8Array): { response: Response; stream: OwnedStream } {
   const reader = response.body!.getReader();
   let controller: ReadableStreamDefaultController<Uint8Array>;
   let stopped = false, finalized = false;
@@ -67,7 +71,7 @@ export function forwardMcpStream(response: Response, signal: AbortSignal, finish
   })();
   const abort = () => { void stop(); };
   const body = new ReadableStream<Uint8Array>({
-    start(c) { controller = c; },
+    start(c) { controller = c; if (prime) c.enqueue(prime); },
     async pull(c) {
       try {
         const next = await reader.read();

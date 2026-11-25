@@ -82,11 +82,11 @@ export function actingIdentity(as?: string, env = process.env, cwd = process.cwd
     return { name: n.name, source: "BUS_IDENTITY" };
   }
   if (local) return boundSession(local, cwd);
-  const pin = pinnedIdentity(cwd);
+  const pin = pinnedIdentity(cwd, env);
   // `||`, not `??`: an empty BUS_IDENTITY falls through to the pin, as in
   // sessionIdentity — with `??` it skipped the pin and changed the handle.
-  const base = env.BUS_IDENTITY || pin || defaultIdentity(cwd);
-  const rule = pin ? "the repo's .mcp.json pin" : "the directory name";
+  const base = env.BUS_IDENTITY || pin?.name || defaultIdentity(cwd);
+  const rule = pin ? `the repo's ${pin.file} pin` : "the directory name";
   const name = resolveIdentity(base, cwd);
   return { name, source: name === base ? rule : `${rule}, plus worktree "${linkedWorktreeName(cwd)}"` };
 }
@@ -129,7 +129,7 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
   const { db, openEnded } = await import("../local/db.ts");
   const { isHuman, lastSeen } = await import("../core/boards.ts");
   const { callBoardTool } = await import("../core/tools.ts");
-  const { addressSet } = await import("../core/bindings.ts");
+  const { localAddressSet } = await import("../core/bindings.ts");
   const { deliverEnded, poke } = await import("../local/wakeup.ts");
   await deliverEnded(db, openEnded);
   // The human's handle speaks with the human's authority (#announce), which nothing an agent can run may borrow.
@@ -139,7 +139,7 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
   // under its ID before binding is its own here too (#284 S5). No `session`:
   // this process wrote the post, not that session. One transaction, so a
   // bind or unbind can't change the set between its read and the write.
-  const outcome = db.transaction(() => callBoardTool(db, name, tool, args, { addresses: addressSet(db, name, null) })).immediate();
+  const outcome = db.transaction(() => callBoardTool(db, name, tool, args, { addresses: localAddressSet(db, name) })).immediate();
   // The acting session too: a wakeup re-arms its claim-expiry timer, as its own tool call would.
   await Promise.all([...new Set([...outcome.wake, name])].map((h) => poke(h)));
   return outcome.result;
@@ -147,7 +147,7 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
 
 async function serverCall(name: string, tool: ClaimTool, args: Record<string, unknown>): Promise<unknown> {
   try {
-    return await makeClient().post("/api/claims/call", { identity: name, tool, args });
+    return await makeClient().post("/api/claims/call", { as: name, tool, args });
   } catch (e) {
     if (!(e instanceof ApiError)) throw e;
     // An unknown identity is "unknown_identity"; a bare not_found means the route itself is missing.

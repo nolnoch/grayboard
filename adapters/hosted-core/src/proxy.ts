@@ -10,12 +10,13 @@ import snapshot from "./native-tools.json" with { type: "json" };
 import type { CallOutcome, Controller } from "./controller.js";
 import type { Operation } from "./diagnostics.js";
 import { AccessExpired, accessExpiry, same } from "./model.js";
-import { InsufficientScope, NativeWire, ServerUnreachable, unreachable, type WireOptions } from "./wire.js";
+import { ConnectProbeFailed, InsufficientScope, NativeWire, ServerUnreachable, type WireOptions } from "./wire.js";
+import { HostedAttachments } from "./attachments.js";
+import { outputOf } from "./results.js";
 import {
-  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, downloadAttachment, publishedLimits, readAttachmentFiles, saveTarget,
-  sendWithUploads, SendLanded, serverBusDir, type AttachmentLimits, type AttachmentTransport,
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, publishedLimits,
+  SendLanded, type AttachmentLimits,
 } from "../../../src/shared/attachments.ts";
-import { describeFetchError, HTTP_TIMEOUT_MS, transferTimeoutMs } from "../../../src/shared/http.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { GRAYBOARD_ALIAS_LOST_META } from "../../../src/shared/session_meta.ts";
 
@@ -72,38 +73,50 @@ export function hostTools(native: NativeTool[]): NativeTool[] {
 }
 function withPaths(tool: NativeTool): NativeTool {
   const properties = Object.fromEntries(Object.entries(tool.inputSchema.properties ?? {}).map(([key, value]) => key === "attachment_ids" ? ["attachments", ATTACHMENTS_PARAM] : [key, value]));
-  const description = tool.description?.replace("attachment_ids?", "attachments?").replace(" Attachments are uploaded IDs, not paths.", " Attachments are local file paths.");
+  const description = tool.description?.replace("attachment_ids?", "attachments?");
   return { ...tool, ...(description === undefined ? {} : { description }), inputSchema: { ...tool.inputSchema, properties } };
 }
 
-// The tool's parsed result for afterCall: structuredContent, else the single
-// text content parsed as JSON (or as is when it isn't JSON).
-export function outputOf(result: CallToolResult): unknown {
-  if (result.structuredContent !== undefined) return result.structuredContent;
-  const only = result.content.length === 1 ? result.content[0] : undefined;
-  if (only?.type !== "text") return undefined;
-  try { return JSON.parse(only.text); } catch { return only.text; }
-}
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 // A tool result that reports `message` as an error, in every hosted adapter.
 export const failure = (message: string): CallToolResult => ({ ...text(`error: ${message}`), isError: true });
 
-// The attachment routes refused a request with the server's own code and message.
-export class AttachmentRefused extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) { super(message); }
-}
 // A forwarded call the server answered with isError: its uploads are released
 // and its result returned as is.
 class Refused extends Error {
   constructor(readonly result: CallToolResult) { super("tool call refused"); }
 }
+// A tool call its caller aborted (ToolProxy.call's `signal`).
+export class CallAborted extends Error {
+  constructor(options?: ErrorOptions) { super("aborted", options); this.name = "CallAborted"; }
+}
+
+// `work`, or CallAborted as soon as `signal` aborts. The work itself goes on
+// (a shared connect other calls wait on); its later failure is theirs to see.
+export function unlessAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) {
+    // Still observe the work: a connect this call opened and nobody else awaits
+    // would otherwise reject unhandled (pi exits on that).
+    work.then(undefined, () => {});
+    return Promise.reject(new CallAborted());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new CallAborted());
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(
+      value => { signal.removeEventListener("abort", abort); resolve(value); },
+      (error: unknown) => { signal.removeEventListener("abort", abort); reject(error); });
+  });
+}
+
 // The wire classified the failure as the transport's (a closed connection, a
 // network error, a gateway 502-504), not a request that ran out of time on a
-// working connection.
+// working connection, nor a failed connect probe (#1347), which says nothing of the pooled socket.
 function broken(error: unknown): boolean {
   if (!(error instanceof ServerUnreachable)) return false;
   for (let e: unknown = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-    if (e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout) return false;
+    if (e instanceof ConnectProbeFailed || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout) return false;
   }
   return true;
 }
@@ -121,14 +134,16 @@ export class ToolProxy {
   // Every call and instructions fetch not yet settled, for retire().
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly closing = new AbortController();
-  private readonly roots: string[];
-  private readonly resource: URL;
+  private readonly attachments: HostedAttachments;
   constructor(readonly options: ProxyOptions) {
     const resource = canonicalEndpoint(options.wire.url);
     if (!resource) throw new Error("Grayboard MCP URL must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     this.current = hostTools(snapshotTools());
-    this.roots = options.roots ?? attachRoots();
-    this.resource = resource;
+    this.attachments = new HostedAttachments({
+      resource, auth: options.auth, harness: options.harness, loginAction: options.loginAction,
+      signal: this.closing.signal, roots: options.roots ?? attachRoots(), env: options.env, limits: signal => this.limits(signal),
+      unreleased: (id, error) => options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error })),
+    });
   }
 
   tools(): NativeTool[] { return this.current; }
@@ -149,8 +164,13 @@ export class ToolProxy {
   // back verbatim (content, structuredContent, isError, _meta); a transport
   // failure throws the wire's classified error. A call that needs a new login
   // (signed out, expired, insufficient scope) returns one error naming it.
-  call(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    return this.track(this.invoke(name, args, sessionID));
+  // `signal` aborts the wait (it throws CallAborted), not the call: one the
+  // server already took may still land. It ends the wait for the shared
+  // connect, the server's answer and an upload or download at once; the
+  // before/after hooks (the Controller's queue) and an aborted send's upload
+  // releases still run first. It never closes the shared connection.
+  call(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    return this.track(this.invoke(name, args, sessionID, signal));
   }
 
   // The server's instructions for this session (its native initialize
@@ -193,7 +213,8 @@ export class ToolProxy {
     return work;
   }
 
-  private async invoke(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  private async invoke(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    if (signal?.aborted) throw new CallAborted();
     const signedOut = await this.signedOut();
     if (signedOut) return failure(signedOut.message);
     try { await this.options.hooks?.beforeCall({ sessionID, tool: name }); }
@@ -204,11 +225,19 @@ export class ToolProxy {
     }
     let outcome: CallOutcome = { status: "error" }, lost = false;
     try {
-      const result = await this.dispatch(name, args, sessionID);
+      if (signal?.aborted) throw new CallAborted();
+      const result = await this.dispatch(name, args, sessionID, signal);
+      // Recorded before the abort check: a call that completed is recorded so
+      // (afterCall, a lost hold's instructions) even when nobody reads it.
       lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError) outcome = { status: "completed", output: outputOf(result) };
+      // An abort the dispatch turned into an error result (an attachment's) is still an abort.
+      if (signal?.aborted) throw new CallAborted();
       return result;
     } catch (error) {
+      // Before any classification: the SDK reports a caller's abort as a
+      // request timeout, which would otherwise read as an outage.
+      if (signal?.aborted) throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
       const expired = this.loginNeeded(error);
       if (expired) return failure(expired.message);
       throw error;
@@ -232,10 +261,10 @@ export class ToolProxy {
     } finally { await wire.close(); }
   }
 
-  private async dispatch(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    if (name === ATTACHMENT_GET_TOOL.name) return this.attachmentGet(args, sessionID);
-    if ((name === "dm_send" || name === "board_post") && args.attachments !== undefined) return this.withUploads(name, args, sessionID);
-    return this.forward(name, args, sessionID);
+  private async dispatch(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    if (name === ATTACHMENT_GET_TOOL.name) return this.attachmentGet(args, sessionID, signal);
+    if ((name === "dm_send" || name === "board_post") && args.attachments !== undefined) return this.withUploads(name, args, sessionID, signal);
+    return this.forward(name, args, sessionID, signal);
   }
 
   // Only a broken transport closes the shared connection at once, and only
@@ -243,14 +272,18 @@ export class ToolProxy {
   // timeout, a 429, a 401 or 403 leaves it to the other calls in flight on it,
   // which closing it would abort (a committed dm_send would then read as
   // unreachable). A connection connect() replaced closes after its last call.
-  private async forward(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  // The connect is shared, so a call's abort ends only its own request.
+  private async forward(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    if (signal?.aborted) throw new CallAborted();
     const native = this.native ?? this.open();
     native.users++;
     try {
-      const wire = await native.ready;
-      try { return await wire.callTool(name, args, sessionID); }
+      // A connect still in flight (connect timeouts, 429 backoff) is shared, so
+      // an abort stops only this call's wait for it.
+      const wire = await unlessAborted(native.ready, signal);
+      try { return await wire.callTool(name, args, sessionID, signal); }
       catch (error) {
-        if (broken(error)) this.drop(native);
+        if (!signal?.aborted && broken(error)) this.drop(native);
         throw error;
       }
     } finally {
@@ -261,22 +294,22 @@ export class ToolProxy {
   // The server's attachment caps, published as a capability of the shared
   // connection; a server older than #430 publishes none, and gets the
   // shared defaults its own config also starts from.
-  private async limits(): Promise<AttachmentLimits> {
-    const wire = await (this.native ?? this.open()).ready;
+  private async limits(signal?: AbortSignal): Promise<AttachmentLimits> {
+    if (signal?.aborted) throw new CallAborted();
+    const wire = await unlessAborted((this.native ?? this.open()).ready, signal);
     return publishedLimits(wire.client.getServerCapabilities()?.experimental) ?? DEFAULT_ATTACHMENT_LIMITS;
   }
 
   // Reads and checks the files an agent named (all before any is sent), then
   // uploads them for this session and calls the tool with their ids.
-  private async withUploads(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  private async withUploads(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     const { attachments, ...rest } = args;
     try {
-      const files = await readAttachmentFiles(attachments, this.roots, { limits: await this.limits() });
-      return await sendWithUploads(files, this.transport(sessionID), async ids => {
-        const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID);
+      return await this.attachments.send(attachments, sessionID, async ids => {
+        const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID, signal);
         if (result.isError) throw new Refused(result);
         return result;
-      });
+      }, signal);
     } catch (error) {
       if (error instanceof Refused) return error.result;
       if (error instanceof SendLanded) return text({ sent: true, attachment_ids: error.attachments, note: error.message });
@@ -287,81 +320,15 @@ export class ToolProxy {
 
   // attachment_get(id, dir?): saves under the same roots and default
   // directory as server mode, after checking the server's sha256.
-  private async attachmentGet(args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  private async attachmentGet(args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     try {
-      const id = checkAttachmentId(args.id);
-      const target = await saveTarget(args.dir, this.roots, serverBusDir(this.resource.href), this.options.env);
-      return text(await downloadAttachment(id, target, (await this.limits()).file, this.transport(sessionID)));
+      return text(await this.attachments.get(args, sessionID, signal));
     } catch (error) {
       if (this.transportFailure(error)) throw error;
       return failure((error as Error).message);
     }
   }
 
-  // The hosted endpoint's attachment routes (src/server/mcp-attachments.ts):
-  // the session rides in X-Grayboard-Session; the server acts as its bound name.
-  private transport(sessionID: string): AttachmentTransport {
-    const base = `${this.resource.href.replace(/\/$/, "")}/attachments`;
-    return {
-      upload: async file => {
-        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data);
-        const stored = z.object({ id: z.number().int().positive() }).safeParse(await response.json().catch(() => undefined));
-        if (!stored.success) throw new Error("Invalid attachment upload response");
-        return stored.data.id;
-      },
-      release: async id => {
-        try {
-          const response = await this.http("DELETE", `${base}/${id}`, sessionID, HTTP_TIMEOUT_MS);
-          await response.body?.cancel();
-          return true;
-        } catch (error) {
-          if (error instanceof AttachmentRefused && error.status === 404) return false;
-          throw error;
-        }
-      },
-      download: async (id, maxBytes) => {
-        const ms = transferTimeoutMs(maxBytes);
-        const response = await this.http("GET", `${base}/${id}`, sessionID, ms);
-        try { return { headers: response.headers, data: new Uint8Array(await response.arrayBuffer()) }; }
-        catch (error) { throw this.fetchFailure(error, ms); }
-      },
-      unreleased: (id, error) => this.options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error })),
-    };
-  }
-
-  // One authorized request to an attachment route, retried once after the
-  // credential's onUnauthorized, as the MCP transport does.
-  private async http(method: "POST" | "GET" | "DELETE", url: string, sessionID: string, ms: number, body?: Uint8Array): Promise<Response> {
-    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.closing.signal]);
-    for (let attempt = 0; ; attempt++) {
-      const token = await this.options.auth.token();
-      if (!token) throw new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(sessionID) });
-      if (body) headers.set("Content-Type", "application/octet-stream");
-      let response: Response;
-      try { response = await fetch(url, { method, headers, body: body ? new Uint8Array(body) : undefined, redirect: "error", signal }); }
-      catch (error) { throw this.fetchFailure(error, ms); }
-      if (response.ok) return response;
-      if (response.status === 401 && attempt === 0 && this.options.auth.onUnauthorized) {
-        await response.body?.cancel();
-        await this.options.auth.onUnauthorized({ response, serverUrl: this.resource, fetchFn: fetch });
-        continue;
-      }
-      if (response.status === 401 || response.status === 403 && /insufficient_scope/.test(response.headers.get("www-authenticate") ?? "")) {
-        await response.body?.cancel();
-        throw new AccessExpired(this.options.harness, this.options.loginAction, response.status === 401 ? "expired" : "login_required");
-      }
-      const refusal = z.object({ code: z.string(), message: z.string() }).safeParse(await response.json().catch(() => undefined));
-      if (refusal.success) throw new AttachmentRefused(response.status, refusal.data.code, refusal.data.message);
-      if ([502, 503, 504].includes(response.status)) throw new ServerUnreachable(new Error(`HTTP ${response.status}`));
-      throw new Error(`grayboard server at ${this.resource.origin}: HTTP ${response.status}`);
-    }
-  }
-
-  private fetchFailure(error: unknown, ms: number): Error {
-    if (!this.closing.signal.aborted && unreachable(error)) return new ServerUnreachable(error);
-    return new Error(`grayboard server at ${this.resource.origin}: ${describeFetchError(error, ms)}`, { cause: error });
-  }
 
   private open(): Native {
     const native: Native = { ready: this.listed(new NativeWire(this.options.wire, this.options.auth, this.closing.signal), () => this.native === native), users: 0, retired: false, closed: false };
@@ -423,15 +390,23 @@ export class ToolProxy {
   // 401 the transport's onUnauthorized retry didn't fix (SdkHttpError 401, or
   // the SDK's UnauthorizedError for a credential without onUnauthorized).
   private loginNeeded(error: unknown): AccessExpired | undefined {
-    for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-      if (e instanceof AccessExpired) return e;
-      if (e instanceof InsufficientScope) return new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401) return new AccessExpired(this.options.harness, this.options.loginAction, "expired");
-    }
-    return undefined;
+    const cause = signOutCause(error);
+    return cause === undefined || cause instanceof AccessExpired ? cause : new AccessExpired(this.options.harness, this.options.loginAction, cause);
   }
 
   private transportFailure(error: unknown): boolean {
     return error instanceof ServerUnreachable || !!this.loginNeeded(error);
   }
+}
+
+// Why only a new login can make `error`'s request succeed, from its cause
+// chain, or undefined when a login wouldn't help: an AccessExpired as thrown,
+// else the reason one would carry.
+export function signOutCause(error: unknown): AccessExpired | "login_required" | "expired" | undefined {
+  for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    if (e instanceof AccessExpired) return e;
+    if (e instanceof InsufficientScope) return "login_required";
+    if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401) return "expired";
+  }
+  return undefined;
 }
