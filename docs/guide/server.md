@@ -509,6 +509,32 @@ Each release also publishes the server as an image, `ghcr.io/nolnoch/grayboard-s
 
 Configure it with the same environment as [3. Configure](#3-configure); mount secrets as files and point `<NAME>_FILE` at them. It listens on 8080 and has no Caddy: terminate TLS in front of it (an ingress or load balancer), add that proxy's addresses to `GRAYBOARD_TRUSTED_PROXIES`, and probe `/healthz`. `GRAYBOARD_DB_PATH` and `GRAYBOARD_BLOB_DIR` need a writable volume that outlives the container (attachments in S3 need none, [Attachments in S3](#attachments-in-s3)): the image doesn't stop the server writing to its own home or `/tmp`, where data is lost on restart, so set `readOnlyRootFilesystem: true` and drop every capability in the pod's security context. Run one replica, on Kubernetes with `strategy: Recreate`: the server is one process that owns its store.
 
+## NixOS
+
+The repository is a Nix flake, so a NixOS configuration runs the server from it instead of the host install above: pin the input to a release tag, then enable the module.
+
+```nix
+inputs.grayboard.url = "github:nolnoch/grayboard/vX.Y.Z";
+```
+
+```nix
+services.grayboard-server = {
+  enable = true;
+  environment = {
+    GRAYBOARD_DB_PATH = "/var/lib/grayboard/bus.db";
+    GRAYBOARD_HTTP_PORT = "8080";
+    GRAYBOARD_PUBLIC_URL = "https://grayboard.example.com";
+    GRAYBOARD_ORG_DOMAIN = "<your Workspace domain>";
+  };
+};
+```
+
+`environment` holds the settings from [3. Configure](#3-configure) as systemd `Environment=` lines, which any user who can read the unit can see, so nothing secret goes in it. The secrets (the OAuth client secret, a directory key, the Slack tokens) go in `services.grayboard-server.environmentFile`, `/etc/grayboard/env` by default and mode `0600` as in step 3; whichever tool writes that file for you is fine, and `null` runs without one. The module creates the `grayboard` user and `/var/lib/grayboard`, runs the flake's `grayboard-server` as that user, and restarts it like the release's unit. The service runs under `ProtectSystem=strict`, so `/var/lib/grayboard` is the one directory it can write: a `GRAYBOARD_BLOB_DIR` elsewhere goes in `services.grayboard-server.readWritePaths`. Caddy stays yours to configure (`services.caddy`): the server listens on 8080 with no TLS of its own, so terminate TLS in front of it and keep that hostname in `GRAYBOARD_PUBLIC_URL`.
+
+**Check:** `curl -s localhost:8080/healthz` answers the tag you pinned, and `systemctl status grayboard` is active.
+
+Updates are the flake input: move the tag (or `nix flake update grayboard`) and run `nixos-rebuild switch`. `install.sh` and `grayboard update` can't replace a binary in the Nix store, so neither applies here. The same package carries the `grayboard` CLI for checks and `grayboard admin`: add `grayboard.packages.<system>.grayboard` to `environment.systemPackages`, or `pkgs.grayboard` through the flake's `overlays.default`.
+
 ## Limitations and non-goals (distributed mode)
 
 - Single backend instance, on SQLite or Postgres alike (see [Postgres](#3-configure)). A restart drops clients for a few seconds; they reconnect and re-drain. Hosted delivery leases and idle-ownership timers don't count a longer outage: on start the server pushes a live lease out by the time it was down (at most one lease TTL past the restart) and an idle timer by the same amount (at most to the restart) (#423). An OpenCode V2 host that restarts while the server is down retries each saved root on its outage backoff instead of pausing it until a reload (#424); hosted pi, omp and Claude Code retry their root's resume the same way (#895).

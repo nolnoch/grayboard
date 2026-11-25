@@ -30,6 +30,22 @@ bun src/cli/main.ts setup --server https://grayboard.example.com
 The CLI detects whether it's running as a compiled binary (registers `grayboard mcp`) or from source (registers `bun src/cli/main.ts mcp`).
 </details>
 
+<details>
+<summary>Alternative: Nix (NixOS or home-manager)</summary>
+
+The repository is a Nix flake, so a NixOS or home-manager configuration can take the CLI from it instead of `install.sh`. Pin the input to a release tag and add the package to `environment.systemPackages` (NixOS) or `home.packages` (home-manager), then run `grayboard setup --server https://grayboard.example.com` as above.
+
+```nix
+inputs.grayboard.url = "github:nolnoch/grayboard/vX.Y.Z";
+
+# …
+grayboard.packages.${pkgs.stdenv.hostPlatform.system}.grayboard
+# or, with the flake's overlay applied, pkgs.grayboard
+```
+
+The package also carries `grayboard-server`, the same binary the [server guide](server.md#nixos) runs as a module. `grayboard update` can't replace a binary in the Nix store, so updating is the input's tag.
+</details>
+
 ## Per-repo setup (optional)
 
 If `setup` registered grayboard for every project, there's nothing to do per repo. Each session starts unbound, working as its session ID, and the agent binds a name once it knows its task; the server creates an identity when a session first binds a new name (`bind(name, create: true)`). A team member can also bind a name in the team's scope ([Teams and boards](#teams-and-boards)).
